@@ -1,0 +1,121 @@
+//! Counters shared between the engine, server and TUI. Everything is lock-free atomics except
+//! a small event log and the per-request history.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use parking_lot::Mutex;
+
+#[derive(Default)]
+pub struct Stats {
+    // token throughput
+    pub prompt_tokens: AtomicU64,
+    pub gen_tokens: AtomicU64,
+    pub prefill_ns: AtomicU64,
+    pub decode_ns: AtomicU64,
+    /// last decode step latency (ns) and last prefill rate (tokens/s * 1000)
+    pub last_decode_ns: AtomicU64,
+    pub last_prefill_tps_milli: AtomicU64,
+    // data movement
+    pub upload_bytes: AtomicU64,
+    pub download_bytes: AtomicU64,
+    pub disk_bytes: AtomicU64,
+    pub disk_ns: AtomicU64,
+    pub engram_bytes: AtomicU64,
+    // expert cache
+    pub expert_vram_hits: AtomicU64,
+    pub expert_ram_hits: AtomicU64,
+    pub expert_disk_loads: AtomicU64,
+    pub expert_cpu_runs: AtomicU64,
+    pub expert_prefetches: AtomicU64,
+    pub expert_uploads: AtomicU64,
+    pub vram_slots_total: AtomicU64,
+    pub vram_slots_used: AtomicU64,
+    pub ram_cache_bytes: AtomicU64,
+    pub ram_cache_limit: AtomicU64,
+    pub ram_cache_entries: AtomicU64,
+    // timing breakdown of the last token (ns)
+    pub t_gpu_wait_ns: AtomicU64,
+    pub t_expert_ns: AtomicU64,
+    pub t_sample_ns: AtomicU64,
+    pub t_moe_ns: AtomicU64,
+    pub t_cpu_moe_ns: AtomicU64,
+    // state
+    pub ctx_len: AtomicU64,
+    pub ctx_max: AtomicU64,
+    pub requests_active: AtomicU64,
+    pub requests_queued: AtomicU64,
+    pub requests_done: AtomicU64,
+    pub gpu_dense_bytes: AtomicU64,
+    pub gpu_total_bytes: AtomicU64,
+    pub load_progress_milli: AtomicU64,
+    pub phase: Mutex<String>,
+    pub model_name: Mutex<String>,
+    pub adapter: Mutex<String>,
+    pub events: Mutex<VecDeque<(Instant, String)>>,
+    /// per-layer expert hit counters: (vram hits, misses)
+    pub layer_hits: Mutex<Vec<(u64, u64)>>,
+    /// recent decode tok/s samples for the sparkline
+    pub tps_history: Mutex<VecDeque<u64>>,
+    /// tail of the text being generated (for the dashboard)
+    pub transcript: Mutex<String>,
+}
+
+impl Stats {
+    pub fn add(c: &AtomicU64, v: u64) {
+        c.fetch_add(v, Ordering::Relaxed);
+    }
+    pub fn get(c: &AtomicU64) -> u64 {
+        c.load(Ordering::Relaxed)
+    }
+    pub fn set(c: &AtomicU64, v: u64) {
+        c.store(v, Ordering::Relaxed);
+    }
+
+    pub fn event(&self, msg: impl Into<String>) {
+        let msg = msg.into();
+        tracing::info!("{msg}");
+        let mut e = self.events.lock();
+        e.push_back((Instant::now(), msg));
+        while e.len() > 200 {
+            e.pop_front();
+        }
+    }
+
+    pub fn push_text(&self, t: &str) {
+        let mut s = self.transcript.lock();
+        s.push_str(t);
+        if s.len() > 8192 {
+            let cut = s.len() - 6144;
+            let cut = (cut..s.len()).find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+            s.drain(..cut);
+        }
+    }
+
+    pub fn set_phase(&self, p: impl Into<String>) {
+        *self.phase.lock() = p.into();
+    }
+
+    pub fn snapshot_json(&self) -> serde_json::Value {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        serde_json::json!({
+            "prompt_tokens": g(&self.prompt_tokens),
+            "generated_tokens": g(&self.gen_tokens),
+            "prefill_seconds": g(&self.prefill_ns) as f64 / 1e9,
+            "decode_seconds": g(&self.decode_ns) as f64 / 1e9,
+            "last_decode_ms": g(&self.last_decode_ns) as f64 / 1e6,
+            "upload_bytes": g(&self.upload_bytes),
+            "disk_bytes": g(&self.disk_bytes),
+            "engram_bytes": g(&self.engram_bytes),
+            "expert_vram_hits": g(&self.expert_vram_hits),
+            "expert_ram_hits": g(&self.expert_ram_hits),
+            "expert_disk_loads": g(&self.expert_disk_loads),
+            "vram_slots": [g(&self.vram_slots_used), g(&self.vram_slots_total)],
+            "ram_cache_bytes": g(&self.ram_cache_bytes),
+            "ctx_len": g(&self.ctx_len),
+            "requests_done": g(&self.requests_done),
+            "gpu_bytes": g(&self.gpu_total_bytes),
+        })
+    }
+}

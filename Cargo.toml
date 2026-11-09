@@ -1,0 +1,54 @@
+[package]
+name = "dsv4"
+version = "0.1.0"
+edition = "2024"
+description = "wgpu inference engine for DeepSeek-V4.1-Flash GGUF quants with streaming MoE experts"
+license = "MIT"
+
+[[bin]]
+name = "dsv4"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1.54", features = ["full"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "http2"] }
+futures = "0.3"
+indicatif = "0.18"
+memmap2 = "0.9"
+bytemuck = { version = "1.25", features = ["derive"] }
+half = { version = "2.7", features = ["bytemuck"] }
+rayon = "1.12"
+parking_lot = "0.13"
+wgpu = "30"
+pollster = "1"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+minijinja = { version = "3.1", features = ["serde", "json", "builtins", "loop_controls", "macros", "preserve_order"] }
+minijinja-contrib = { version = "3.1", features = ["pycompat"] }
+axum = "0.8"
+async-stream = "0.3"
+tokio-stream = "0.1"
+ratatui = "0.30"
+crossterm = "0.29"
+sysinfo = "0.40"
+nvml-wrapper = "0.13"
+rand = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+crossbeam-channel = "0.5"
+
+[profile.release]
+opt-level = 3
+debug = 1
+codegen-units = 16
+lto = "thin"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

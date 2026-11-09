@@ -229,6 +229,20 @@ impl ExpertStore {
         }
         Stats::set(&stats.vram_slots_total, n_slots as u64);
         Stats::set(&stats.ram_cache_limit, ram_bytes);
+        let override_layer = match std::env::var("DSV4_EXPERT_OVERRIDE") {
+            Ok(v) => {
+                let (l, p) = v.split_once(':').ok_or_else(|| anyhow::anyhow!("DSV4_EXPERT_OVERRIDE must be layer:path"))?;
+                let l: usize = l.parse()?;
+                let f = File::open(p).map_err(|e| anyhow::anyhow!("override file {p}: {e}"))?;
+                let want = geom.expert_bytes * cfg.n_experts as u64;
+                if f.metadata()?.len() != want {
+                    bail!("override file {p} is {} bytes, expected {want}", f.metadata()?.len());
+                }
+                stats.event(format!("layer {l} experts overridden from {p}"));
+                Some((l, f))
+            }
+            Err(_) => None,
+        };
         Ok(Self {
             geom,
             locs,
@@ -245,20 +259,7 @@ impl ExpertStore {
             demand: rayon::ThreadPoolBuilder::new().num_threads(8).thread_name(|i| format!("expert-rd-{i}")).build()?,
             pinned_ram: Mutex::new(HashMap::new()),
             counts: Mutex::new(vec![vec![0; cfg.n_experts]; cfg.n_layers]),
-            override_layer: match std::env::var("DSV4_EXPERT_OVERRIDE") {
-                Ok(v) => {
-                    let (l, p) = v.split_once(':').ok_or_else(|| anyhow::anyhow!("DSV4_EXPERT_OVERRIDE must be layer:path"))?;
-                    let l: usize = l.parse()?;
-                    let f = File::open(p).map_err(|e| anyhow::anyhow!("override file {p}: {e}"))?;
-                    let want = geom.expert_bytes * cfg.n_experts as u64;
-                    if f.metadata()?.len() != want {
-                        bail!("override file {p} is {} bytes, expected {want}", f.metadata()?.len());
-                    }
-                    stats.event(format!("layer {l} experts overridden from {p}"));
-                    Some((l, f))
-                }
-                Err(_) => None,
-            },
+            override_layer,
         })
     }
 

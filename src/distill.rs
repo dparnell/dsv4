@@ -29,6 +29,8 @@ use crate::gguf::Gguf;
 
 const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 const MIN_TRAIN: usize = 16;
+/// samples per expert actually used (evenly spaced), to bound the fitting cost
+const MAX_SAMPLES: usize = 3000;
 
 fn e8m0(e: u8) -> f32 {
     2f32.powi(e as i32 - 127)
@@ -153,10 +155,6 @@ fn hidden(e: &Expert, x: MatRef<f32>, limit: f32) -> Mat<f32> {
     Mat::from_fn(x.nrows(), g.ncols(), |i, j| act(g[(i, j)], u[(i, j)], limit))
 }
 
-fn rows(m: MatRef<f32>, idx: &[usize]) -> Mat<f32> {
-    Mat::from_fn(idx.len(), m.ncols(), |i, j| m[(idx[i], j)])
-}
-
 fn cols(m: MatRef<f32>, idx: &[usize]) -> Mat<f32> {
     Mat::from_fn(m.nrows(), idx.len(), |i, j| m[(i, idx[j])])
 }
@@ -263,9 +261,11 @@ struct Split {
 }
 
 fn split(flat: &[f32], d: usize) -> Split {
-    let n = flat.len() / d;
-    let te: Vec<usize> = (0..n).filter(|i| i % 5 == 4).collect();
-    let tr: Vec<usize> = (0..n).filter(|i| i % 5 != 4).collect();
+    let n_all = flat.len() / d;
+    let n = n_all.min(MAX_SAMPLES);
+    let pick = |i: usize| i * n_all / n;
+    let te: Vec<usize> = (0..n).filter(|i| i % 5 == 4).map(pick).collect();
+    let tr: Vec<usize> = (0..n).filter(|i| i % 5 != 4).map(pick).collect();
     let mk = |idx: &[usize]| Mat::from_fn(idx.len(), d, |i, j| flat[idx[i] * d + j]);
     Split { xtr: mk(&tr), xte: mk(&te) }
 }
@@ -282,6 +282,9 @@ struct Ctx<'a> {
     cfg: &'a Config,
     shared_in: Option<Mat<f32>>,
     shared_out: Option<Mat<f32>>,
+    /// this expert's own leading input / output directions (lowrank), computed once
+    own_in: Option<Mat<f32>>,
+    own_out: Option<Mat<f32>>,
 }
 
 fn fit(c: &Ctx, e: &Expert, s: &Split, m: Method, ratio: usize, ytr: MatRef<f32>, htr: MatRef<f32>) -> Result<Fitted> {
@@ -333,9 +336,8 @@ fn fit(c: &Ctx, e: &Expert, s: &Split, m: Method, ratio: usize, ytr: MatRef<f32>
         }
         Method::LowRank | Method::Shared => {
             let (vin, pout) = if m == Method::LowRank {
-                let svx = s.xtr.thin_svd().map_err(|e| anyhow::anyhow!("svd failed: {e:?}"))?;
-                let svy = ytr.thin_svd().map_err(|e| anyhow::anyhow!("svd failed: {e:?}"))?;
-                (leading(svx.V(), p), leading(svy.V(), p))
+                let _ = (s, ytr);
+                (leading(c.own_in.as_ref().unwrap().as_ref(), p), leading(c.own_out.as_ref().unwrap().as_ref(), p))
             } else {
                 (leading(c.shared_in.as_ref().unwrap().as_ref(), p), leading(c.shared_out.as_ref().unwrap().as_ref(), p))
             };
@@ -363,7 +365,7 @@ pub struct PilotArgs<'a> {
     pub methods: Vec<Method>,
     /// write the replacement layer for (method, ratio) here
     pub emit: Option<(Method, usize, &'a Path)>,
-    /// cap on experts analysed (most-used first), 0 = all
+    /// analyse this many experts, evenly spaced over the usage ranking (0 = all)
     pub max_experts: usize,
 }
 
@@ -383,13 +385,16 @@ pub fn pilot(g: &Gguf, cfg: &Config, a: &PilotArgs) -> Result<()> {
     );
     let mut order: Vec<usize> = (0..ne).filter(|&e| counts[e] * 4 / 5 >= MIN_TRAIN).collect();
     order.sort_by_key(|&e| std::cmp::Reverse(counts[e]));
-    if a.max_experts > 0 {
-        order.truncate(a.max_experts);
+    if a.max_experts > 0 && a.max_experts < order.len() {
+        // evenly spaced over the usage ranking, so rare and common experts are both represented
+        let n = order.len();
+        order = (0..a.max_experts).map(|i| order[i * n / a.max_experts]).collect();
     }
 
     // shared subspaces need the pooled input / output covariance of the layer first
     let need_shared = a.methods.contains(&Method::Shared) || a.emit.is_some_and(|x| x.0 == Method::Shared);
-    let mut ctx = Ctx { cfg, shared_in: None, shared_out: None };
+    let mut ctx = Ctx { cfg, shared_in: None, shared_out: None, own_in: None, own_out: None };
+    let need_own = a.methods.contains(&Method::LowRank) || a.emit.is_some_and(|x| x.0 == Method::LowRank);
     if need_shared {
         let mut cin = Mat::<f32>::zeros(d, d);
         let mut cout = Mat::<f32>::zeros(d, d);
@@ -440,6 +445,12 @@ pub fn pilot(g: &Gguf, cfg: &Config, a: &PilotArgs) -> Result<()> {
         let htr = hidden(&ex, s.xtr.as_ref(), limit);
         let ytr = &htr * ex.down.transpose();
         let yte = hidden(&ex, s.xte.as_ref(), limit) * ex.down.transpose();
+        if need_own {
+            let svx = s.xtr.thin_svd().map_err(|e| anyhow::anyhow!("svd failed: {e:?}"))?;
+            let svy = ytr.thin_svd().map_err(|e| anyhow::anyhow!("svd failed: {e:?}"))?;
+            ctx.own_in = Some(svx.V().to_owned());
+            ctx.own_out = Some(svy.V().to_owned());
+        }
         let mut row = format!("{e:>3} n={:>5}", counts[e]);
 
         // the engine's own int8-activation CPU path, as a reference error level

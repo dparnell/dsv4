@@ -180,7 +180,7 @@ enum Cmd {
         emit: Option<String>,
         #[arg(long)]
         emit_path: Option<PathBuf>,
-        /// Analyse only the N most-used experts (0 = all)
+        /// Analyse N experts spread evenly over the usage ranking (0 = all)
         #[arg(long, default_value_t = 0)]
         max_experts: usize,
     },

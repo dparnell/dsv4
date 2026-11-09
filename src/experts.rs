@@ -103,7 +103,10 @@ pub struct ExpertStore {
     pub n_slots: usize,
     freq: Mutex<HashMap<Key, (u64, f32)>>,
     inflight: Mutex<std::collections::HashSet<Key>>,
+    /// background prefetch reads
     io: rayon::ThreadPool,
+    /// demand reads on the critical path; kept off the global pool, which runs CPU experts
+    demand: rayon::ThreadPool,
 }
 
 /// A resident expert: which slab, and the byte offset of its slot within it.
@@ -154,6 +157,9 @@ fn open_direct(path: &std::path::Path) -> std::io::Result<File> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        if std::env::var("DSV4_BUFFERED_IO").is_ok_and(|v| v == "1") {
+            return OpenOptions::new().read(true).open(path);
+        }
         if let Ok(f) = OpenOptions::new().read(true).custom_flags(FILE_FLAG_NO_BUFFERING).open(path) {
             return Ok(f);
         }
@@ -227,6 +233,7 @@ impl ExpertStore {
             freq: Mutex::new(HashMap::new()),
             inflight: Mutex::new(Default::default()),
             io: rayon::ThreadPoolBuilder::new().num_threads(8).thread_name(|i| format!("expert-io-{i}")).build()?,
+            demand: rayon::ThreadPoolBuilder::new().num_threads(8).thread_name(|i| format!("expert-rd-{i}")).build()?,
         })
     }
 
@@ -257,7 +264,7 @@ impl ExpertStore {
         }
         out.resize(n, 0);
         let mb = self.geom.mat_bytes as usize;
-        let raws: Vec<Result<Vec<u8>>> = self.locs[layer]
+        let read_all = || -> Vec<Result<Vec<u8>>> { self.locs[layer]
             .par_iter()
             .map(|m| {
                 if m.shard == usize::MAX {
@@ -268,7 +275,13 @@ impl ExpertStore {
                 }
                 Ok(read_aligned(&self.files[m.shard], m.offset + e as u64 * m.stride, m.stride as usize)?)
             })
-            .collect();
+            .collect() };
+        // blocking reads must not occupy the global pool, which runs the CPU experts
+        let raws = if self.io.current_thread_index().is_some() || self.demand.current_thread_index().is_some() {
+            read_all()
+        } else {
+            self.demand.install(read_all)
+        };
         for (i, r) in raws.into_iter().enumerate() {
             let raw = r?;
             repack_mxfp4(&raw, &mut out[i * mb..(i + 1) * mb]);
@@ -381,7 +394,7 @@ impl ExpertStore {
         }
         if !missing.is_empty() {
             // fetch host copies in parallel (RAM hits are instant, disk loads overlap)
-            let datas: Vec<Result<Arc<Vec<u8>>>> = missing.par_iter().map(|&(_, e)| self.fetch_host(layer, e)).collect();
+            let datas: Vec<Result<Arc<Vec<u8>>>> = self.demand.install(|| missing.par_iter().map(|&(_, e)| self.fetch_host(layer, e)).collect());
             let mut v = self.vram.lock();
             let tick = v.tick;
             for (&(i, e), d) in missing.iter().zip(datas) {

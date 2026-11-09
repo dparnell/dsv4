@@ -54,7 +54,8 @@ struct ModelArgs {
     /// VRAM for the routed-expert cache in GB (default: free VRAM minus a reserve)
     #[arg(long)]
     expert_vram_gb: Option<f64>,
-    /// Host RAM for the routed-expert cache in GB (default: 75% of system RAM, leaving >= 16 GB)
+    /// Host RAM for the routed-expert cache in GB (default: 75% of system RAM, leaving >= 16 GB,
+    /// capped by the memory that is actually free at startup)
     #[arg(long)]
     ram_cache_gb: Option<f64>,
     /// GPU backend: vulkan | dx12 | metal (default: best available)
@@ -183,6 +184,50 @@ fn total_ram() -> u64 {
     s.total_memory()
 }
 
+/// Memory we can actually take right now: the smaller of free physical RAM and (on Windows)
+/// remaining commit charge, since every heap allocation counts against the commit limit.
+fn available_ram() -> u64 {
+    let phys = sysinfo::System::new()
+        .map(|mut s| {
+            s.refresh_memory();
+            s.available_memory()
+        })
+        .unwrap_or(32 << 30);
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            len: u32,
+            load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page_file: u64,
+            avail_page_file: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_ext: u64,
+        }
+        unsafe extern "system" {
+            fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
+        }
+        let mut m: MemoryStatusEx = unsafe { std::mem::zeroed() };
+        m.len = std::mem::size_of::<MemoryStatusEx>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 {
+            return phys.min(m.avail_page_file);
+        }
+    }
+    phys
+}
+
+/// Default size of the host expert cache: 75% of RAM (leaving 16 GB), but never more than what
+/// is free now minus room for the rest of the process (~14 GB of loading buffers and tables).
+fn default_ram_cache() -> u64 {
+    let t = total_ram();
+    let by_total = (t / 4 * 3).min(t.saturating_sub(16 << 30));
+    let by_free = available_ram().saturating_sub(20 << 30);
+    by_total.min(by_free).max(2 << 30)
+}
+
 
 struct Loaded {
     model: Model,
@@ -197,10 +242,7 @@ fn load(args: &ModelArgs, stats: Arc<Stats>) -> Result<Loaded> {
         None => chat::find_tokenizer(&first).context("tokenizer.json not found next to the model; run `dsv4 download` or pass --tokenizer")?,
     };
     let tok = Arc::new(Tokenizer::load(&tok_path)?);
-    let ram = args.ram_cache_gb.map(|g| (g * 1e9) as u64).unwrap_or_else(|| {
-        let t = total_ram();
-        (t / 4 * 3).min(t.saturating_sub(16 << 30))
-    });
+    let ram = args.ram_cache_gb.map(|g| (g * 1e9) as u64).unwrap_or_else(default_ram_cache);
     // The expert VRAM budget is decided after the dense weights are resident: ExpertStore is
     // created inside Model::load, so estimate free VRAM up-front from NVML minus the dense size.
     // None: measured once the dense weights and activations are resident

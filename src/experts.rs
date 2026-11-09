@@ -458,6 +458,12 @@ impl ExpertStore {
         ent.1
     }
 
+    /// Slots available for streaming (not holding a pinned expert): the most experts one
+    /// `ensure` call may need to bring in.
+    pub fn streaming_slots(&self) -> usize {
+        self.vram.lock().pinned.iter().filter(|&&p| !p).count()
+    }
+
     pub fn is_resident(&self, layer: usize, e: usize) -> bool {
         self.vram.lock().map.contains_key(&key(layer, e))
     }

@@ -947,7 +947,7 @@ impl Model {
         let cfg = &self.cfg;
         let a = &self.acts;
         let gpu = &self.gpu;
-        let cap = self.experts.n_slots;
+        let cap = self.experts.streaming_slots();
         let geom = &self.experts.geom;
         let mat_words = (geom.mat_bytes / 4) as u32;
         for wave in list.chunks(cap) {

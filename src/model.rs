@@ -30,6 +30,8 @@ pub struct ModelOptions {
     pub expert_ram_bytes: u64,
     pub backend: Option<String>,
     pub cpu_experts: bool,
+    /// Experiment: route only among these experts per layer (pinned in VRAM/RAM up front)
+    pub expert_subset: Option<Vec<Vec<usize>>>,
 }
 
 /// Per-layer persistent attention state.
@@ -113,6 +115,10 @@ pub struct Model {
     cpu_experts: bool,
     step: std::sync::atomic::AtomicU64,
     snapshot: Option<Snapshot>,
+    /// [layer][expert] -> may be routed to (None: all)
+    allowed: Option<Vec<Vec<bool>>>,
+    /// add expert selection counts to this profile after every request
+    pub profile_out: Option<std::path::PathBuf>,
 }
 
 struct Snapshot {
@@ -177,7 +183,7 @@ pub struct Routing {
     pub per_expert: Vec<Vec<(u32, u32, f32)>>,
 }
 
-pub fn route(cfg: &Config, logits: &[f32], bias: &[f32], t: usize) -> Routing {
+pub fn route(cfg: &Config, logits: &[f32], bias: &[f32], t: usize, allowed: Option<&[bool]>) -> Routing {
     let ne = cfg.n_experts;
     let k = cfg.n_active;
     let mut per_expert: Vec<Vec<(u32, u32, f32)>> = vec![Vec::new(); ne];
@@ -186,7 +192,11 @@ pub fn route(cfg: &Config, logits: &[f32], bias: &[f32], t: usize) -> Routing {
         .map(|ti| {
             let row = &logits[ti * ne..(ti + 1) * ne];
             let scores: Vec<f32> = row.iter().map(|&x| (if x > 20.0 { x } else { x.exp().ln_1p() }).sqrt()).collect();
-            let mut idx: Vec<usize> = (0..ne).collect();
+            let mut idx: Vec<usize> = match allowed {
+                Some(m) => (0..ne).filter(|&e| m[e]).collect(),
+                None => (0..ne).collect(),
+            };
+            let k = k.min(idx.len());
             idx.select_nth_unstable_by(k - 1, |&a, &b| (scores[b] + bias[b]).total_cmp(&(scores[a] + bias[a])));
             let sel = &idx[..k];
             let sum: f32 = sel.iter().map(|&e| scores[e]).sum::<f32>() + 1e-20;
@@ -336,6 +346,31 @@ impl Model {
             }
         };
         let experts = Arc::new(ExpertStore::new(&g, &gpu, &cfg, vram, opt.expert_ram_bytes, stats.clone())?);
+        let allowed = match &opt.expert_subset {
+            Some(sub) => {
+                stats.set_phase("pinning expert subset");
+                let set: Vec<(usize, usize)> = sub.iter().enumerate().flat_map(|(l, es)| es.iter().map(move |&e| (l, e))).collect();
+                let in_vram = experts.pin(&gpu, &set, cfg.n_active * 2)?;
+                stats.event(format!(
+                    "expert subset: {} per layer, {} pinned ({} in VRAM, {} in RAM, {:.1} GB)",
+                    sub.first().map_or(0, |s| s.len()),
+                    set.len(),
+                    in_vram,
+                    set.len() - in_vram,
+                    set.len() as f64 * experts.geom.expert_bytes as f64 / 1e9
+                ));
+                Some(
+                    sub.iter()
+                        .map(|es| {
+                            let mut m = vec![false; cfg.n_experts];
+                            es.iter().for_each(|&e| m[e] = true);
+                            m
+                        })
+                        .collect(),
+                )
+            }
+            None => None,
+        };
         let mut gate_host = Vec::new();
         for l in 0..cfg.n_layers {
             gate_host.push(crate::weights::read_f32(&g, g.tensor(&format!("blk.{l}.ffn_gate_inp.weight"))?)?);
@@ -377,6 +412,8 @@ impl Model {
             cpu_experts: opt.cpu_experts && crate::cpu_moe::has_avx2(),
             step: std::sync::atomic::AtomicU64::new(0),
             snapshot: None,
+            allowed,
+            profile_out: None,
         })
     }
 
@@ -637,8 +674,8 @@ impl Model {
             Stats::add(&self.stats.t_gpu_wait_ns, tw.elapsed().as_nanos() as u64);
             let xnf_host: Option<Vec<f32>> = if self.cpu_experts { Some(bytemuck::cast_slice(&back.pop().unwrap()).to_vec()) } else { None };
             let rl: Vec<f32> = bytemuck::cast_slice(&back.pop().unwrap()).to_vec();
-            let routing = route(&cfg, &rl, &ly.exp_bias, t_all);
-            if let (Some(x), true) = (xnf_host.as_deref(), l + 1 < cfg.n_layers && t_all <= 4) {
+            let routing = route(&cfg, &rl, &ly.exp_bias, t_all, self.allowed.as_ref().map(|a| a[l].as_slice()));
+            if let (Some(x), true) = (xnf_host.as_deref(), l + 1 < cfg.n_layers && t_all <= 4 && self.allowed.is_none()) {
                 self.prefetch_next(l + 1, x, t_all);
             }
             self.run_experts(l, &routing, xnf_host.as_deref())?;

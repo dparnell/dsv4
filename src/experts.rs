@@ -85,6 +85,8 @@ pub struct Slab {
 }
 
 struct VramState {
+    /// slots holding pinned experts are never chosen as victims
+    pinned: Vec<bool>,
     slot_key: Vec<Option<Key>>,
     last_use: Vec<u64>,
     map: HashMap<Key, usize>,
@@ -107,6 +109,10 @@ pub struct ExpertStore {
     io: rayon::ThreadPool,
     /// demand reads on the critical path; kept off the global pool, which runs CPU experts
     demand: rayon::ThreadPool,
+    /// experts kept in host memory for the whole run (never evicted)
+    pinned_ram: Mutex<HashMap<Key, Arc<Vec<u8>>>>,
+    /// lifetime selection counts [layer][expert], for building usage profiles
+    counts: Mutex<Vec<Vec<u64>>>,
 }
 
 /// A resident expert: which slab, and the byte offset of its slot within it.
@@ -227,13 +233,15 @@ impl ExpertStore {
             ram: Mutex::new(RamCache { map: HashMap::new(), lru: BTreeMap::new(), bytes: 0, limit: ram_bytes, tick: 0 }),
             slabs,
             slots_per_slab,
-            vram: Mutex::new(VramState { slot_key: vec![None; n_slots], last_use: vec![0; n_slots], map: HashMap::new(), tick: 0 }),
+            vram: Mutex::new(VramState { pinned: vec![false; n_slots], slot_key: vec![None; n_slots], last_use: vec![0; n_slots], map: HashMap::new(), tick: 0 }),
             stats,
             n_slots,
             freq: Mutex::new(HashMap::new()),
             inflight: Mutex::new(Default::default()),
             io: rayon::ThreadPoolBuilder::new().num_threads(8).thread_name(|i| format!("expert-io-{i}")).build()?,
             demand: rayon::ThreadPoolBuilder::new().num_threads(8).thread_name(|i| format!("expert-rd-{i}")).build()?,
+            pinned_ram: Mutex::new(HashMap::new()),
+            counts: Mutex::new(vec![vec![0; cfg.n_experts]; cfg.n_layers]),
         })
     }
 
@@ -320,6 +328,12 @@ impl ExpertStore {
     fn fetch_host_inner(&self, layer: usize, e: usize, count: bool) -> Result<Arc<Vec<u8>>> {
         let k = key(layer, e);
         let use_ram = self.ram.lock().limit > 0;
+        if let Some(v) = self.pinned_ram.lock().get(&k) {
+            if count {
+                Stats::add(&self.stats.expert_ram_hits, 1);
+            }
+            return Ok(v.clone());
+        }
         loop {
             if let Some(v) = self.ram.lock().get(k) {
                 if count {
@@ -351,7 +365,7 @@ impl ExpertStore {
     pub fn prefetch(self: &Arc<Self>, layer: usize, experts: &[usize]) {
         for &e in experts {
             let k = key(layer, e);
-            if self.is_resident(layer, e) || self.ram.lock().map.contains_key(&k) || self.inflight.lock().contains(&k) {
+            if self.is_resident(layer, e) || self.pinned_ram.lock().contains_key(&k) || self.ram.lock().map.contains_key(&k) || self.inflight.lock().contains(&k) {
                 continue;
             }
             Stats::add(&self.stats.expert_prefetches, 1);
@@ -407,7 +421,7 @@ impl ExpertStore {
                         best = s;
                         break;
                     }
-                    if v.last_use[s] < best_t && v.last_use[s] != tick {
+                    if !v.pinned[s] && v.last_use[s] < best_t && v.last_use[s] != tick {
                         best_t = v.last_use[s];
                         best = s;
                     }
@@ -435,6 +449,7 @@ impl ExpertStore {
 
     /// Record one use of an expert; returns its decayed usage score (uses per ~100 steps).
     pub fn note_use(&self, layer: usize, e: usize, step: u64) -> f32 {
+        self.counts.lock()[layer][e] += 1;
         let mut f = self.freq.lock();
         let ent = f.entry(key(layer, e)).or_insert((step, 0.0));
         let decay = 0.97f32.powi((step - ent.0).min(10_000) as i32);
@@ -447,4 +462,71 @@ impl ExpertStore {
         self.vram.lock().map.contains_key(&key(layer, e))
     }
 
+    /// Load `set` (layer, expert) into pinned host memory, then pin as many as fit into VRAM,
+    /// keeping `reserve` slots free for streaming anything else. Returns how many went to VRAM.
+    pub fn pin(&self, gpu: &Gpu, set: &[(usize, usize)], reserve: usize) -> Result<usize> {
+        let blobs: Vec<Result<((usize, usize), Vec<u8>)>> =
+            self.demand.install(|| set.par_iter().map(|&(l, e)| self.load_disk(l, e).map(|b| ((l, e), b))).collect());
+        let mut pr = self.pinned_ram.lock();
+        let mut v = self.vram.lock();
+        let room = self.n_slots.saturating_sub(reserve);
+        let mut in_vram = 0;
+        for r in blobs {
+            let ((l, e), b) = r?;
+            if in_vram < room {
+                let s = in_vram;
+                v.slot_key[s] = Some(key(l, e));
+                v.pinned[s] = true;
+                v.map.insert(key(l, e), s);
+                let r = self.slot_ref(s);
+                gpu.write(&self.slabs[r.slab].buf, r.offset, &b);
+                in_vram += 1;
+                if in_vram % 16 == 0 {
+                    gpu.flush();
+                }
+            }
+            pr.insert(key(l, e), Arc::new(b));
+        }
+        gpu.flush();
+        Stats::set(&self.stats.vram_slots_used, in_vram as u64);
+        Ok(in_vram)
+    }
+
+    /// Add this run's selection counts to the profile at `path` (created if missing).
+    pub fn save_profile(&self, path: &std::path::Path) -> Result<()> {
+        let mut total: Vec<Vec<u64>> = self.counts.lock().clone();
+        if let Ok(old) = load_profile(path) {
+            for (t, o) in total.iter_mut().zip(old) {
+                for (a, b) in t.iter_mut().zip(o) {
+                    *a += b;
+                }
+            }
+        }
+        std::fs::write(path, serde_json::to_vec(&serde_json::json!({ "counts": total }))?)?;
+        for c in self.counts.lock().iter_mut() {
+            c.iter_mut().for_each(|x| *x = 0);
+        }
+        Ok(())
+    }
 }
+
+/// Selection counts [layer][expert] from a profile written by `save_profile`.
+pub fn load_profile(path: &std::path::Path) -> Result<Vec<Vec<u64>>> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    Ok(serde_json::from_value(v["counts"].clone())?)
+}
+
+/// The `n` most-selected experts of every layer according to `counts`.
+pub fn top_experts(counts: &[Vec<u64>], n: usize) -> Vec<Vec<usize>> {
+    counts
+        .iter()
+        .map(|c| {
+            let mut idx: Vec<usize> = (0..c.len()).collect();
+            idx.sort_by_key(|&e| std::cmp::Reverse(c[e]));
+            idx.truncate(n);
+            idx.sort_unstable();
+            idx
+        })
+        .collect()
+}
+

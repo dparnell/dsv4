@@ -169,6 +169,12 @@ pub fn spawn(mut model: Model, tok: Arc<Tokenizer>, stats: Arc<Stats>, model_id:
                     model.truncate(0);
                     model.drop_snapshot();
                 }
+                if let Some(p) = model.profile_out.clone() {
+                    match model.experts.save_profile(&p) {
+                        Ok(()) => st.event(format!("expert profile updated: {}", p.display())),
+                        Err(e) => st.event(format!("could not write expert profile: {e:#}")),
+                    }
+                }
                 Stats::set(&st.requests_active, 0);
                 Stats::add(&st.requests_done, 1);
                 st.set_phase("idle");

@@ -68,6 +68,17 @@ struct ModelArgs {
     /// experts on the CPU from the RAM cache
     #[arg(long)]
     gpu_only_experts: bool,
+    /// Experiment: restrict routing to the N most-used experts of each layer (from
+    /// --expert-profile) and pin them in VRAM, overflowing to RAM. N = 6 ignores the router's
+    /// choice entirely (it only weights the fixed six).
+    #[arg(long, requires = "expert_profile")]
+    expert_subset: Option<usize>,
+    /// Expert usage profile (JSON) used to choose --expert-subset
+    #[arg(long)]
+    expert_profile: Option<PathBuf>,
+    /// Add this run's expert selection counts to a profile (JSON, created if missing)
+    #[arg(long)]
+    save_expert_profile: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -247,8 +258,25 @@ fn load(args: &ModelArgs, stats: Arc<Stats>) -> Result<Loaded> {
     // created inside Model::load, so estimate free VRAM up-front from NVML minus the dense size.
     // None: measured once the dense weights and activations are resident
     let vram = args.expert_vram_gb.map(|g| (g * 1e9) as u64);
-    let opt = ModelOptions { max_ctx: args.ctx, chunk: args.chunk, seg: args.segment, expert_vram_bytes: vram, expert_ram_bytes: ram, backend: args.backend.clone(), cpu_experts: !args.gpu_only_experts };
-    let model = Model::load(&first, &opt, stats.clone())?;
+    let expert_subset = match (args.expert_subset, &args.expert_profile) {
+        (Some(n), Some(p)) => {
+            let counts = experts::load_profile(p).with_context(|| format!("reading expert profile {}", p.display()))?;
+            Some(experts::top_experts(&counts, n))
+        }
+        _ => None,
+    };
+    let opt = ModelOptions {
+        max_ctx: args.ctx,
+        chunk: args.chunk,
+        seg: args.segment,
+        expert_vram_bytes: vram,
+        expert_ram_bytes: ram,
+        backend: args.backend.clone(),
+        cpu_experts: !args.gpu_only_experts,
+        expert_subset,
+    };
+    let mut model = Model::load(&first, &opt, stats.clone())?;
+    model.profile_out = args.save_expert_profile.clone();
     let template = ChatTemplate::new(model.g.str("tokenizer.chat_template"));
     Ok(Loaded { model, tok, template })
 }

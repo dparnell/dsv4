@@ -1,4 +1,5 @@
 mod chat;
+mod distill;
 mod config;
 mod cpu_moe;
 mod download;
@@ -134,6 +135,54 @@ enum Cmd {
         /// Model id reported by /v1/models
         #[arg(long, default_value = "deepseek-v4.1-flash")]
         model_id: String,
+    },
+    /// Experiment: record the routed inputs of one layer's experts while prefilling a corpus
+    Capture {
+        #[command(flatten)]
+        model: ModelArgs,
+        /// Layer whose expert inputs are recorded (later layers are skipped)
+        #[arg(long)]
+        layer: usize,
+        /// Output file (records of [u16 expert][u16 slot][f32 weight][f32 x; dim])
+        #[arg(long)]
+        out: PathBuf,
+        /// Stop after this many tokens
+        #[arg(long, default_value_t = 49152)]
+        tokens: usize,
+        /// Tokens per prefill (each is a fresh context)
+        #[arg(long, default_value_t = 1024)]
+        doc_tokens: usize,
+        /// Chunks taken from each file (for variety)
+        #[arg(long, default_value_t = 2)]
+        chunks_per_file: usize,
+        /// Text file listing the corpus files, one path per line
+        #[arg(long)]
+        list: PathBuf,
+    },
+    /// Experiment: fit compressed replacements for one layer's experts on captured inputs and
+    /// report their error on held-out samples
+    DistillPilot {
+        #[arg(long, short, default_value = DEFAULT_MODEL_DIR)]
+        model: PathBuf,
+        #[arg(long)]
+        layer: usize,
+        /// Capture file from `dsv4 capture`
+        #[arg(long)]
+        capture: PathBuf,
+        /// Compression ratios (bytes per expert vs original)
+        #[arg(long, value_delimiter = ',', default_value = "2,4,8")]
+        ratios: Vec<usize>,
+        /// Methods: prune, prune+fit, lowrank, shared
+        #[arg(long, value_delimiter = ',', default_value = "prune,prune+fit,lowrank,shared")]
+        methods: Vec<String>,
+        /// Write the replacement layer for METHOD:RATIO (use with DSV4_EXPERT_OVERRIDE)
+        #[arg(long)]
+        emit: Option<String>,
+        #[arg(long)]
+        emit_path: Option<PathBuf>,
+        /// Analyse only the N most-used experts (0 = all)
+        #[arg(long, default_value_t = 0)]
+        max_experts: usize,
     },
     /// Generate a completion for one prompt
     Run {
@@ -435,6 +484,55 @@ fn main() -> Result<()> {
             }
             server.join().map_err(|_| anyhow::anyhow!("server thread panicked"))??;
             Ok(())
+        }
+        Cmd::Capture { model, layer, out, tokens, doc_tokens, chunks_per_file, list } => {
+            use std::io::Write;
+            init_logging(false);
+            let stats = Arc::new(Stats::default());
+            let Loaded { mut model, tok, .. } = load(&model, stats.clone())?;
+            let file = std::fs::File::create(&out).with_context(|| format!("creating {}", out.display()))?;
+            model.capture = Some(model::Capture { layer, out: std::io::BufWriter::with_capacity(64 << 20, file), stop: true, records: 0 });
+            let t0 = std::time::Instant::now();
+            let mut total = 0usize;
+            'files: for path in std::fs::read_to_string(&list)?.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let Ok(text) = std::fs::read_to_string(path) else {
+                    eprintln!("skip {path}: not readable as UTF-8");
+                    continue;
+                };
+                let ids = tok.encode(&text)?;
+                for chunk in ids.chunks(doc_tokens).take(chunks_per_file) {
+                    if total >= tokens {
+                        break 'files;
+                    }
+                    if chunk.len() < 64 {
+                        continue;
+                    }
+                    model.truncate(0);
+                    model.forward(chunk)?;
+                    total += chunk.len();
+                    let rec = model.capture.as_ref().unwrap().records;
+                    eprintln!("{total:>6} tokens  {rec:>7} records  {:>6.0}s  {path}", t0.elapsed().as_secs_f64());
+                }
+            }
+            let mut cap = model.capture.take().unwrap();
+            cap.out.flush()?;
+            eprintln!("captured {} records over {total} tokens of layer {layer} -> {}", cap.records, out.display());
+            Ok(())
+        }
+        Cmd::DistillPilot { model, layer, capture, ratios, methods, emit, emit_path, max_experts } => {
+            let first = gguf::resolve_model_path(&model)?;
+            let g = gguf::Gguf::open(&first)?;
+            let cfg = config::Config::from_gguf(&g)?;
+            let methods = methods.iter().map(|m| distill::Method::parse(m)).collect::<Result<Vec<_>>>()?;
+            let emit = match &emit {
+                Some(s) => {
+                    let (m, r) = s.split_once(':').context("--emit takes METHOD:RATIO")?;
+                    let path = emit_path.as_deref().context("--emit needs --emit-path")?;
+                    Some((distill::Method::parse(m)?, r.parse::<usize>()?, path))
+                }
+                None => None,
+            };
+            distill::pilot(&g, &cfg, &distill::PilotArgs { layer, capture: &capture, ratios, methods, emit, max_experts })
         }
         Cmd::Run { model, sampling, prompt, raw, tui } => {
             init_logging(tui);

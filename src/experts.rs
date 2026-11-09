@@ -113,6 +113,9 @@ pub struct ExpertStore {
     pinned_ram: Mutex<HashMap<Key, Arc<Vec<u8>>>>,
     /// lifetime selection counts [layer][expert], for building usage profiles
     counts: Mutex<Vec<Vec<u64>>>,
+    /// DSV4_EXPERT_OVERRIDE=layer:path - that layer's experts come from a replacement file
+    /// (all experts, repacked layout, in index order; written by `dsv4 distill-pilot --emit`)
+    override_layer: Option<(usize, File)>,
 }
 
 /// A resident expert: which slab, and the byte offset of its slot within it.
@@ -242,6 +245,20 @@ impl ExpertStore {
             demand: rayon::ThreadPoolBuilder::new().num_threads(8).thread_name(|i| format!("expert-rd-{i}")).build()?,
             pinned_ram: Mutex::new(HashMap::new()),
             counts: Mutex::new(vec![vec![0; cfg.n_experts]; cfg.n_layers]),
+            override_layer: match std::env::var("DSV4_EXPERT_OVERRIDE") {
+                Ok(v) => {
+                    let (l, p) = v.split_once(':').ok_or_else(|| anyhow::anyhow!("DSV4_EXPERT_OVERRIDE must be layer:path"))?;
+                    let l: usize = l.parse()?;
+                    let f = File::open(p).map_err(|e| anyhow::anyhow!("override file {p}: {e}"))?;
+                    let want = geom.expert_bytes * cfg.n_experts as u64;
+                    if f.metadata()?.len() != want {
+                        bail!("override file {p} is {} bytes, expected {want}", f.metadata()?.len());
+                    }
+                    stats.event(format!("layer {l} experts overridden from {p}"));
+                    Some((l, f))
+                }
+                Err(_) => None,
+            },
         })
     }
 
@@ -253,6 +270,17 @@ impl ExpertStore {
     fn load_disk(&self, layer: usize, e: usize) -> Result<Vec<u8>> {
         let t0 = Instant::now();
         let n = self.geom.expert_bytes as usize;
+        if let Some((ol, f)) = &self.override_layer {
+            if *ol == layer {
+                let mut out = vec![0u8; n];
+                #[cfg(windows)]
+                std::os::windows::fs::FileExt::seek_read(f, &mut out, (e * n) as u64)?;
+                #[cfg(unix)]
+                std::os::unix::fs::FileExt::read_exact_at(f, &mut out, (e * n) as u64)?;
+                Stats::add(&self.stats.expert_disk_loads, 1);
+                return Ok(out);
+            }
+        }
         let mut out: Vec<u8> = Vec::new();
         if out.try_reserve_exact(n).is_err() {
             // commit limit reached: give back a quarter of the RAM tier and retry

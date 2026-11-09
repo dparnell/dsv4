@@ -119,6 +119,34 @@ pub struct Model {
     allowed: Option<Vec<Vec<bool>>>,
     /// add expert selection counts to this profile after every request
     pub profile_out: Option<std::path::PathBuf>,
+    /// record the routed FFN inputs of one layer (expert distillation experiments)
+    pub capture: Option<Capture>,
+}
+
+/// Writes one record per (token, routed expert) of `layer`:
+/// [u16 expert][u16 slot][f32 route weight][f32 x; dim], x being the normalized FFN input.
+pub struct Capture {
+    pub layer: usize,
+    pub out: std::io::BufWriter<std::fs::File>,
+    /// skip the layers after `layer` (the logits are then meaningless)
+    pub stop: bool,
+    pub records: u64,
+}
+
+impl Capture {
+    fn write(&mut self, routing: &Routing, x: &[f32], d: usize) -> Result<()> {
+        use std::io::Write;
+        for (e, list) in routing.per_expert.iter().enumerate() {
+            for &(t, slot, w) in list {
+                self.out.write_all(&(e as u16).to_le_bytes())?;
+                self.out.write_all(&(slot as u16).to_le_bytes())?;
+                self.out.write_all(&w.to_le_bytes())?;
+                self.out.write_all(bytemuck::cast_slice(&x[t as usize * d..(t as usize + 1) * d]))?;
+                self.records += 1;
+            }
+        }
+        Ok(())
+    }
 }
 
 struct Snapshot {
@@ -414,6 +442,7 @@ impl Model {
             snapshot: None,
             allowed,
             profile_out: None,
+            capture: None,
         })
     }
 
@@ -667,14 +696,21 @@ impl Model {
             ly.sh_down.run(&mut batch, &a.sa, 0, cfg.moe_inter, &a.sh_out, 0, d, t_all, 0, false);
             let tw = Instant::now();
             let mut ranges = vec![(&a.rlog, 0u64, (t_all * cfg.n_experts * 4) as u64)];
-            if self.cpu_experts {
+            let want_x = self.cpu_experts || self.capture.as_ref().is_some_and(|c| c.layer == l);
+            if want_x {
                 ranges.push((&a.xnf, 0, (t_all * d * 4) as u64));
             }
             let mut back = gpu.read_multi(batch, &ranges);
             Stats::add(&self.stats.t_gpu_wait_ns, tw.elapsed().as_nanos() as u64);
-            let xnf_host: Option<Vec<f32>> = if self.cpu_experts { Some(bytemuck::cast_slice(&back.pop().unwrap()).to_vec()) } else { None };
+            let xnf_host: Option<Vec<f32>> = if want_x { Some(bytemuck::cast_slice(&back.pop().unwrap()).to_vec()) } else { None };
             let rl: Vec<f32> = bytemuck::cast_slice(&back.pop().unwrap()).to_vec();
             let routing = route(&cfg, &rl, &ly.exp_bias, t_all, self.allowed.as_ref().map(|a| a[l].as_slice()));
+            if let Some(cap) = self.capture.as_mut().filter(|c| c.layer == l) {
+                cap.write(&routing, xnf_host.as_deref().unwrap(), d)?;
+                if cap.stop {
+                    return Ok(vec![0.0; cfg.vocab]);
+                }
+            }
             if let (Some(x), true) = (xnf_host.as_deref(), l + 1 < cfg.n_layers && t_all <= 4 && self.allowed.is_none()) {
                 self.prefetch_next(l + 1, x, t_all);
             }

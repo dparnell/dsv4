@@ -259,6 +259,14 @@ enum Cmd {
     },
     /// Check every GPU kernel against a CPU reference
     Selftest,
+    /// Measure how fast routed experts run on the CPU (random weights, no model needed)
+    BenchCpu {
+        #[arg(long, default_value_t = 5120)]
+        dim: usize,
+        /// Hidden size of one expert
+        #[arg(long, default_value_t = 2304)]
+        inter: usize,
+    },
     /// Measure expert streaming throughput from disk
     BenchIo {
         #[arg(long, short, default_value = DEFAULT_MODEL_DIR)]
@@ -461,27 +469,9 @@ fn main() -> Result<()> {
                 let (gbps, ms) = store.bench_disk(n, threads)?;
                 println!("{threads:>3} loaders: {gbps:>6.2} GB/s  ({ms:.2} ms/expert amortized, 18.8 MB each)");
             }
-            // CPU expert compute from RAM, one token (decode case)
-            let geom = &store.geom;
-            let blobs: Vec<Vec<u8>> = (0..24).map(|i| vec![(i * 37 % 251) as u8; geom.expert_bytes as usize]).collect();
-            let x = vec![0.01f32; cfg.dim];
-            let t0 = std::time::Instant::now();
-            for b in &blobs {
-                let _ = cpu_moe::expert_forward(b, geom.inter, cfg.dim, geom.mat_bytes as usize, &[&x], &[1.0], 10.0);
-            }
-            let ms = t0.elapsed().as_secs_f64() * 1e3 / blobs.len() as f64;
-            println!("CPU expert (1 token, avx2={}): {ms:.2} ms  ({:.1} GB/s effective)", cpu_moe::has_avx2(), geom.expert_bytes as f64 / ms / 1e6);
-            use rayon::prelude::*;
-            let t0 = std::time::Instant::now();
-            for group in blobs.chunks(6) {
-                group.par_iter().for_each(|b| {
-                    let _ = cpu_moe::expert_forward(b, geom.inter, cfg.dim, geom.mat_bytes as usize, &[&x], &[1.0], 10.0);
-                });
-            }
-            let ms = t0.elapsed().as_secs_f64() * 1e3 / blobs.len() as f64;
-            println!("CPU experts, 6 concurrent: {ms:.2} ms/expert  ({:.1} GB/s effective)", geom.expert_bytes as f64 / ms / 1e6);
             Ok(())
         }
+        Cmd::BenchCpu { dim, inter } => cpu_moe::bench(dim, inter),
         Cmd::Prompt { model, file, no_think } => {
             let first = gguf::resolve_model_path(&model)?;
             let g = gguf::Gguf::open(&first)?;
@@ -717,11 +707,12 @@ fn print_breakdown(st: &Stats) {
     let g = |c: &std::sync::atomic::AtomicU64| Stats::get(c);
     let s = |c: &std::sync::atomic::AtomicU64| Stats::get(c) as f64 / 1e9;
     eprintln!(
-        "breakdown: gpu-wait {:.2}s  experts {:.2}s (gpu path {:.2}s, cpu path {:.2}s)  disk {:.2} GB in {} loads  ram hits {}  vram hits {}  cpu runs {}  uploads {} ({:.2} GB)  prefetches {} ({} used, {} cancelled)",
+        "breakdown: gpu-wait {:.2}s  experts {:.2}s (gpu path {:.2}s, cpu path {:.2}s, computing {:.2}s)  disk {:.2} GB in {} loads  ram hits {}  vram hits {}  cpu runs {}  uploads {} ({:.2} GB)  prefetches {} ({} used, {} cancelled)",
         s(&st.t_gpu_wait_ns),
         s(&st.t_moe_ns),
         s(&st.t_expert_ns),
         s(&st.t_cpu_moe_ns),
+        s(&st.t_cpu_compute_ns),
         g(&st.disk_bytes) as f64 / 1e9,
         g(&st.expert_disk_loads),
         g(&st.expert_ram_hits),

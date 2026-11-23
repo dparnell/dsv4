@@ -509,7 +509,7 @@ impl Model {
             route_tail_skip: opt.route_tail_skip,
             prompt_skip: opt.prompt_skip,
             gaps: Vec::new(),
-            cpu_experts: opt.cpu_experts && crate::cpu_moe::has_avx2(),
+            cpu_experts: opt.cpu_experts && crate::cpu_moe::has_simd(),
             step: std::sync::atomic::AtomicU64::new(0),
             snapshot: None,
             allowed,
@@ -1059,31 +1059,39 @@ impl Model {
                 let _timer = scopeguard(|| Stats::add(&self.stats.t_cpu_moe_ns, t_cpu.elapsed().as_nanos() as u64));
                 let d = cfg.dim;
                 let geom = &self.experts.geom;
-                let run = |e: usize, blob: &[u8]| -> Vec<(usize, Vec<f32>)> {
-                    let list = &routing.per_expert[e];
-                    let xs: Vec<&[f32]> = list.iter().map(|&(t, _, _)| &x[t as usize * d..(t as usize + 1) * d]).collect();
-                    let ws: Vec<f32> = list.iter().map(|&(_, _, w)| w).collect();
-                    let ys = crate::cpu_moe::expert_forward(blob, geom.inter, d, geom.mat_bytes as usize, &xs, &ws, cfg.swiglu_limit);
-                    list.iter().zip(ys).map(|(&(t, k, _), y)| (t as usize * cfg.n_active + k as usize, y)).collect()
+                let run = |batch: Vec<(usize, Arc<Vec<u8>>)>, out: &mut CpuOut| {
+                    let jobs: Vec<crate::cpu_moe::Job> = batch
+                        .iter()
+                        .map(|(e, blob)| crate::cpu_moe::Job {
+                            blob,
+                            xs: routing.per_expert[*e].iter().map(|&(t, _, _)| &x[t as usize * d..(t as usize + 1) * d]).collect(),
+                            ws: routing.per_expert[*e].iter().map(|&(_, _, w)| w).collect(),
+                        })
+                        .collect();
+                    let t_run = std::time::Instant::now();
+                    let ys = crate::cpu_moe::experts_forward(&jobs, geom.inter, d, geom.mat_bytes as usize, cfg.swiglu_limit);
+                    Stats::add(&self.stats.t_cpu_compute_ns, t_run.elapsed().as_nanos() as u64);
+                    for ((e, _), ys) in batch.iter().zip(ys) {
+                        out.rows.extend(routing.per_expert[*e].iter().zip(ys).map(|(&(t, k, _), y)| (t as usize * cfg.n_active + k as usize, y)));
+                    }
+                    out.blobs.extend(batch);
                 };
                 // experts already in memory compute while the others are being read
                 let (ready, pending): (Vec<_>, Vec<_>) =
                     cpu_list.iter().copied().zip(loads).partition(|(_, l)| matches!(l, crate::expert_io::Load::Ready(_)));
-                let mut done = ready
-                    .into_par_iter()
-                    .map(|(e, l)| {
-                        let blob = l.wait()?;
-                        Ok((e, run(e, &blob), blob))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                for (e, l) in pending {
-                    let blob = l.wait()?;
-                    done.push((e, run(e, &blob), blob));
-                }
                 let mut all = CpuOut::default();
-                for (e, rows, blob) in done {
-                    all.rows.extend(rows);
-                    all.blobs.push((e, blob));
+                let ready = ready.into_iter().map(|(e, l)| Ok((e, l.wait()?))).collect::<Result<Vec<_>>>()?;
+                // in groups, so a prompt's many cold experts do not need all their buffers at once
+                let mut ready = ready.into_iter();
+                loop {
+                    let group: Vec<_> = ready.by_ref().take(16).collect();
+                    if group.is_empty() {
+                        break;
+                    }
+                    run(group, &mut all);
+                }
+                for (e, l) in pending {
+                    run(vec![(e, l.wait()?)], &mut all);
                 }
                 Ok(all)
             },

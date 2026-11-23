@@ -49,6 +49,8 @@ pub struct Stats {
     pub t_sample_ns: AtomicU64,
     pub t_moe_ns: AtomicU64,
     pub t_cpu_moe_ns: AtomicU64,
+    /// the part of it spent computing rather than waiting for experts to be read
+    pub t_cpu_compute_ns: AtomicU64,
     // state
     pub ctx_len: AtomicU64,
     pub ctx_max: AtomicU64,

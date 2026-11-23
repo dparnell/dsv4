@@ -218,7 +218,7 @@ pub fn run() -> Result<()> {
         let range = want.iter().fold(0f32, |a, v| a.max(v.abs()));
         let err = cpu.iter().zip(&want).fold(0f32, |a, (g, w)| a.max((g - w).abs())) / range;
         let ok = err < 0.03;
-        println!("{} moe cpu q8       max err {err:.2e} of output range (avx2={})", if ok { "PASS" } else { "FAIL" }, crate::cpu_moe::has_avx2());
+        println!("{} moe cpu q8       max err {err:.2e} of output range ({:?})", if ok { "PASS" } else { "FAIL" }, crate::cpu_moe::isa());
         all &= ok;
     }
 

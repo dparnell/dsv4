@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 
 use crate::gguf::Gguf;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     pub n_layers: usize,
     pub dim: usize,
@@ -131,6 +131,14 @@ impl Config {
 
     pub fn is_index_source(&self, layer: usize) -> bool {
         self.index_source_layers.contains(&layer)
+    }
+
+    /// First layer from which a position's output only matters to the positions shortly after it:
+    /// the last compressed-KV source, when no later layer has Engram input. Everything past it
+    /// sees earlier positions through that layer's compressed rows and the sliding window alone.
+    pub fn skip_layer(&self) -> Option<usize> {
+        let y = self.kv_source_layers.iter().copied().max()?;
+        (y > 0 && (y..self.n_layers).all(|l| self.ratio(l) > 0) && self.engram_layers.iter().all(|&l| l < y)).then_some(y)
     }
 
     pub fn n_hash_cols(&self) -> usize {

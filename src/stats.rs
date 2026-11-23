@@ -33,6 +33,11 @@ pub struct Stats {
     pub expert_prefetch_hits: AtomicU64,
     pub expert_prefetch_cancels: AtomicU64,
     pub expert_uploads: AtomicU64,
+    /// routed picks chosen because of --route-prior / dropped by --route-tail-skip
+    pub route_moved: AtomicU64,
+    pub route_dropped: AtomicU64,
+    /// (token, layer) pairs of prompts whose experts were not needed
+    pub prompt_rows_skipped: AtomicU64,
     pub vram_slots_total: AtomicU64,
     pub vram_slots_used: AtomicU64,
     pub ram_cache_bytes: AtomicU64,

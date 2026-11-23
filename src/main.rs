@@ -79,6 +79,16 @@ struct ModelArgs {
     /// for warming the caches
     #[arg(long)]
     expert_profile: Option<PathBuf>,
+    /// LOSSY: while decoding, pick experts as if those in VRAM or RAM scored LAMBDA higher
+    #[arg(long, value_name = "LAMBDA", num_args = 0..=1, default_missing_value = "0.1", default_value_t = 0.0, hide_default_value = true)]
+    route_prior: f32,
+    /// LOSSY: while decoding, drop picks of weight rank R (0-based, 1-5) or lower that are not in
+    /// VRAM or RAM
+    #[arg(long, value_name = "R", num_args = 0..=1, default_missing_value = "5", default_value_t = 0, hide_default_value = true)]
+    route_tail_skip: usize,
+    /// Compute every layer for every prompt position, even where it cannot influence the output
+    #[arg(long)]
+    no_prompt_skip: bool,
     /// Do not read ahead likely experts of the next layer
     #[arg(long)]
     no_prefetch: bool,
@@ -191,6 +201,27 @@ enum Cmd {
         /// Analyse N experts spread evenly over the usage ranking (0 = all)
         #[arg(long, default_value_t = 0)]
         max_experts: usize,
+    },
+    /// Teacher-forced quality check: decode text token by token, report perplexity, speed and the
+    /// distance to a saved reference run
+    Eval {
+        #[command(flatten)]
+        model: ModelArgs,
+        /// Text files; each is a fresh context
+        #[arg(long, value_delimiter = ',')]
+        text: Vec<PathBuf>,
+        /// Tokens of each file processed as a prompt
+        #[arg(long, default_value_t = 64)]
+        prefill: usize,
+        /// Tokens of each file then decoded one at a time
+        #[arg(long, default_value_t = 64)]
+        tokens: usize,
+        /// Write the logits for later comparison
+        #[arg(long)]
+        save: Option<PathBuf>,
+        /// Compare with logits written by --save
+        #[arg(long)]
+        base: Option<PathBuf>,
     },
     /// Generate a completion for one prompt
     Run {
@@ -330,9 +361,18 @@ fn load(args: &ModelArgs, stats: Arc<Stats>) -> Result<Loaded> {
         cpu_experts: !args.gpu_only_experts,
         expert_subset,
         expert_ranking: counts.as_ref().map(|c| experts::rank_counts(c)),
+        route_prior: args.route_prior.max(0.0),
+        route_tail_skip: args.route_tail_skip,
+        prompt_skip: !args.no_prompt_skip,
         prefetch: !args.no_prefetch,
         warm_up: !args.no_warm_up,
     };
+    if args.route_prior > 0.0 || args.route_tail_skip > 0 {
+        stats.event(format!(
+            "LOSSY routing is on (route-prior {}, route-tail-skip {}): output depends on which experts are cached",
+            args.route_prior, args.route_tail_skip
+        ));
+    }
     let mut model = Model::load(&first, &opt, stats.clone())?;
     model.profile_out = args.save_expert_profile.clone();
     let template = ChatTemplate::new(model.g.str("tokenizer.chat_template"));
@@ -543,6 +583,12 @@ fn main() -> Result<()> {
             };
             distill::pilot(&g, &cfg, &distill::PilotArgs { layer, capture: &capture, ratios, methods, emit, max_experts })
         }
+        Cmd::Eval { model, text, prefill, tokens, save, base } => {
+            init_logging(false);
+            let stats = Arc::new(Stats::default());
+            let Loaded { model, tok, .. } = load(&model, stats.clone())?;
+            eval(model, &tok, &stats, &text, prefill, tokens, save.as_deref(), base.as_deref())
+        }
         Cmd::Run { model, sampling, prompt, raw, tui } => {
             init_logging(tui);
             let stats = Arc::new(Stats::default());
@@ -604,6 +650,69 @@ fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn eval(mut model: Model, tok: &Tokenizer, stats: &Stats, texts: &[PathBuf], prefill: usize, tokens: usize, save: Option<&Path>, base: Option<&Path>) -> Result<()> {
+    use std::io::Read;
+    let log_softmax = |l: &[f32]| -> Vec<f64> {
+        let max = l.iter().copied().fold(f32::MIN, f32::max) as f64;
+        let z = l.iter().map(|&x| (x as f64 - max).exp()).sum::<f64>().ln() + max;
+        l.iter().map(|&x| x as f64 - z).collect()
+    };
+    let argmax = |l: &[f32]| (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap_or(0);
+    let mut out = save.map(std::fs::File::create).transpose()?.map(std::io::BufWriter::new);
+    let mut reference = base.map(std::fs::File::open).transpose()?.map(std::io::BufReader::new);
+    let (mut n, mut nll, mut kld, mut same, mut worst) = (0usize, 0f64, 0f64, 0usize, 0f64);
+    let (mut t_pre, mut t_dec, mut n_dec) = (0f64, 0f64, 0usize);
+    for path in texts {
+        let ids = tok.encode(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)?;
+        if ids.len() < prefill + tokens {
+            anyhow::bail!("{} has only {} tokens", path.display(), ids.len());
+        }
+        model.truncate(0);
+        let t0 = std::time::Instant::now();
+        let mut logits = model.forward(&ids[..prefill])?;
+        t_pre += t0.elapsed().as_secs_f64();
+        for i in 0..tokens {
+            let lp = log_softmax(&logits);
+            nll -= lp[ids[prefill + i] as usize];
+            n += 1;
+            if let Some(f) = &mut out {
+                f.write_all(bytemuck::cast_slice(&logits))?;
+            }
+            if let Some(f) = &mut reference {
+                let mut r = vec![0f32; logits.len()];
+                f.read_exact(bytemuck::cast_slice_mut(&mut r)).context("reference logits: too short for this run")?;
+                let rp = log_softmax(&r);
+                let d: f64 = rp.iter().zip(&lp).map(|(a, b)| a.exp() * (a - b)).sum();
+                kld += d;
+                worst = worst.max(d);
+                same += (argmax(&r) == argmax(&logits)) as usize;
+            }
+            if i + 1 < tokens {
+                let t0 = std::time::Instant::now();
+                logits = model.forward(&ids[prefill + i..prefill + i + 1])?;
+                t_dec += t0.elapsed().as_secs_f64();
+                n_dec += 1;
+            }
+        }
+    }
+    if let Some(f) = &mut out {
+        f.flush()?;
+    }
+    println!(
+        "eval: {n} tokens  ppl {:.4}  prefill {:.1} s ({:.2} tok/s)  decode {:.2} tok/s",
+        (nll / n as f64).exp(),
+        t_pre,
+        (prefill * texts.len()) as f64 / t_pre,
+        n_dec as f64 / t_dec.max(1e-9)
+    );
+    if reference.is_some() {
+        println!("vs reference: kld {:.5} (worst {:.4})  same top-1 {:.1}%", kld / n as f64, worst, 100.0 * same as f64 / n as f64);
+    }
+    print_breakdown(stats);
+    Ok(())
+}
+
 fn print_breakdown(st: &Stats) {
     let g = |c: &std::sync::atomic::AtomicU64| Stats::get(c);
     let s = |c: &std::sync::atomic::AtomicU64| Stats::get(c) as f64 / 1e9;
@@ -623,6 +732,12 @@ fn print_breakdown(st: &Stats) {
         g(&st.expert_prefetches),
         g(&st.expert_prefetch_hits),
         g(&st.expert_prefetch_cancels),
+    );
+    eprintln!(
+        "routing: {} picks moved by the prior, {} dropped; {} prompt token-layers skipped",
+        g(&st.route_moved),
+        g(&st.route_dropped),
+        g(&st.prompt_rows_skipped),
     );
 }
 

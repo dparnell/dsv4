@@ -32,6 +32,12 @@ pub struct ModelOptions {
     pub cpu_experts: bool,
     /// All experts, hottest first (None: built-in ranking)
     pub expert_ranking: Option<Vec<crate::experts::Key>>,
+    /// Decode picks its experts as if those in VRAM or RAM scored this much higher (lossy; 0: off)
+    pub route_prior: f32,
+    /// Decode drops picks of this weight rank or lower that would need the disk (lossy; 0: off)
+    pub route_tail_skip: usize,
+    /// Skip the work of prompt positions that cannot influence the prompt's end
+    pub prompt_skip: bool,
     /// Read likely experts of the next layer ahead of its routing
     pub prefetch: bool,
     /// Fill the expert caches from the ranking in the background
@@ -120,6 +126,12 @@ pub struct Model {
     stats: Arc<Stats>,
     cpu_experts: bool,
     prefetch: bool,
+    route_prior: f32,
+    route_tail_skip: usize,
+    prompt_skip: bool,
+    /// (from, to): states of `from < n < to` tokens cannot be resumed, their last layers' window
+    /// rows were skipped
+    gaps: Vec<(usize, usize)>,
     step: std::sync::atomic::AtomicU64,
     snapshot: Option<Snapshot>,
     /// [layer][expert] -> may be routed to (None: all)
@@ -158,6 +170,7 @@ impl Capture {
 
 struct Snapshot {
     tokens: Vec<u32>,
+    gaps: Vec<(usize, usize)>,
     bufs: Vec<(Option<Buf>, Option<Buf>, Option<Buf>)>,
 }
 
@@ -216,34 +229,77 @@ fn scopeguard<F: FnMut()>(f: F) -> Guard<F> {
 pub struct Routing {
     /// per expert: list of (token, k-slot, weight)
     pub per_expert: Vec<Vec<(u32, u32, f32)>>,
+    /// picks changed / dropped by a `RoutePref`
+    pub moved: u64,
+    pub dropped: u64,
 }
 
-pub fn route(cfg: &Config, logits: &[f32], bias: &[f32], t: usize, allowed: Option<&[bool]>) -> Routing {
+/// The longest resumable state of at most `n` tokens: inside a gap, fall back to its start.
+fn resumable(n: usize, gaps: &[(usize, usize)]) -> usize {
+    gaps.iter().rev().fold(n, |n, &(a, b)| if a < n && n < b { a } else { n })
+}
+
+/// Lossy decode routing that favours experts already in memory.
+pub struct RoutePref {
+    /// added to the score held experts are picked by (their weights are not changed)
+    pub prior: f32,
+    /// picks of this weight rank (0-based) or lower that are not held are dropped; 0: none
+    pub tail_skip: usize,
+    /// [expert] -> in VRAM or RAM
+    pub held: Vec<bool>,
+}
+
+pub fn route_score(x: f32) -> f32 {
+    (if x > 20.0 { x } else { x.exp().ln_1p() }).sqrt()
+}
+
+/// Pick the experts of every token from row `from` on; rows before it get none.
+pub fn route(cfg: &Config, logits: &[f32], bias: &[f32], t: usize, from: usize, allowed: Option<&[bool]>, pref: Option<&RoutePref>) -> Routing {
     let ne = cfg.n_experts;
     let k = cfg.n_active;
     let mut per_expert: Vec<Vec<(u32, u32, f32)>> = vec![Vec::new(); ne];
-    let picks: Vec<Vec<(usize, f32)>> = (0..t)
+    let picks: Vec<(Vec<(usize, f32)>, u64, u64)> = (0..t)
         .into_par_iter()
         .map(|ti| {
+            if ti < from {
+                return (Vec::new(), 0, 0);
+            }
             let row = &logits[ti * ne..(ti + 1) * ne];
-            let scores: Vec<f32> = row.iter().map(|&x| (if x > 20.0 { x } else { x.exp().ln_1p() }).sqrt()).collect();
+            let scores: Vec<f32> = row.iter().map(|&x| route_score(x)).collect();
             let mut idx: Vec<usize> = match allowed {
                 Some(m) => (0..ne).filter(|&e| m[e]).collect(),
                 None => (0..ne).collect(),
             };
             let k = k.min(idx.len());
-            idx.select_nth_unstable_by(k - 1, |&a, &b| (scores[b] + bias[b]).total_cmp(&(scores[a] + bias[a])));
-            let sel = &idx[..k];
+            let plain = |e: usize| scores[e] + bias[e];
+            idx.select_nth_unstable_by(k - 1, |&a, &b| plain(b).total_cmp(&plain(a)));
+            let (mut moved, mut dropped) = (0, 0);
+            let mut sel = idx[..k].to_vec();
+            if let Some(p) = pref.filter(|p| p.prior > 0.0) {
+                let s = |e: usize| plain(e) + if p.held[e] { p.prior } else { 0.0 };
+                idx.select_nth_unstable_by(k - 1, |&a, &b| s(b).total_cmp(&s(a)));
+                moved = idx[..k].iter().filter(|e| !sel.contains(e)).count() as u64;
+                sel = idx[..k].to_vec();
+            }
             let sum: f32 = sel.iter().map(|&e| scores[e]).sum::<f32>() + 1e-20;
-            sel.iter().map(|&e| (e, scores[e] / sum * cfg.route_scale)).collect()
+            if let Some(p) = pref.filter(|p| p.tail_skip > 0) {
+                sel.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+                let kept: Vec<usize> = sel.iter().enumerate().filter(|&(r, &e)| r < p.tail_skip || p.held[e]).map(|x| *x.1).collect();
+                dropped = (sel.len() - kept.len()) as u64;
+                sel = kept;
+            }
+            (sel.iter().map(|&e| (e, scores[e] / sum * cfg.route_scale)).collect(), moved, dropped)
         })
         .collect();
-    for (ti, p) in picks.iter().enumerate() {
+    let (mut moved, mut dropped) = (0, 0);
+    for (ti, (p, m, d)) in picks.iter().enumerate() {
+        moved += m;
+        dropped += d;
         for (slot, &(e, w)) in p.iter().enumerate() {
             per_expert[e].push((ti as u32, slot as u32, w));
         }
     }
-    Routing { per_expert }
+    Routing { per_expert, moved, dropped }
 }
 
 impl Model {
@@ -449,6 +505,10 @@ impl Model {
             tokens: Vec::new(),
             stats,
             prefetch: opt.prefetch,
+            route_prior: opt.route_prior,
+            route_tail_skip: opt.route_tail_skip,
+            prompt_skip: opt.prompt_skip,
+            gaps: Vec::new(),
             cpu_experts: opt.cpu_experts && crate::cpu_moe::has_avx2(),
             step: std::sync::atomic::AtomicU64::new(0),
             snapshot: None,
@@ -463,9 +523,11 @@ impl Model {
         self.ring - self.cfg.window - 1
     }
 
-    fn usable(&self, state_tokens: &[u32], prompt: &[u32]) -> usize {
+    fn usable(&self, state_tokens: &[u32], gaps: &[(usize, usize)], prompt: &[u32]) -> usize {
         let common = state_tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
         let common = common.min(prompt.len().saturating_sub(1)); // always recompute the last token
+        // inside a gap: fall back to its start
+        let common = resumable(common, gaps);
         if state_tokens.len() - common <= self.slack() { common } else { 0 }
     }
 
@@ -473,8 +535,8 @@ impl Model {
     /// or the snapshot taken after the previous prefill, and return its length. The compressed
     /// caches are position-indexed and append-only, so only the rings need restoring.
     pub fn prepare(&mut self, prompt: &[u32]) -> usize {
-        let live = self.usable(&self.tokens, prompt);
-        let snap = self.snapshot.as_ref().map(|s| self.usable(&s.tokens, prompt)).unwrap_or(0);
+        let live = self.usable(&self.tokens, &self.gaps, prompt);
+        let snap = self.snapshot.as_ref().map(|s| self.usable(&s.tokens, &s.gaps, prompt)).unwrap_or(0);
         if snap > live {
             let s = self.snapshot.as_ref().unwrap();
             let mut b = self.gpu.begin();
@@ -487,6 +549,7 @@ impl Model {
             }
             b.submit();
             self.tokens = s.tokens.clone();
+            self.gaps = s.gaps.clone();
             self.truncate(snap);
             self.stats.event(format!("restored KV snapshot ({snap} tokens reused)"));
             snap
@@ -506,6 +569,7 @@ impl Model {
     pub fn take_snapshot(&mut self) {
         let snap = self.snapshot.get_or_insert_with(|| Snapshot {
             tokens: Vec::new(),
+            gaps: Vec::new(),
             bufs: self
                 .states
                 .iter()
@@ -525,10 +589,12 @@ impl Model {
         }
         b.submit();
         snap.tokens = self.tokens.clone();
+        snap.gaps = self.gaps.clone();
     }
 
     pub fn truncate(&mut self, n: usize) {
         self.tokens.truncate(n);
+        self.gaps.retain(|g| g.0 < n);
         Stats::set(&self.stats.ctx_len, n as u64);
     }
 
@@ -598,17 +664,39 @@ impl Model {
     /// Run the model over `toks` (appended at the current position). Returns logits of the last
     /// token.
     pub fn forward(&mut self, toks: &[u32]) -> Result<Vec<f32>> {
+        let p0 = self.tokens.len();
+        let end = p0 + toks.len();
+        // Every state of `resume` or more tokens stays usable for a later request that diverges
+        // near the end of this prompt; only what those states need is computed.
+        let margin = (toks.len() / 8).clamp(16, 512);
+        let resume = (self.prompt_skip && self.capture.is_none() && self.cfg.skip_layer().is_some() && end > p0 + margin).then(|| end - margin);
         let mut logits = Vec::new();
         let mut i = 0;
         while i < toks.len() {
             let n = (toks.len() - i).min(self.seg);
-            logits = self.forward_segment(&toks[i..i + n])?;
+            logits = self.forward_segment(&toks[i..i + n], resume)?;
             i += n;
+        }
+        if let Some(r) = resume {
+            self.gaps.push((p0, r));
         }
         Ok(logits)
     }
 
-    fn forward_segment(&mut self, toks: &[u32]) -> Result<Vec<f32>> {
+    /// First positions whose window keys, and whose whole output, layer `l` must produce so that
+    /// position `resume` and all later ones come out exactly.
+    fn needed_from(&self, l: usize, resume: Option<usize>) -> (usize, usize) {
+        let (Some(r), Some(y)) = (resume, self.cfg.skip_layer()) else { return (0, 0) };
+        if l < y {
+            return (0, 0);
+        }
+        // each layer looks back one window further than the one above it
+        let back = self.cfg.window - 1;
+        let out = r.saturating_sub(back * (self.cfg.n_layers - 1 - l));
+        (out.saturating_sub(back), out)
+    }
+
+    fn forward_segment(&mut self, toks: &[u32], resume: Option<usize>) -> Result<Vec<f32>> {
         let cfg = self.cfg.clone();
         let t_all = toks.len();
         let p0 = self.tokens.len();
@@ -651,11 +739,17 @@ impl Model {
             let ly = &self.layers[l];
             let ratio = cfg.ratio(l);
             let yarn = ratio > 0;
+            let (keys_from, out_from) = self.needed_from(l, resume);
+            let last = p0 + t_all - 1;
             // ---------------- attention, chunk by chunk ----------------
             for c in 0..n_chunks {
                 let c0 = c * self.chunk;
                 let m = (t_all - c0).min(self.chunk);
                 let pc = p0 + c0;
+                let keys_only = pc + m - 1 < out_from;
+                if pc + m - 1 < keys_from && self.cfg.skip_layer() != Some(l) {
+                    continue;
+                }
                 if let (Some(e), true) = (&ly.engram, self.engram.is_some()) {
                     let li = cfg.engram_layers.iter().position(|&x| x == l).unwrap();
                     let width = self.engram.as_ref().unwrap().cols() * self.engram.as_ref().unwrap().head_dim;
@@ -679,7 +773,10 @@ impl Model {
                     &[d as u32, (l == 0) as u32, f(cfg.norm_eps), c0 as u32, 0, 0],
                     (m as u32, 1, 1),
                 );
-                self.attention(&mut batch, l, c, m, pc, c0, yarn, &mut cand_active)?;
+                self.attention(&mut batch, l, c, m, pc, c0, yarn, &mut cand_active, keys_only)?;
+                if keys_only {
+                    continue;
+                }
                 batch.run(
                     "hc_post",
                     &[a.h.all(), a.y.all(), a.dummy.all(), a.mix_a.all()],
@@ -687,6 +784,14 @@ impl Model {
                     grid1d(m * d),
                 );
             }
+            if last < out_from {
+                // nothing here is needed past this layer
+                batch.submit();
+                Stats::add(&self.stats.prompt_rows_skipped, (t_all * (cfg.n_layers - l)) as u64);
+                return Ok(Vec::new());
+            }
+            let row_from = out_from.saturating_sub(p0);
+            Stats::add(&self.stats.prompt_rows_skipped, row_from as u64);
             // ---------------- MoE over the whole segment ----------------
             batch.run(
                 "hc_mix",
@@ -716,7 +821,11 @@ impl Model {
             Stats::add(&self.stats.t_gpu_wait_ns, tw.elapsed().as_nanos() as u64);
             let xnf_host: Option<Vec<f32>> = if want_x { Some(bytemuck::cast_slice(&back.pop().unwrap()).to_vec()) } else { None };
             let rl: Vec<f32> = bytemuck::cast_slice(&back.pop().unwrap()).to_vec();
-            let routing = route(&cfg, &rl, &ly.exp_bias, t_all, self.allowed.as_ref().map(|a| a[l].as_slice()));
+            let pref = (t_all == 1 && (self.route_prior > 0.0 || self.route_tail_skip > 0))
+                .then(|| RoutePref { prior: self.route_prior, tail_skip: self.route_tail_skip, held: self.experts.held(l, cfg.n_experts) });
+            let routing = route(&cfg, &rl, &ly.exp_bias, t_all, row_from, self.allowed.as_ref().map(|a| a[l].as_slice()), pref.as_ref());
+            Stats::add(&self.stats.route_moved, routing.moved);
+            Stats::add(&self.stats.route_dropped, routing.dropped);
             if let Some(cap) = self.capture.as_mut().filter(|c| c.layer == l) {
                 cap.write(&routing, xnf_host.as_deref().unwrap(), d)?;
                 if cap.stop {
@@ -750,7 +859,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn attention(&self, b: &mut Batch, l: usize, c: usize, m: usize, pc: usize, c0: usize, yarn: bool, cand_active: &mut [bool]) -> Result<()> {
+    fn attention(&self, b: &mut Batch, l: usize, c: usize, m: usize, pc: usize, c0: usize, yarn: bool, cand_active: &mut [bool], keys_only: bool) -> Result<()> {
         let cfg = &self.cfg;
         let a = &self.acts;
         let ly = &self.layers[l];
@@ -813,6 +922,9 @@ impl Model {
                     self.quant(b, &a.lat, g, hd, 16, 2);
                     self.copy(b, &a.lat, 0, st.ccache.as_ref().unwrap(), j_lo * hd, g * hd);
                 }
+            }
+            if keys_only {
+                return Ok(());
             }
             let n_comp = (pc + m) / ratio;
             let k_eff = topk.min(n_comp);
@@ -903,6 +1015,15 @@ impl Model {
         let gpu = &self.gpu;
         let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
         trace_routing(step, l, routing);
+        if routing.dropped > 0 {
+            // a dropped pick's output row still holds an earlier layer's values
+            let mut used = vec![false; cfg.n_active];
+            routing.per_expert.iter().flatten().for_each(|&(_, k, _)| used[k as usize] = true);
+            let zero = vec![0u8; cfg.dim * 4];
+            for k in (0..cfg.n_active).filter(|&k| !used[k]) {
+                gpu.write(&self.acts.o6, (k * cfg.dim * 4) as u64, &zero);
+            }
+        }
         let mut gpu_list: Vec<usize> = Vec::new();
         let mut cpu_list: Vec<usize> = Vec::new();
         let mut uses = vec![0f64; cfg.n_experts];
@@ -989,6 +1110,9 @@ impl Model {
         let d = cfg.dim;
         let w = &self.gate_host[next];
         let bias = &self.layers[next].exp_bias;
+        // expect what `route` will pick
+        let held = (self.route_prior > 0.0).then(|| self.experts.held(next, cfg.n_experts));
+        let keep = if self.route_tail_skip > 0 { self.route_tail_skip.min(cfg.n_active) } else { cfg.n_active };
         let mut want: Vec<(usize, usize)> = Vec::new();
         for t in 0..t_all {
             let xt = &x[t * d..(t + 1) * d];
@@ -996,13 +1120,13 @@ impl Model {
                 .into_par_iter()
                 .map(|e| {
                     let z: f32 = w[e * d..(e + 1) * d].iter().zip(xt).map(|(a, b)| a * b).sum();
-                    (if z > 20.0 { z } else { z.exp().ln_1p() }).sqrt() + bias[e]
+                    route_score(z) + bias[e] + if held.as_ref().is_some_and(|h| h[e]) { self.route_prior } else { 0.0 }
                 })
                 .collect();
             let mut idx: Vec<usize> = (0..cfg.n_experts).collect();
             // best guesses first: the rest is dropped if the disk has not got to it in time
             idx.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]));
-            for (r, &e) in idx[..cfg.n_active].iter().enumerate() {
+            for (r, &e) in idx[..keep].iter().enumerate() {
                 want.push((r, e));
             }
         }
@@ -1087,4 +1211,53 @@ fn trace_routing(step: u64, l: usize, routing: &Routing) {
     }
     line.push(char::from(10));
     let _ = f.lock().unwrap().write_all(line.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pick(r: &Routing) -> Vec<(usize, f32)> {
+        r.per_expert.iter().enumerate().flat_map(|(e, l)| l.iter().map(move |x| (e, x.2))).collect()
+    }
+
+    #[test]
+    fn resume_avoids_gaps() {
+        let gaps = [(0, 100), (130, 400)];
+        for (n, want) in [(50, 0), (100, 100), (120, 120), (130, 130), (399, 130), (400, 400), (450, 450)] {
+            assert_eq!(resumable(n, &gaps), want, "{n}");
+        }
+        // gaps that meet
+        assert_eq!(resumable(250, &[(0, 210), (200, 300)]), 0);
+    }
+
+    #[test]
+    fn route_preferences() {
+        let mut cfg = Config::default();
+        cfg.n_experts = 6;
+        cfg.n_active = 2;
+        cfg.route_scale = 1.0;
+        let logits = [3.0, 2.0, 1.95, 0.0, -1.0, -2.0f32];
+        let bias = [0.0; 6];
+        let plain = route(&cfg, &logits, &bias, 1, 0, None, None);
+        assert_eq!(pick(&plain).iter().map(|x| x.0).collect::<Vec<_>>(), [0, 1]);
+        // expert 2 is nearly as good as 1 and in memory
+        let held = vec![false, false, true, false, false, true];
+        let p = RoutePref { prior: 0.1, tail_skip: 0, held: held.clone() };
+        let r = route(&cfg, &logits, &bias, 1, 0, None, Some(&p));
+        assert_eq!(pick(&r).iter().map(|x| x.0).collect::<Vec<_>>(), [0, 2]);
+        assert_eq!((r.moved, r.dropped), (1, 0));
+        // weights come from the unbiased scores
+        let w = route_score(3.0) / (route_score(3.0) + route_score(1.95));
+        assert!((pick(&r)[0].1 - w).abs() < 1e-6);
+        // the tail skip keeps the remaining weight as it was
+        let p = RoutePref { prior: 0.0, tail_skip: 1, held };
+        let r = route(&cfg, &logits, &bias, 1, 0, None, Some(&p));
+        assert_eq!(pick(&r), vec![pick(&plain)[0]]);
+        assert_eq!(r.dropped, 1);
+        // rows before `from` get nothing
+        let two: Vec<f32> = logits.iter().chain(&logits).copied().collect();
+        let r = route(&cfg, &two, &bias, 2, 1, None, None);
+        assert!(r.per_expert.iter().flatten().all(|x| x.0 == 1));
+    }
 }

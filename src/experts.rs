@@ -651,6 +651,14 @@ impl ExpertStore {
         self.vram.lock().map.contains_key(&key(layer, e))
     }
 
+    /// Which experts of `layer` are in VRAM or RAM right now.
+    pub fn held(&self, layer: usize, n_experts: usize) -> Vec<bool> {
+        let v = self.vram.lock();
+        let p = self.pinned_ram.lock();
+        let r = self.ram.lock();
+        (0..n_experts).map(|e| key(layer, e)).map(|k| v.map.contains_key(&k) || p.contains_key(&k) || r.map.contains_key(&k)).collect()
+    }
+
     /// Load `set` (layer, expert) into pinned host memory, then pin as many as fit into VRAM,
     /// keeping `reserve` slots free for streaming anything else. Returns how many went to VRAM.
     pub fn pin(&self, gpu: &Gpu, set: &[(usize, usize)], reserve: usize) -> Result<usize> {

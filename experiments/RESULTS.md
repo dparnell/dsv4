@@ -55,3 +55,31 @@ tok/s; `--no-warm-up` 0.4 / 0.51.
   count with half-life 16 24.5%; the ranking mainly helps prefill (4,500 experts: 1.00 -> 0.62).
 - Prefetching reads ~18% more from disk with no clear speed gain on this drive.
 - Cold random reads on this drive: ~0.75 GB/s regardless of queue depth (1 MB requests: 0.4).
+
+# Lossy routing (`--route-prior`, `--route-tail-skip`)
+
+`dsv4 eval`, 3 texts x (64 prompt + 60 teacher-forced tokens, 177 decode steps), 26 VRAM slots,
+36 GB RAM tier. "Held" = in VRAM or RAM. Reference: the same build without the flags (a repeat of
+it is bit-identical, so the quality noise floor is 0). One run each; the drive's speed varies, so
+disk GB (prompts included) is the steadier measure of work.
+
+| | Decode tok/s | Disk GB | PPL | KLD | Worst KLD | Same top-1 |
+|---|---|---|---|---|---|---|
+| off / repeat | 0.64 / 0.61 | 562 / 563 | 4.910 | 0 | 0 | 100% |
+| tail-skip 5 | 1.01 | 491 | 4.895 | 0.0144 | 0.10 | 95.0% |
+| prior 0.05 | 0.85 | 478 | 4.887 | 0.0185 | 0.18 | 95.6% |
+| prior 0.1 | 0.78 | 428 | 5.039 | 0.0208 | 0.16 | 92.8% |
+| prior 0.1 + tail-skip 5 | 1.11 | 410 | 4.956 | 0.0235 | 0.26 | 93.3% |
+| tail-skip 3 | 1.80 | 369 | 5.325 | 0.0473 | 1.03 | 91.1% |
+
+# Prompt skip
+
+Only what the last `clamp(len/8, 16, 512)` positions need is computed past layer 20.
+
+- Exact: 490-token prompt (segment 128, chunk 64) + 14 tokens, `--gpu-only-experts`: logits
+  bit-identical with and without. Longer prompts are not reproducible run to run (the top-k shader
+  emits indices in arbitrary order): on 1,100 tokens the skip differs by KLD 0.008, a plain repeat
+  by 0.010.
+- Work: 4,500 tokens + 32: disk 1,016 -> 757 GB (-25%), uploads 1,118 -> 870 GB. 1,100 tokens: -4%;
+  no benefit for short prompts. Wall time there was 691 -> 803 s, but the drive averaged 1.4 vs
+  0.9 GB/s in the two runs, so no speedup has been demonstrated.

@@ -47,10 +47,21 @@ On top of that:
 * **Layer-major prefill.** Prompts are processed in segments (`--segment`, default 1024 tokens): every token of a
   segment passes layer *l* before any passes layer *l+1*, so each routed expert is fetched at most once per layer
   per segment instead of once per token.
+* **Prompt skip.** Past the last compressed-KV layer (20 of 40) a position only matters to those shortly after it, so
+  early positions of long prompts stop there (`--no-prompt-skip` disables this). A later request that diverges from the
+  prompt earlier than its last eighth (16-512 tokens) recomputes the new part of the previous prompt.
 * **Prefix reuse.** The KV state of the previous request is kept; a new request that shares its prefix
   (multi-turn chat) only prefills the new tokens.
 * The model's own KV-compression (128-token sliding window + 2:1 / 1:1 compressed KV with a sparse top-512
   indexer) keeps the KV cache tiny, so long contexts cost little VRAM.
+
+### Lossy routing (off by default)
+
+Both flags change the output of decoding, depending on which experts happen to be cached. Measured costs:
+[experiments/RESULTS.md](experiments/RESULTS.md).
+
+* `--route-tail-skip [R]` (default 5): drop picks of weight rank R or lower that would need the disk.
+* `--route-prior [LAMBDA]` (default 0.1): pick experts as if those in memory scored LAMBDA higher.
 
 ### What speed to expect
 
@@ -95,6 +106,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/jso
 | `prompt file.json` | render an OpenAI messages file with the model's chat template |
 | `info` | GGUF metadata, tensor types and model configuration |
 | `selftest` | every WGSL kernel (and the CPU expert path) against a CPU reference |
+| `eval` | teacher-forced perplexity and speed on text files; `--save` / `--base` compare two configurations |
 | `bench-io` | expert streaming throughput from disk and CPU expert speed |
 
 Common model options: `--ctx` (context, default 32768), `--segment`, `--chunk`, `--expert-vram-gb`,

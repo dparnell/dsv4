@@ -10,13 +10,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use half::f16;
 use rayon::prelude::*;
 
 use crate::config::Config;
 use crate::engram::Engram;
 use crate::experts::ExpertStore;
-use crate::gguf::{GGML_Q8_0, Gguf, TensorInfo};
+use crate::gguf::{Gguf, TensorInfo};
 use crate::gpu::{B, Batch, Buf, Gpu};
 use crate::stats::Stats;
 use crate::weights::{Layer, Q8W, f32_buf};
@@ -341,8 +340,8 @@ impl Model {
         let head = Q8W::load(&g, &gpu, "output.weight")?;
         gpu.flush();
         let embd = g.tensor("token_embd.weight")?.clone();
-        if embd.ty != GGML_Q8_0 {
-            bail!("token_embd: only Q8_0 supported");
+        if !crate::quants::can_dequantize(embd.ty) {
+            bail!("token_embd: {} is not supported", crate::gguf::type_name(embd.ty));
         }
         let dense = gpu.gpu_bytes.load(std::sync::atomic::Ordering::Relaxed);
         Stats::set(&stats.gpu_dense_bytes, dense);
@@ -603,17 +602,12 @@ impl Model {
     fn embed(&self, toks: &[u32]) -> Vec<f32> {
         let d = self.cfg.dim;
         let raw = self.g.bytes(&self.embd);
-        let row_bytes = d / 32 * 34;
+        let row_bytes = raw.len() / (self.embd.n_elements() as usize / d);
         let hc = self.cfg.hc_mult;
         let mut out = vec![0f32; toks.len() * hc * d];
         out.par_chunks_mut(hc * d).zip(toks.par_iter()).for_each(|(o, &t)| {
             let r = &raw[t as usize * row_bytes..(t as usize + 1) * row_bytes];
-            for (b, blk) in r.chunks_exact(34).enumerate() {
-                let s = f16::from_le_bytes([blk[0], blk[1]]).to_f32();
-                for i in 0..32 {
-                    o[b * 32 + i] = blk[2 + i] as i8 as f32 * s;
-                }
-            }
+            crate::quants::dequantize(self.embd.ty, r, &mut o[..d]);
             let (first, rest) = o.split_at_mut(d);
             for c in rest.chunks_exact_mut(d) {
                 c.copy_from_slice(first);
@@ -1065,13 +1059,14 @@ impl Model {
                     let jobs: Vec<crate::cpu_moe::Job> = batch
                         .iter()
                         .map(|(e, blob)| crate::cpu_moe::Job {
+                            geom: geom.layers[l],
                             blob,
                             xs: routing.per_expert[*e].iter().map(|&(t, _, _)| &x[t as usize * d..(t as usize + 1) * d]).collect(),
                             ws: routing.per_expert[*e].iter().map(|&(_, _, w)| w).collect(),
                         })
                         .collect();
                     let t_run = std::time::Instant::now();
-                    let ys = crate::cpu_moe::experts_forward(&jobs, geom.inter, d, geom.layers[l].host[0], cfg.swiglu_limit);
+                    let ys = crate::cpu_moe::experts_forward(&jobs, geom.inter, d, cfg.swiglu_limit);
                     Stats::add(&self.stats.t_cpu_compute_ns, t_run.elapsed().as_nanos() as u64);
                     for ((e, _), ys) in batch.iter().zip(ys) {
                         out.rows.extend(routing.per_expert[*e].iter().zip(ys).map(|(&(t, k, _), y)| (t as usize * cfg.n_active + k as usize, y)));
@@ -1152,7 +1147,15 @@ impl Model {
         let gpu = &self.gpu;
         let cap = self.experts.streaming_slots();
         let geom = &self.experts.geom;
-        let mat_words = (geom.layers[l].host[0] / 4) as u32;
+        let types = geom.layers[l].types;
+        let lens = geom.layers[l].slot_lens(geom.inter, geom.dim);
+        let (up_word, down_word) = ((lens[0] / 4) as u32, ((lens[0] + lens[1]) / 4) as u32);
+        // p7.. of the low-bit kernels
+        let extra = |ty: u32| -> [u32; 5] {
+            let lut: &[u32; 4] = bytemuck::cast_ref(crate::quants::codes(ty).0);
+            [crate::quants::has_min(ty) as u32, lut[0], lut[1], lut[2], lut[3]]
+        };
+        let lut = types.map(|t| t != crate::gguf::GGML_MXFP4);
         let mut waves = list.chunks(cap).peekable();
         while let Some(wave) = waves.next() {
             // read the next wave while this one is uploaded and recorded
@@ -1177,17 +1180,37 @@ impl Model {
                 let slab = &self.experts.slabs[s.slab].buf;
                 let sb = slab.range(s.offset, geom.slot_bytes);
                 let tm = if cnt == 1 { 1 } else { 8 };
-                let (gk, dk) = if tm == 1 { ("moe_gate_up_1", "moe_down_1") } else { ("moe_gate_up_8", "moe_down_8") };
+                let gk = match (lut[0], tm) {
+                    (false, 1) => "moe_gate_up_1",
+                    (false, _) => "moe_gate_up_8",
+                    (true, 1) => "moe_gate_up_lut_1",
+                    (true, _) => "moe_gate_up_lut_8",
+                };
+                let dk = match (lut[2], tm) {
+                    (false, 1) => "moe_down_1",
+                    (false, _) => "moe_down_8",
+                    (true, 1) => "moe_down_lut_1",
+                    (true, _) => "moe_down_lut_8",
+                };
+                let mut gp = vec![geom.inter as u32, geom.dim as u32, cnt as u32, start as u32, f(cfg.swiglu_limit), up_word, cfg.dim as u32];
+                if lut[0] {
+                    gp.extend(extra(types[0]));
+                }
+                let mut dp = vec![geom.dim as u32, geom.inter as u32, cnt as u32, start as u32, 0, down_word];
+                if lut[2] {
+                    dp.push(0);
+                    dp.extend(extra(types[2]));
+                }
                 b.run(
                     gk,
                     &[sb, a.xnf.all(), a.route.all(), a.hmid.all()],
-                    &[geom.inter as u32, geom.dim as u32, cnt as u32, start as u32, f(cfg.swiglu_limit), mat_words, cfg.dim as u32],
+                    &gp,
                     ((geom.inter as u32).div_ceil(8), (cnt as u32).div_ceil(tm), 1),
                 );
                 b.run(
                     dk,
                     &[sb, a.hmid.all(), a.route.all(), a.o6.all()],
-                    &[geom.dim as u32, geom.inter as u32, cnt as u32, start as u32, 0, 2 * mat_words],
+                    &dp,
                     ((geom.dim as u32).div_ceil(8), (cnt as u32).div_ceil(tm), 1),
                 );
             }

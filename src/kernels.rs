@@ -274,6 +274,175 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
 }
 "#;
 
+/// Low-bit (IQ1-IQ3, Q2_K, Q3_K) expert matrices, as laid out by `quants::to_slot`: 4-bit codes into
+/// the 16 int8 values of p8..p11, an int8 scale per 16 weights and a float per 256 (p7 != 0: also
+/// a uint8 offset per 16 and its float per 256). K is a multiple of 256.
+const LUT_COMMON: &str = r#"
+var<private> KV4: array<f32, 16>;
+fn init_lut() {
+  let w = array<u32, 4>(P.p8, P.p9, P.p10, P.p11);
+  for (var j = 0u; j < 4u; j++) {
+    let v = vec4<f32>(unpack4xI8(w[j]));
+    for (var i = 0u; i < 4u; i++) { KV4[j * 4u + i] = v[i]; }
+  }
+}
+fn lo4(w: u32) -> vec4<f32> {
+  return vec4<f32>(KV4[w & 15u], KV4[(w >> 8u) & 15u], KV4[(w >> 16u) & 15u], KV4[(w >> 24u) & 15u]);
+}
+fn hi4(w: u32) -> vec4<f32> {
+  return vec4<f32>(KV4[(w >> 4u) & 15u], KV4[(w >> 12u) & 15u], KV4[(w >> 20u) & 15u], KV4[(w >> 28u) & 15u]);
+}
+// scales of the two halves of block b (32 weights) in a row of the matrix at word `m`
+fn scales(m: u32, row: u32, b: u32) -> vec2<f32> {
+  let n = P.p0 * P.p1;
+  let sb = m + n / 8u;
+  let i = row * (P.p1 / 16u) + b * 2u;
+  let v = unpack4xI8(S[sb + (i >> 2u)]);
+  let d = fbits(S[sb + n / 64u + row * (P.p1 / 256u) + (b >> 3u)]);
+  return vec2<f32>(f32(v[i & 3u]), f32(v[(i & 3u) + 1u])) * d;
+}
+fn mins(m: u32, row: u32, b: u32) -> vec2<f32> {
+  if (P.p7 == 0u) { return vec2<f32>(0.0); }
+  let n = P.p0 * P.p1;
+  let mb = m + n / 8u + n / 64u + n / 256u;
+  let i = row * (P.p1 / 16u) + b * 2u;
+  let v = unpack4xU8(S[mb + (i >> 2u)]);
+  let d = fbits(S[mb + n / 64u + row * (P.p1 / 256u) + (b >> 3u)]);
+  return vec2<f32>(f32(v[i & 3u]), f32(v[(i & 3u) + 1u])) * d;
+}
+"#;
+
+/// MOE_GATE_UP for low-bit matrices. Also p7=offsets p8..p11=values
+const MOE_GATE_UP_LUT: &str = r#"
+@group(0) @binding(0) var<storage, read> S: array<u32>;
+@group(0) @binding(1) var<storage, read> X: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> R: array<u32>;
+@group(0) @binding(3) var<storage, read_write> H: array<f32>;
+var<workgroup> red: array<array<vec2<f32>, TM>, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+  let N = P.p0; let K = P.p1; let cnt = P.p2;
+  let lane = li & 31u;
+  let row = wid.x * 8u + (li >> 5u);
+  let t0 = wid.y * TM;
+  let nb = K / 32u;
+  init_lut();
+  let up = P.p5;                  // word offset of the up matrix
+  var acc: array<vec2<f32>, TM>;
+  for (var t = 0u; t < TM; t++) { acc[t] = vec2<f32>(0.0); }
+  if (row < N) {
+    for (var b = lane; b < nb; b += 32u) {
+      let s = row * nb + b;
+      let sg = scales(0u, row, b);
+      let su = scales(up, row, b);
+      let mg = mins(0u, row, b);
+      let mu = mins(up, row, b);
+      var g: array<vec4<f32>, 8>;
+      var u: array<vec4<f32>, 8>;
+      for (var i = 0u; i < 4u; i++) {
+        let wg = S[s * 4u + i];
+        let wu = S[up + s * 4u + i];
+        g[i] = lo4(wg); g[i + 4u] = hi4(wg);
+        u[i] = lo4(wu); u[i + 4u] = hi4(wu);
+      }
+      for (var t = 0u; t < TM; t++) {
+        if (t0 + t < cnt) {
+          let tok = R[(P.p3 + t0 + t) * 3u];
+          let xb = (tok * P.p6 + b * 32u) >> 2u;
+          var dg = vec2<f32>(0.0); var du = vec2<f32>(0.0); var sx = vec2<f32>(0.0);
+          for (var i = 0u; i < 4u; i++) {
+            let x = X[xb + i]; let y = X[xb + i + 4u];
+            dg += vec2<f32>(dot(g[i], x), dot(g[i + 4u], y));
+            du += vec2<f32>(dot(u[i], x), dot(u[i + 4u], y));
+            if (P.p7 != 0u) { sx += vec2<f32>(dot(vec4<f32>(1.0), x), dot(vec4<f32>(1.0), y)); }
+          }
+          acc[t] += vec2<f32>(dot(dg, sg) - dot(sx, mg), dot(du, su) - dot(sx, mu));
+        }
+      }
+    }
+  }
+  for (var t = 0u; t < TM; t++) { red[li][t] = acc[t]; }
+  workgroupBarrier();
+  for (var s = 16u; s > 0u; s >>= 1u) {
+    if (lane < s) { for (var t = 0u; t < TM; t++) { red[li][t] += red[li + s][t]; } }
+    workgroupBarrier();
+  }
+  if (lane == 0u && row < N) {
+    let lim = fbits(P.p4);
+    for (var t = 0u; t < TM; t++) {
+      if (t0 + t < cnt) {
+        let e = P.p3 + t0 + t;
+        let w = fbits(R[e * 3u + 2u]);
+        let gv = min(red[li][t].x, lim);
+        let uv = clamp(red[li][t].y, -lim, lim);
+        H[e * N + row] = gv / (1.0 + exp(-gv)) * uv * w;
+      }
+    }
+  }
+}
+"#;
+
+/// MOE_DOWN for low-bit matrices. Also p7=offsets p8..p11=values
+const MOE_DOWN_LUT: &str = r#"
+@group(0) @binding(0) var<storage, read> S: array<u32>;
+@group(0) @binding(1) var<storage, read> Hh: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> R: array<u32>;
+@group(0) @binding(3) var<storage, read_write> O: array<f32>;
+var<workgroup> red: array<array<f32, TM>, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+  let N = P.p0; let K = P.p1; let cnt = P.p2;
+  let lane = li & 31u;
+  let row = wid.x * 8u + (li >> 5u);
+  let t0 = wid.y * TM;
+  let nb = K / 32u;
+  init_lut();
+  let base = P.p5;
+  var acc: array<f32, TM>;
+  for (var t = 0u; t < TM; t++) { acc[t] = 0.0; }
+  if (row < N) {
+    for (var b = lane; b < nb; b += 32u) {
+      let s = row * nb + b;
+      let sc = scales(base, row, b);
+      let mn = mins(base, row, b);
+      var w: array<vec4<f32>, 8>;
+      for (var i = 0u; i < 4u; i++) {
+        let ww = S[base + s * 4u + i];
+        w[i] = lo4(ww); w[i + 4u] = hi4(ww);
+      }
+      for (var t = 0u; t < TM; t++) {
+        if (t0 + t < cnt) {
+          let xb = ((P.p3 + t0 + t) * K + b * 32u) >> 2u;
+          var d = vec2<f32>(0.0); var sx = vec2<f32>(0.0);
+          for (var i = 0u; i < 4u; i++) {
+            let x = Hh[xb + i]; let y = Hh[xb + i + 4u];
+            d += vec2<f32>(dot(w[i], x), dot(w[i + 4u], y));
+            if (P.p7 != 0u) { sx += vec2<f32>(dot(vec4<f32>(1.0), x), dot(vec4<f32>(1.0), y)); }
+          }
+          acc[t] += dot(d, sc) - dot(sx, mn);
+        }
+      }
+    }
+  }
+  for (var t = 0u; t < TM; t++) { red[li][t] = acc[t]; }
+  workgroupBarrier();
+  for (var s = 16u; s > 0u; s >>= 1u) {
+    if (lane < s) { for (var t = 0u; t < TM; t++) { red[li][t] += red[li + s][t]; } }
+    workgroupBarrier();
+  }
+  if (lane == 0u && row < N) {
+    for (var t = 0u; t < TM; t++) {
+      if (t0 + t < cnt) {
+        let orow = R[(P.p3 + t0 + t) * 3u + 1u];
+        O[orow * N + row] = red[li][t];
+      }
+    }
+  }
+}
+"#;
+
 /// RMSNorm over rows. p0=D p1=in_off p2=out_off p3=in_stride p4=out_stride p5=eps p6=has_weight
 const RMSNORM: &str = r#"
 @group(0) @binding(0) var<storage, read> X: array<f32>;
@@ -951,6 +1120,10 @@ pub fn all() -> Vec<(&'static str, String)> {
         ("moe_gate_up_8", k(&format!("{MXFP4_COMMON}{}", MOE_GATE_UP.replace("TM", "8u")))),
         ("moe_down_1", k(&format!("{MXFP4_COMMON}{}", MOE_DOWN.replace("TM", "1u")))),
         ("moe_down_8", k(&format!("{MXFP4_COMMON}{}", MOE_DOWN.replace("TM", "8u")))),
+        ("moe_gate_up_lut_1", k(&format!("{LUT_COMMON}{}", MOE_GATE_UP_LUT.replace("TM", "1u")))),
+        ("moe_gate_up_lut_8", k(&format!("{LUT_COMMON}{}", MOE_GATE_UP_LUT.replace("TM", "8u")))),
+        ("moe_down_lut_1", k(&format!("{LUT_COMMON}{}", MOE_DOWN_LUT.replace("TM", "1u")))),
+        ("moe_down_lut_8", k(&format!("{LUT_COMMON}{}", MOE_DOWN_LUT.replace("TM", "8u")))),
         ("rmsnorm", k(RMSNORM)),
         ("rope", k(ROPE)),
         ("quant_sim", k(QUANT_SIM)),

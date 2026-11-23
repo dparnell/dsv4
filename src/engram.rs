@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::gguf::{GGML_BF16, GGML_F32, GGML_MXFP8, Gguf, TensorInfo};
+use crate::gguf::{GGML_MXFP8, Gguf, TensorInfo};
 use crate::stats::Stats;
 
 pub struct Engram {
@@ -51,9 +51,11 @@ impl Engram {
         let hd = table.dims[0] as usize;
         let row_bytes = match table.ty {
             GGML_MXFP8 => hd / 32 * 33,
-            GGML_BF16 => hd * 2,
-            GGML_F32 => hd * 4,
-            t => bail!("engram table type {t} not supported (use the MXFP8/BF16 engram)"),
+            t if crate::quants::can_dequantize(t) && hd as u64 % crate::gguf::type_block(t).unwrap().0 == 0 => {
+                let (be, bb) = crate::gguf::type_block(t).unwrap();
+                hd / be as usize * bb as usize
+            }
+            t => bail!("engram table type {} is not supported", crate::gguf::type_name(t)),
         };
         let n_cols = cfg.engram_layers.len() * cfg.n_hash_cols();
         if cfg.engram_offsets.len() != n_cols || cfg.engram_primes.len() != n_cols {
@@ -117,16 +119,7 @@ impl Engram {
                     }
                 }
             }
-            GGML_BF16 => {
-                for (c, v) in b.chunks_exact(2).zip(out.iter_mut()) {
-                    *v = half::bf16::from_le_bytes([c[0], c[1]]).to_f32();
-                }
-            }
-            _ => {
-                for (c, v) in b.chunks_exact(4).zip(out.iter_mut()) {
-                    *v = f32::from_le_bytes(c.try_into().unwrap());
-                }
-            }
+            ty => crate::quants::dequantize(ty, b, out),
         }
     }
 

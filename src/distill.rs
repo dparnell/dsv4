@@ -131,6 +131,7 @@ pub fn load_expert(g: &Gguf, cfg: &Config, layer: usize, e: usize) -> Result<Exp
     let mut raws: Vec<Vec<u8>> = Vec::new();
     for nm in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
         let t = g.tensor(&format!("blk.{layer}.{nm}.weight"))?;
+        anyhow::ensure!(t.ty == crate::gguf::GGML_MXFP4, "distillation needs MXFP4 experts (UD-Q4_K_XL)");
         let stride = (t.nbytes / t.dims[2]) as usize;
         raws.push(g.bytes(t)[e * stride..(e + 1) * stride].to_vec());
     }

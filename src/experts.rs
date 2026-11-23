@@ -10,9 +10,11 @@
 //! `HEAT_HALF_LIFE` forward steps, started from a routing profile. The profile also decides what
 //! the caches are filled with while the disk is otherwise idle after startup.
 //!
-//! An expert is gate|up|down MXFP4 matrices, each stored on the GPU as
-//! [qs: rows*nb*16 bytes][e8m0 scales: rows*nb bytes] (nb = K/32 blocks per row).
+//! An expert is gate|up|down matrices. MXFP4 ones are stored as [qs: rows*nb*16 bytes]
+//! [e8m0 scales: rows*nb bytes] (nb = K/32 blocks per row) in both tiers; low-bit ones keep their
+//! GGUF bytes in RAM and become 4-bit codes plus scales in VRAM (quants.rs).
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::sync::Arc;
@@ -25,6 +27,7 @@ use crate::config::Config;
 use crate::expert_io::{Finished, LayerParts, Load, Loader, Part, PartKind, THREADS};
 use crate::gguf::{GGML_MXFP4, Gguf, type_block};
 use crate::gpu::{Buf, Gpu};
+use crate::quants;
 use crate::stats::Stats;
 
 pub type Key = u32;
@@ -44,6 +47,30 @@ pub struct LayerGeom {
 impl LayerGeom {
     pub fn host_len(&self) -> usize {
         self.host.iter().sum()
+    }
+    /// bytes of each matrix in a VRAM slot
+    pub fn slot_lens(&self, inter: usize, dim: usize) -> [usize; 3] {
+        self.types.map(|t| quants::slot_len(t, inter, dim))
+    }
+    /// The VRAM slot contents for an expert as the RAM tier holds it.
+    pub fn slot_data<'a>(&self, inter: usize, dim: usize, host: &'a [u8]) -> Cow<'a, [u8]> {
+        if self.types == [GGML_MXFP4; 3] {
+            return Cow::Borrowed(host);
+        }
+        let lens = self.slot_lens(inter, dim);
+        let mut out = vec![0u8; lens.iter().sum()];
+        let (mut src, mut dst) = (host, &mut out[..]);
+        for i in 0..3 {
+            let (s, d);
+            (s, src) = src.split_at(self.host[i]);
+            (d, dst) = dst.split_at_mut(lens[i]);
+            let (rows, k) = if i == 2 { (dim, inter) } else { (inter, dim) };
+            match self.types[i] {
+                GGML_MXFP4 => d.copy_from_slice(s),
+                t => quants::to_slot(t, s, rows, k, d),
+            }
+        }
+        Cow::Owned(out)
     }
 }
 
@@ -71,8 +98,8 @@ pub fn layer_geoms(g: &Gguf, cfg: &Config) -> Result<(Vec<LayerGeom>, Vec<LayerP
                 Part { file: 0, offset: 0, stride: 0, dst, len: rows * k / 32 * 17, kind: PartKind::Zero }
             } else {
                 let t = g.tensor(&name)?;
-                if t.ty != GGML_MXFP4 {
-                    bail!("blk.{l}.{nm}: expected MXFP4 experts (type 39), got {}", t.ty);
+                if t.ty != GGML_MXFP4 && !quants::is_low_bit(t.ty) {
+                    bail!("blk.{l}.{nm}: {} experts are not supported", crate::gguf::type_name(t.ty));
                 }
                 let (be, bb) = type_block(t.ty).unwrap();
                 let len = (rows * k) as u64 / be * bb;
@@ -80,11 +107,18 @@ pub fn layer_geoms(g: &Gguf, cfg: &Config) -> Result<(Vec<LayerGeom>, Vec<LayerP
                     bail!("blk.{l}.{nm}: unexpected shape {:?}", t.dims);
                 }
                 geom.types[i] = t.ty;
-                Part { file: t.shard, offset: t.file_offset, stride: len, dst, len: len as usize, kind: PartKind::Mxfp4 }
+                let kind = if t.ty == GGML_MXFP4 { PartKind::Mxfp4 } else { PartKind::Raw };
+                Part { file: t.shard, offset: t.file_offset, stride: len, dst, len: len as usize, kind }
             };
             geom.host[i] = part.len;
             dst += part.len;
             parts.push(part);
+        }
+        if geom.types[0] != geom.types[1] {
+            bail!("blk.{l}: gate and up experts of different types are not supported");
+        }
+        if geom.types != [GGML_MXFP4; 3] && (cfg.dim % 256 != 0 || cfg.moe_inter % 256 != 0) {
+            bail!("low-bit experts need dimensions that are multiples of 256");
         }
         geoms.push(geom);
         layers.push(LayerParts { len: dst, parts });
@@ -285,7 +319,7 @@ impl ExpertStore {
                 *l = p;
             }
         }
-        let slot_bytes = layers.iter().map(|l| l.host_len() as u64).max().unwrap();
+        let slot_bytes = layers.iter().map(|l| l.slot_lens(cfg.moe_inter, cfg.dim).iter().sum::<usize>() as u64).max().unwrap();
         let mean_host = layers.iter().map(|l| l.host_len() as f64).sum::<f64>() / layers.len() as f64;
         let geom = ExpertGeom { inter: cfg.moe_inter, dim: cfg.dim, layers, slot_bytes, mean_host };
 
@@ -584,7 +618,12 @@ impl ExpertStore {
         });
     }
 
+    fn slot_data<'a>(&self, layer: usize, host: &'a [u8]) -> Cow<'a, [u8]> {
+        self.geom.layers[layer].slot_data(self.geom.inter, self.geom.dim, host)
+    }
+
     fn promote_now(&self, gpu: &Gpu, k: Key, data: &[u8]) {
+        let data = self.slot_data((k >> 16) as usize, data);
         let slot = {
             // once the gate is ours, every command using the victim's old contents is submitted;
             // the queue orders the write below after them
@@ -602,7 +641,7 @@ impl ExpertStore {
             s
         };
         let r = self.slot_ref(slot);
-        gpu.write(&self.slabs[r.slab].buf, r.offset, data);
+        gpu.write(&self.slabs[r.slab].buf, r.offset, &data);
         Stats::add(&self.stats.expert_uploads, 1);
         let mut v = self.vram.lock();
         v.busy[slot] = false;
@@ -661,7 +700,7 @@ impl ExpertStore {
                 v.last_use[best] = tick;
                 v.map.insert(key(layer, e), best);
                 let r = self.slot_ref(best);
-                gpu.write(&self.slabs[r.slab].buf, r.offset, &d);
+                gpu.write(&self.slabs[r.slab].buf, r.offset, &self.slot_data(layer, &d));
                 Stats::add(&self.stats.expert_uploads, 1);
                 result[i] = Some(best);
             }
@@ -719,7 +758,7 @@ impl ExpertStore {
                 v.pinned[s] = true;
                 v.map.insert(key(l, e), s);
                 let r = self.slot_ref(s);
-                gpu.write(&self.slabs[r.slab].buf, r.offset, &b);
+                gpu.write(&self.slabs[r.slab].buf, r.offset, &self.slot_data(l, &b));
                 in_vram += 1;
                 if in_vram % 16 == 0 {
                     gpu.flush();

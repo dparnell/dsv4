@@ -33,7 +33,13 @@ pub fn type_block(t: u32) -> Option<(u64, u64)> {
         12 => (256, 144),
         13 => (256, 176),
         14 => (256, 210),
-        20 => (32, 18), // IQ4_NL
+        16 => (256, 66), // IQ2_XXS
+        17 => (256, 74), // IQ2_XS
+        18 => (256, 98), // IQ3_XXS
+        19 => (256, 50), // IQ1_S
+        20 => (32, 18),  // IQ4_NL
+        21 => (256, 110), // IQ3_S
+        22 => (256, 82), // IQ2_S
         23 => (256, 136),
         _ => return None,
     })
@@ -47,10 +53,18 @@ pub fn type_name(t: u32) -> &'static str {
         GGML_BF16 => "BF16",
         GGML_MXFP4 => "MXFP4",
         GGML_MXFP8 => "MXFP8",
+        10 => "Q2_K",
+        11 => "Q3_K",
         12 => "Q4_K",
         13 => "Q5_K",
         14 => "Q6_K",
+        16 => "IQ2_XXS",
+        17 => "IQ2_XS",
+        18 => "IQ3_XXS",
+        19 => "IQ1_S",
         20 => "IQ4_NL",
+        21 => "IQ3_S",
+        22 => "IQ2_S",
         _ => "?",
     }
 }
@@ -246,6 +260,10 @@ pub fn resolve_model_path(p: &Path) -> Result<PathBuf> {
             }
         }
         found.sort();
+        if found.len() > 1 {
+            let names: Vec<_> = found.iter().filter_map(|f| f.parent()?.file_name()).map(|n| n.to_string_lossy()).collect();
+            tracing::warn!("several models in {} ({}): using the first; pass --model with the folder of another", p.display(), names.join(", "));
+        }
         if let Some(f) = found.into_iter().next() {
             return Ok(f);
         }

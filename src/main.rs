@@ -12,6 +12,7 @@ mod gpu;
 mod kernels;
 mod model;
 mod pack;
+mod quants;
 mod selftest;
 mod server;
 mod stats;
@@ -271,6 +272,9 @@ enum Cmd {
         /// Hidden size of one expert
         #[arg(long, default_value_t = 2304)]
         inter: usize,
+        /// Types of the gate, up and down matrices, e.g. IQ2_XXS,IQ2_XXS,IQ2_S
+        #[arg(long, default_value = "MXFP4,MXFP4,MXFP4")]
+        types: String,
     },
     /// Copy the experts into one file where each is contiguous, which drives read faster
     /// (lossless; takes as much space as the experts). An interrupted run resumes.
@@ -533,7 +537,16 @@ fn main() -> Result<()> {
             let (geoms, parts) = experts::layer_geoms(&g, &cfg)?;
             pack::repack(&g, &geoms, parts, layers.unwrap_or(cfg.n_layers), cfg.n_experts, &out.unwrap_or_else(|| pack::default_path(&first)))
         }
-        Cmd::BenchCpu { dim, inter } => cpu_moe::bench(dim, inter),
+        Cmd::BenchCpu { dim, inter, types } => {
+            let mut t = [0u32; 3];
+            for (i, name) in types.split(',').enumerate().take(3) {
+                t[i] = (0..64).find(|&t| gguf::type_name(t).eq_ignore_ascii_case(name.trim())).filter(|&t| t == gguf::GGML_MXFP4 || quants::is_low_bit(t)).with_context(|| format!("{name}: not an expert type"))?;
+            }
+            if t.contains(&0) {
+                anyhow::bail!("--types takes three types");
+            }
+            cpu_moe::bench(dim, inter, t)
+        }
         Cmd::Prompt { model, file, no_think } => {
             let first = gguf::resolve_model_path(&model)?;
             let g = gguf::Gguf::open(&first)?;

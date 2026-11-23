@@ -2,11 +2,10 @@
 //! uploaded once at startup. These stay resident in VRAM (~8 GB for the Q4 quant).
 
 use anyhow::{Result, bail};
-use half::f16;
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::gguf::{GGML_BF16, GGML_F16, GGML_F32, GGML_Q8_0, Gguf, TensorInfo};
+use crate::gguf::{GGML_Q8_0, Gguf, TensorInfo};
 use crate::gpu::{Batch, Buf, Gpu};
 
 /// Q8_0 weight [n rows][k] repacked as [int8 n*k][f16 scales n*k/32], possibly split into
@@ -42,23 +41,37 @@ pub fn repack_q8(raw: &[u8], rows: usize, k: usize) -> Vec<u8> {
     out
 }
 
+/// Other formats are requantized to Q8_0, which adds little to the rounding they already have.
+fn to_q8(ty: u32, raw: &[u8], rows: usize, k: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rows * (k / 32 * 34)];
+    out.par_chunks_mut(k / 32 * 34).zip(raw.par_chunks(raw.len() / rows)).for_each_init(
+        || vec![0f32; k],
+        |v, (o, r)| {
+            crate::quants::dequantize(ty, r, v);
+            crate::quants::quantize_q8_0(v, o);
+        },
+    );
+    out
+}
+
 impl Q8W {
     pub fn load(g: &Gguf, gpu: &Gpu, name: &str) -> Result<Self> {
         let t = g.tensor(name)?;
-        if t.ty != GGML_Q8_0 {
-            bail!("{name}: expected Q8_0, got type {}", t.ty);
+        if !crate::quants::can_dequantize(t.ty) {
+            bail!("{name}: {} is not supported", crate::gguf::type_name(t.ty));
         }
         let k = t.dims[0] as usize;
         let n = (t.n_elements() / t.dims[0]) as usize;
         let raw = g.bytes(t);
         let row_bytes = (k / 32 * 34) as u64;
+        let src_row = raw.len() / n;
         let max_rows = ((gpu.max_binding() - 4096) / (row_bytes)) as usize;
         let mut parts = Vec::new();
         let mut row0 = 0;
         while row0 < n {
             let rows = (n - row0).min(max_rows);
-            let src = &raw[row0 * (k / 32 * 34)..(row0 + rows) * (k / 32 * 34)];
-            let packed = repack_q8(src, rows, k);
+            let src = &raw[row0 * src_row..(row0 + rows) * src_row];
+            let packed = if t.ty == GGML_Q8_0 { repack_q8(src, rows, k) } else { repack_q8(&to_q8(t.ty, src, rows, k), rows, k) };
             let buf = gpu.buffer_init(name, &packed);
             parts.push(Q8Part { buf, row0, rows, scale_off_words: (rows * k / 4) as u32 });
             row0 += rows;
@@ -92,21 +105,12 @@ impl Q8W {
 
 /// Read any float tensor as f32 on the host.
 pub fn read_f32(g: &Gguf, t: &TensorInfo) -> Result<Vec<f32>> {
-    let b = g.bytes(t);
-    Ok(match t.ty {
-        GGML_F32 => b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
-        GGML_F16 => b.chunks_exact(2).map(|c| f16::from_le_bytes(c.try_into().unwrap()).to_f32()).collect(),
-        GGML_BF16 => b.chunks_exact(2).map(|c| half::bf16::from_le_bytes(c.try_into().unwrap()).to_f32()).collect(),
-        GGML_Q8_0 => {
-            let mut out = Vec::with_capacity(t.n_elements() as usize);
-            for blk in b.chunks_exact(34) {
-                let d = f16::from_le_bytes([blk[0], blk[1]]).to_f32();
-                out.extend(blk[2..].iter().map(|&q| q as i8 as f32 * d));
-            }
-            out
-        }
-        _ => bail!("{}: cannot read type {} as f32", t.name, t.ty),
-    })
+    if !crate::quants::can_dequantize(t.ty) {
+        bail!("{}: cannot read type {} as f32", t.name, t.ty);
+    }
+    let mut out = vec![0f32; t.n_elements() as usize];
+    crate::quants::dequantize(t.ty, g.bytes(t), &mut out);
+    Ok(out)
 }
 
 pub fn f32_buf(g: &Gguf, gpu: &Gpu, name: &str) -> Result<Buf> {

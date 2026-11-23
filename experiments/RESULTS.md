@@ -119,3 +119,19 @@ Single-token work is limited by DRAM. Sharing the weights between tokens is the 
   3.45 / 3.03 / 3.09 GB/s. The pack had just been written (drive cache), and repeated reads of 3
   layers flatter both. End-to-end speed with a full pack: not measured.
 - Logits with and without the pack are bit-identical (gpu-only, 24 + 4 tokens).
+
+# Low-bit experts
+
+Not run end to end: no low-bit model was downloaded.
+
+- Decoders against separate transcriptions of ggml's (random blocks), and those against real
+  weights: first 256-2304 values of one tensor per type from Unsloth's files vs the same tensor in
+  UD-Q4_K_XL, cosine IQ1_S 0.87, IQ2_XXS 0.94, IQ2_XS 0.95, Q2_K 0.95, IQ2_S 0.97, IQ3_XXS 0.98,
+  Q3_K 0.99, IQ3_S 0.99, IQ4_NL 0.997, Q5_K 0.999, Q6_K 0.9998.
+- GPU kernels: within 1.2e-6 of the output range of the f32 reference on random blocks.
+- CPU, 32 threads, 6 experts (`bench-cpu --types`), ms per expert: MXFP4 0.56,
+  IQ2_XXS+IQ2_S 0.42, IQ2_S+IQ3_XXS 0.46, IQ1_S+IQ2_XS 0.40, IQ1_S+Q2_K 0.87 (a single layer of
+  UD-IQ2_XXS). One thread: 0.8 vs 4.4, so it needs a fair number of cores.
+- UD-Q4_K_XL is unaffected (same perplexity on a 24 + 4 token gpu-only check).
+- Simulated from a 300-step routing trace, LRU, 38 GB of RAM, decode: GB read per token
+  Q4_K_XL 1.21, IQ3_XXS 0.78, Q2_K_XL 0.58, IQ2_XXS 0.39, IQ1_M 0.27, IQ1_S 0.20.

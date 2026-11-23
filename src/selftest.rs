@@ -222,6 +222,84 @@ pub fn run() -> Result<()> {
         all &= ok;
     }
 
+    // ---- low-bit experts ----
+    {
+        use crate::quants as q;
+        let (inter, dim) = (256usize, 512usize);
+        for (ty, dn, name) in [
+            (q::IQ1_S, q::Q2_K, "iq1_s/q2_k"),
+            (q::IQ2_XXS, q::IQ2_XS, "iq2_xxs/xs"),
+            (q::IQ2_S, q::IQ3_XXS, "iq2_s/iq3_xxs"),
+            (q::Q3_K, q::IQ3_S, "q3_k/iq3_s"),
+            (q::Q2_K, q::IQ1_S, "q2_k/iq1_s"),
+        ] {
+            let types = [ty, ty, dn];
+            let mut host = Vec::new();
+            let mut lens = [0usize; 3];
+            let mut deq: Vec<Vec<f32>> = Vec::new();
+            for (i, &t) in types.iter().enumerate() {
+                let raw = q::random_blocks(t, inter * dim / 256, || (r.u() >> 7) as u8);
+                let mut d = vec![0f32; inter * dim];
+                q::dequantize(t, &raw, &mut d);
+                lens[i] = raw.len();
+                host.extend(raw);
+                deq.push(d);
+            }
+            let geom = crate::experts::LayerGeom { types, host: lens };
+            let slot = geom.slot_data(inter, dim, &host);
+            let sl = geom.slot_lens(inter, dim);
+            let sb = gpu.buffer_init("slot", &slot);
+            let toks = 3usize;
+            let x = r.vec(toks * dim, 1.0);
+            let xs: Vec<&[f32]> = x.chunks(dim).collect();
+            let ws = [0.7f32, 1.2, 0.3];
+            let lim = 10.0f32;
+            let mut want = Vec::new();
+            for (x, w) in xs.iter().zip(ws) {
+                let h: Vec<f32> = (0..inter)
+                    .map(|n| {
+                        let gv = (0..dim).map(|i| deq[0][n * dim + i] * x[i]).sum::<f32>().min(lim);
+                        let uv = (0..dim).map(|i| deq[1][n * dim + i] * x[i]).sum::<f32>().clamp(-lim, lim);
+                        gv / (1.0 + (-gv).exp()) * uv * w
+                    })
+                    .collect();
+                want.extend((0..dim).map(|n| (0..inter).map(|i| deq[2][n * inter + i] * h[i]).sum::<f32>()));
+            }
+            let lutp = |t: u32| -> Vec<u32> {
+                let l: &[u32; 4] = bytemuck::cast_ref(q::codes(t).0);
+                vec![q::has_min(t) as u32, l[0], l[1], l[2], l[3]]
+            };
+            let (xb, hb, ob) = (fb(&x), gpu.buffer("h", (toks * inter * 4) as u64), gpu.buffer("o", (toks * dim * 4) as u64));
+            let ent: Vec<u32> = (0..toks as u32).flat_map(|t| [t, t, ws[t as usize].to_bits()]).collect();
+            let rb = gpu.buffer_init("route", bytemuck::cast_slice(&ent));
+            let mut b = gpu.begin();
+            let mut gp = vec![inter as u32, dim as u32, 3, 0, bits(lim), (sl[0] / 4) as u32, dim as u32];
+            gp.extend(lutp(ty));
+            b.run("moe_gate_up_lut_8", &[sb.all(), xb.all(), rb.all(), hb.all()], &gp, ((inter as u32).div_ceil(8), 1, 1));
+            let mut dp = vec![dim as u32, inter as u32, 3, 0, 0, ((sl[0] + sl[1]) / 4) as u32, 0];
+            dp.extend(lutp(dn));
+            b.run("moe_down_lut_8", &[sb.all(), hb.all(), rb.all(), ob.all()], &dp, ((dim as u32).div_ceil(8), 1, 1));
+            let got = gpu.read_f32(b, &ob, 0, toks * dim);
+            let range = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let worst = |got: &[f32]| got.iter().zip(&want).fold(0f32, |a, (g, w)| a.max((g - w).abs())) / range;
+            // and one token through the single-token kernels
+            let mut b = gpu.begin();
+            (gp[2], dp[2]) = (1, 1);
+            b.run("moe_gate_up_lut_1", &[sb.all(), xb.all(), rb.all(), hb.all()], &gp, ((inter as u32).div_ceil(8), 1, 1));
+            b.run("moe_down_lut_1", &[sb.all(), hb.all(), rb.all(), ob.all()], &dp, ((dim as u32).div_ceil(8), 1, 1));
+            let got1 = gpu.read_f32(b, &ob, 0, toks * dim);
+            let (e8, e1) = (worst(&got), worst(&got1));
+            let ok = e8 < 1e-4 && e1 < 1e-4 && range > 0.0;
+            println!("{} moe {name:<14} max err {:.2e} of output range", if ok { "PASS" } else { "FAIL" }, e8.max(e1));
+            all &= ok;
+            let job = crate::cpu_moe::Job { geom, blob: &host, xs, ws: ws.to_vec() };
+            let e = worst(&crate::cpu_moe::experts_forward(&[job], inter, dim, lim)[0].concat());
+            let ok = e < 0.03;
+            println!("{} moe cpu {name:<10} max err {e:.2e} of output range", if ok { "PASS" } else { "FAIL" });
+            all &= ok;
+        }
+    }
+
     // ---- rmsnorm ----
     {
         let (d, rows) = (5120, 3);

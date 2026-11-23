@@ -73,6 +73,17 @@ Decode speed is bounded by how many expert bytes per token miss the faster tiers
 * the whole model's experts (289 GB) do not fit in RAM, so the steady-state speed depends on how skewed expert
   usage is for your workload; the TUI shows the hit rates per tier and per layer.
 
+### Smaller quants
+
+Routed experts may also be IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, Q2_K or Q3_K (mixed per layer), and the
+other weights any type Unsloth's UD-IQ1_S to UD-Q3_K_XL use, so those quants are meant to load; they have not been
+run end to end yet. They need less disk and fit more experts in RAM, at a cost in quality (Basalt measured KLD 0.24
+against BF16 for UD-IQ2_XXS and 0.28 for UD-IQ1_M). `download --quant UD-IQ2_XXS`, then pass that folder as `--model`.
+
+* RAM and packs hold the compact GGUF bytes; the CPU decodes rows as it multiplies them. In VRAM they become
+  4-bit codes plus scales (about 20 MB per expert), without further rounding.
+* Dense weights that are not Q8_0 are requantized to Q8_0 when loaded.
+
 ## Quick start
 
 ```bash
@@ -144,6 +155,7 @@ src/
   weights.rs     dense weight loading / repacking
   experts.rs     three-tier routed-expert store (VRAM slots, RAM LRU, NVMe)
   pack.rs        expert packs (`repack`)
+  quants.rs      decoders for ggml's low-bit formats
   cpu_moe.rs     MXFP4 expert execution on the CPU (AVX2 / VNNI kernels)
   engram.rs      n-gram hashing and MXFP8 row gathers
   model.rs       the forward pass (layer-major segments, chunked attention, hybrid MoE)

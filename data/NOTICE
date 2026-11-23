@@ -22,3 +22,9 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+iq_grids.bin holds the IQ grid tables of ggml (https://github.com/ggml-org/llama.cpp), and
+quant_vectors.bin test vectors for its formats; src/quants.rs follows its decoders. Distributed
+under the MIT License as above, with
+
+Copyright (c) 2023-2026 The ggml authors

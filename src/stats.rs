@@ -29,6 +29,9 @@ pub struct Stats {
     pub expert_disk_loads: AtomicU64,
     pub expert_cpu_runs: AtomicU64,
     pub expert_prefetches: AtomicU64,
+    /// prefetches that were then used / dropped before they started
+    pub expert_prefetch_hits: AtomicU64,
+    pub expert_prefetch_cancels: AtomicU64,
     pub expert_uploads: AtomicU64,
     pub vram_slots_total: AtomicU64,
     pub vram_slots_used: AtomicU64,

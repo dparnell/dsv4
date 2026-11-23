@@ -30,6 +30,12 @@ pub struct ModelOptions {
     pub expert_ram_bytes: u64,
     pub backend: Option<String>,
     pub cpu_experts: bool,
+    /// All experts, hottest first (None: built-in ranking)
+    pub expert_ranking: Option<Vec<crate::experts::Key>>,
+    /// Read likely experts of the next layer ahead of its routing
+    pub prefetch: bool,
+    /// Fill the expert caches from the ranking in the background
+    pub warm_up: bool,
     /// Experiment: route only among these experts per layer (pinned in VRAM/RAM up front)
     pub expert_subset: Option<Vec<Vec<usize>>>,
 }
@@ -113,6 +119,7 @@ pub struct Model {
     pub tokens: Vec<u32>,
     stats: Arc<Stats>,
     cpu_experts: bool,
+    prefetch: bool,
     step: std::sync::atomic::AtomicU64,
     snapshot: Option<Snapshot>,
     /// [layer][expert] -> may be routed to (None: all)
@@ -373,7 +380,8 @@ impl Model {
                 v
             }
         };
-        let experts = Arc::new(ExpertStore::new(&g, &gpu, &cfg, vram, opt.expert_ram_bytes, stats.clone())?);
+        let ranking = opt.expert_ranking.clone().or_else(|| crate::experts::builtin_ranking(&cfg));
+        let experts = Arc::new(ExpertStore::new(&g, &gpu, &cfg, vram, opt.expert_ram_bytes, ranking.as_deref(), stats.clone())?);
         let allowed = match &opt.expert_subset {
             Some(sub) => {
                 stats.set_phase("pinning expert subset");
@@ -410,6 +418,9 @@ impl Model {
             opt.expert_ram_bytes as f64 / 1e9,
             experts.geom.expert_bytes as f64 / 1e6
         ));
+        if let (true, Some(r), None) = (opt.warm_up, ranking, &opt.expert_subset) {
+            experts.warm_up(&gpu, r);
+        }
         let engram = Engram::new(&g, &cfg, stats.clone())?;
         Stats::set(&stats.gpu_total_bytes, gpu.gpu_bytes.load(std::sync::atomic::Ordering::Relaxed));
         Stats::set(&stats.ctx_max, max_ctx as u64);
@@ -437,6 +448,7 @@ impl Model {
             cand_words,
             tokens: Vec::new(),
             stats,
+            prefetch: opt.prefetch,
             cpu_experts: opt.cpu_experts && crate::cpu_moe::has_avx2(),
             step: std::sync::atomic::AtomicU64::new(0),
             snapshot: None,
@@ -711,7 +723,7 @@ impl Model {
                     return Ok(vec![0.0; cfg.vocab]);
                 }
             }
-            if let (Some(x), true) = (xnf_host.as_deref(), l + 1 < cfg.n_layers && t_all <= 4 && self.allowed.is_none()) {
+            if let (Some(x), true) = (xnf_host.as_deref(), self.prefetch && l + 1 < cfg.n_layers && t_all <= 4 && self.allowed.is_none()) {
                 self.prefetch_next(l + 1, x, t_all);
             }
             self.run_experts(l, &routing, xnf_host.as_deref())?;
@@ -880,32 +892,27 @@ impl Model {
 
     /// Routed experts for one layer over the segment.
     ///
-    /// Resident experts (and experts used by many tokens, or hot enough to be admitted) run on
-    /// the GPU in waves that fit the VRAM slots. With `cpu_experts`, the remaining cold experts
+    /// Resident experts (and experts used by many tokens) run on the GPU in waves that fit the
+    /// VRAM slots. With `cpu_experts`, the remaining cold experts
     /// run on the CPU straight from the RAM tier, concurrently with the GPU work, and their
-    /// outputs are uploaded into the same per-(token, k) rows.
+    /// outputs are uploaded into the same per-(token, k) rows. Those that keep getting picked are
+    /// then copied to VRAM in the background for later steps.
     fn run_experts(&self, l: usize, routing: &Routing, xnf: Option<&[f32]>) -> Result<()> {
         const CPU_MAX_TOKENS: usize = 4;
-        const ADMIT_SCORE: f32 = 2.5;
-        const MAX_ADMIT: usize = 2;
         let cfg = &self.cfg;
         let gpu = &self.gpu;
         let step = self.step.load(std::sync::atomic::Ordering::Relaxed);
+        trace_routing(step, l, routing);
         let mut gpu_list: Vec<usize> = Vec::new();
         let mut cpu_list: Vec<usize> = Vec::new();
-        let mut admitted = 0;
+        let mut uses = vec![0f64; cfg.n_experts];
         for e in 0..cfg.n_experts {
             let n = routing.per_expert[e].len();
             if n == 0 {
                 continue;
             }
-            let score = self.experts.note_use(l, e, step);
-            let resident = self.experts.is_resident(l, e);
-            let mut to_gpu = resident || xnf.is_none() || n > CPU_MAX_TOKENS;
-            if !to_gpu && score >= ADMIT_SCORE && admitted < MAX_ADMIT {
-                admitted += 1;
-                to_gpu = true;
-            }
+            uses[e] = self.experts.note_use(l, e, step);
+            let to_gpu = xnf.is_none() || n > CPU_MAX_TOKENS || self.experts.is_resident(l, e);
             if to_gpu {
                 gpu_list.push(e)
             } else {
@@ -916,38 +923,61 @@ impl Model {
         gpu_list.sort_by_key(|&e| !self.experts.is_resident(l, e));
 
         let t_moe = std::time::Instant::now();
+        // queue every disk read before waiting on any
+        let loads = if xnf.is_some() {
+            cpu_list.iter().map(|&e| self.experts.request_host(l, e)).collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        self.experts.end_prefetch(l);
         let (gpu_res, cpu_res) = rayon::join(
             || self.run_experts_gpu(l, routing, &gpu_list),
-            || -> Result<Vec<(usize, Vec<f32>)>> {
-                let Some(x) = xnf else { return Ok(Vec::new()) };
+            || -> Result<CpuOut> {
+                let Some(x) = xnf else { return Ok(Default::default()) };
                 let t_cpu = std::time::Instant::now();
                 let _timer = scopeguard(|| Stats::add(&self.stats.t_cpu_moe_ns, t_cpu.elapsed().as_nanos() as u64));
                 let d = cfg.dim;
                 let geom = &self.experts.geom;
-                let outs: Vec<Result<Vec<(usize, Vec<f32>)>>> = cpu_list
-                    .par_iter()
-                    .map(|&e| {
-                        let blob = self.experts.fetch_host(l, e)?;
-                        let list = &routing.per_expert[e];
-                        let xs: Vec<&[f32]> = list.iter().map(|&(t, _, _)| &x[t as usize * d..(t as usize + 1) * d]).collect();
-                        let ws: Vec<f32> = list.iter().map(|&(_, _, w)| w).collect();
-                        let ys = crate::cpu_moe::expert_forward(&blob, geom.inter, d, geom.mat_bytes as usize, &xs, &ws, cfg.swiglu_limit);
-                        Ok(list.iter().zip(ys).map(|(&(t, k, _), y)| (t as usize * cfg.n_active + k as usize, y)).collect())
+                let run = |e: usize, blob: &[u8]| -> Vec<(usize, Vec<f32>)> {
+                    let list = &routing.per_expert[e];
+                    let xs: Vec<&[f32]> = list.iter().map(|&(t, _, _)| &x[t as usize * d..(t as usize + 1) * d]).collect();
+                    let ws: Vec<f32> = list.iter().map(|&(_, _, w)| w).collect();
+                    let ys = crate::cpu_moe::expert_forward(blob, geom.inter, d, geom.mat_bytes as usize, &xs, &ws, cfg.swiglu_limit);
+                    list.iter().zip(ys).map(|(&(t, k, _), y)| (t as usize * cfg.n_active + k as usize, y)).collect()
+                };
+                // experts already in memory compute while the others are being read
+                let (ready, pending): (Vec<_>, Vec<_>) =
+                    cpu_list.iter().copied().zip(loads).partition(|(_, l)| matches!(l, crate::expert_io::Load::Ready(_)));
+                let mut done = ready
+                    .into_par_iter()
+                    .map(|(e, l)| {
+                        let blob = l.wait()?;
+                        Ok((e, run(e, &blob), blob))
                     })
-                    .collect();
-                let mut all = Vec::new();
-                for o in outs {
-                    all.extend(o?);
+                    .collect::<Result<Vec<_>>>()?;
+                for (e, l) in pending {
+                    let blob = l.wait()?;
+                    done.push((e, run(e, &blob), blob));
+                }
+                let mut all = CpuOut::default();
+                for (e, rows, blob) in done {
+                    all.rows.extend(rows);
+                    all.blobs.push((e, blob));
                 }
                 Ok(all)
             },
         );
         Stats::add(&self.stats.t_moe_ns, t_moe.elapsed().as_nanos() as u64);
         gpu_res?;
-        let rows = cpu_res?;
+        let out = cpu_res?;
         Stats::add(&self.stats.expert_cpu_runs, cpu_list.len() as u64);
-        for (row, y) in rows {
+        for (row, y) in out.rows {
             gpu.write(&self.acts.o6, (row * cfg.dim * 4) as u64, bytemuck::cast_slice(&y));
+        }
+        for (e, blob) in out.blobs {
+            if self.experts.worth_promoting(l, e, uses[e]) {
+                self.experts.promote(gpu, l, e, blob);
+            }
         }
         Ok(())
     }
@@ -959,7 +989,7 @@ impl Model {
         let d = cfg.dim;
         let w = &self.gate_host[next];
         let bias = &self.layers[next].exp_bias;
-        let mut want: Vec<usize> = Vec::new();
+        let mut want: Vec<(usize, usize)> = Vec::new();
         for t in 0..t_all {
             let xt = &x[t * d..(t + 1) * d];
             let scores: Vec<f32> = (0..cfg.n_experts)
@@ -970,12 +1000,15 @@ impl Model {
                 })
                 .collect();
             let mut idx: Vec<usize> = (0..cfg.n_experts).collect();
-            let k = (cfg.n_active + 2).min(cfg.n_experts);
-            idx.select_nth_unstable_by(k - 1, |&a, &b| scores[b].total_cmp(&scores[a]));
-            want.extend_from_slice(&idx[..k]);
+            // best guesses first: the rest is dropped if the disk has not got to it in time
+            idx.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+            for (r, &e) in idx[..cfg.n_active].iter().enumerate() {
+                want.push((r, e));
+            }
         }
         want.sort_unstable();
-        want.dedup();
+        let mut seen = std::collections::HashSet::new();
+        let want: Vec<usize> = want.into_iter().map(|x| x.1).filter(|&e| seen.insert(e)).collect();
         self.experts.prefetch(next, &want);
     }
 
@@ -986,7 +1019,14 @@ impl Model {
         let cap = self.experts.streaming_slots();
         let geom = &self.experts.geom;
         let mat_words = (geom.mat_bytes / 4) as u32;
-        for wave in list.chunks(cap) {
+        let mut waves = list.chunks(cap).peekable();
+        while let Some(wave) = waves.next() {
+            // read the next wave while this one is uploaded and recorded
+            if let Some(next) = waves.peek() {
+                self.experts.prefetch(l, next);
+            }
+            // slots must stay put from lookup until the commands using them are submitted
+            let gate = self.experts.slot_gate.lock();
             let slots = self.experts.ensure(gpu, l, wave)?;
             let mut entries: Vec<u32> = Vec::new();
             let mut ranges = Vec::new();
@@ -1018,7 +1058,33 @@ impl Model {
                 );
             }
             b.submit();
+            drop(gate);
         }
         Ok(())
     }
+}
+
+/// Results of one layer's CPU experts: (output row, values), and the weights they ran from.
+#[derive(Default)]
+struct CpuOut {
+    rows: Vec<(usize, Vec<f32>)>,
+    blobs: Vec<(usize, Arc<Vec<u8>>)>,
+}
+
+/// DSV4_ROUTE_TRACE=path appends every layer's routed experts as one line,
+/// `step layer expert:tokens ...`, for simulating cache policies offline.
+fn trace_routing(step: u64, l: usize, routing: &Routing) {
+    use std::io::Write;
+    static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let out = OUT.get_or_init(|| {
+        let p = std::env::var("DSV4_ROUTE_TRACE").ok()?;
+        Some(std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(p).ok()?))
+    });
+    let Some(f) = out else { return };
+    let mut line = format!("{step} {l}");
+    for (e, list) in routing.per_expert.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
+        line.push_str(&format!(" {e}:{}", list.len()));
+    }
+    line.push(char::from(10));
+    let _ = f.lock().unwrap().write_all(line.as_bytes());
 }

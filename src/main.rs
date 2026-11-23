@@ -5,6 +5,7 @@ mod cpu_moe;
 mod download;
 mod engine;
 mod engram;
+mod expert_io;
 mod experts;
 mod gguf;
 mod gpu;
@@ -74,9 +75,16 @@ struct ModelArgs {
     /// choice entirely (it only weights the fixed six).
     #[arg(long, requires = "expert_profile")]
     expert_subset: Option<usize>,
-    /// Expert usage profile (JSON) used to choose --expert-subset
+    /// Expert usage profile (JSON): chooses --expert-subset, and replaces the built-in ranking
+    /// for warming the caches
     #[arg(long)]
     expert_profile: Option<PathBuf>,
+    /// Do not read ahead likely experts of the next layer
+    #[arg(long)]
+    no_prefetch: bool,
+    /// Do not fill the expert caches in the background after loading
+    #[arg(long)]
+    no_warm_up: bool,
     /// Add this run's expert selection counts to a profile (JSON, created if missing)
     #[arg(long)]
     save_expert_profile: Option<PathBuf>,
@@ -307,13 +315,11 @@ fn load(args: &ModelArgs, stats: Arc<Stats>) -> Result<Loaded> {
     // created inside Model::load, so estimate free VRAM up-front from NVML minus the dense size.
     // None: measured once the dense weights and activations are resident
     let vram = args.expert_vram_gb.map(|g| (g * 1e9) as u64);
-    let expert_subset = match (args.expert_subset, &args.expert_profile) {
-        (Some(n), Some(p)) => {
-            let counts = experts::load_profile(p).with_context(|| format!("reading expert profile {}", p.display()))?;
-            Some(experts::top_experts(&counts, n))
-        }
-        _ => None,
+    let counts = match &args.expert_profile {
+        Some(p) => Some(experts::load_profile(p).with_context(|| format!("reading expert profile {}", p.display()))?),
+        None => None,
     };
+    let expert_subset = args.expert_subset.and_then(|n| counts.as_ref().map(|c| experts::top_experts(c, n)));
     let opt = ModelOptions {
         max_ctx: args.ctx,
         chunk: args.chunk,
@@ -323,6 +329,9 @@ fn load(args: &ModelArgs, stats: Arc<Stats>) -> Result<Loaded> {
         backend: args.backend.clone(),
         cpu_experts: !args.gpu_only_experts,
         expert_subset,
+        expert_ranking: counts.as_ref().map(|c| experts::rank_counts(c)),
+        prefetch: !args.no_prefetch,
+        warm_up: !args.no_warm_up,
     };
     let mut model = Model::load(&first, &opt, stats.clone())?;
     model.profile_out = args.save_expert_profile.clone();
@@ -407,7 +416,7 @@ fn main() -> Result<()> {
             let cfg = config::Config::from_gguf(&g)?;
             let stats = Arc::new(Stats::default());
             let gpu = gpu::Gpu::new(stats.clone(), None)?;
-            let store = experts::ExpertStore::new(&g, &gpu, &cfg, 1, 0, stats)?;
+            let store = experts::ExpertStore::new(&g, &gpu, &cfg, 1, 0, None, stats)?;
             for threads in [1, 4, 8, 16, 32] {
                 let (gbps, ms) = store.bench_disk(n, threads)?;
                 println!("{threads:>3} loaders: {gbps:>6.2} GB/s  ({ms:.2} ms/expert amortized, 18.8 MB each)");
@@ -599,7 +608,7 @@ fn print_breakdown(st: &Stats) {
     let g = |c: &std::sync::atomic::AtomicU64| Stats::get(c);
     let s = |c: &std::sync::atomic::AtomicU64| Stats::get(c) as f64 / 1e9;
     eprintln!(
-        "breakdown: gpu-wait {:.2}s  experts {:.2}s (gpu path {:.2}s, cpu path {:.2}s)  disk {:.2} GB in {} loads  ram hits {}  vram hits {}  cpu runs {}  uploads {} ({:.2} GB)  prefetches {}",
+        "breakdown: gpu-wait {:.2}s  experts {:.2}s (gpu path {:.2}s, cpu path {:.2}s)  disk {:.2} GB in {} loads  ram hits {}  vram hits {}  cpu runs {}  uploads {} ({:.2} GB)  prefetches {} ({} used, {} cancelled)",
         s(&st.t_gpu_wait_ns),
         s(&st.t_moe_ns),
         s(&st.t_expert_ns),
@@ -612,6 +621,8 @@ fn print_breakdown(st: &Stats) {
         g(&st.expert_uploads),
         g(&st.upload_bytes) as f64 / 1e9,
         g(&st.expert_prefetches),
+        g(&st.expert_prefetch_hits),
+        g(&st.expert_prefetch_cancels),
     );
 }
 

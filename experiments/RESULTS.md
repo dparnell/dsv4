@@ -34,3 +34,24 @@ Reference: the engine's int8-activation CPU path is 0.010. Sanity check at 1x: a
 Conclusion: the experts have little exploitable redundancy (contribution spread evenly over
 hidden units; inputs not confined to a small subspace). Even 2x costs ~45% of each expert's
 output, so the line of inquiry was stopped before the end-to-end layer swap.
+
+# Expert tier rework (warm start, admission, I/O)
+
+RTX 5080 with 26 expert slots, 36 GB RAM tier, PNY CS2241, 48 greedy tokens (22-token prompt),
+two interleaved rounds; the drive's speed varies between runs.
+
+| | Prefill s | Decode tok/s | Disk GB | Uploads GB | VRAM hits |
+|---|---|---|---|---|---|
+| before | 44.7 / 57.5 | 0.32 / 0.26 | 159 | 79 | 9 |
+| after | 53.1 / 34.3 | 0.45 / 0.66 | 122 | 14 | 889 |
+| after, `--no-prefetch` | 49.8 / 46.2 | 0.57 / 0.64 | 103 | 14 | 889 |
+
+Idle server, 24 tokens (one run each): warm-up (1,914 experts in 34 s) 0.7 prefill / 0.72 decode
+tok/s; `--no-warm-up` 0.4 / 0.51.
+
+- Output with `--gpu-only-experts` (24 greedy tokens) is identical before and after.
+- The old admission uploaded 3,741 experts for 9 VRAM hits.
+- Trace replay (2 prompts, 110 steps, 1,800 experts in RAM): decode misses LRU 26.5%, decayed use
+  count with half-life 16 24.5%; the ranking mainly helps prefill (4,500 experts: 1.00 -> 0.62).
+- Prefetching reads ~18% more from disk with no clear speed gain on this drive.
+- Cold random reads on this drive: ~0.75 GB/s regardless of queue depth (1 MB requests: 0.4).

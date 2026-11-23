@@ -23,20 +23,27 @@ The UD-Q4_K_XL quant is 501 GB on disk, made of three very different parts:
 Per token the router picks 6 of 384 experts in each of 40 layers (≈4.5 GB of expert weights), so expert
 movement dominates. `dsv4` uses a three-tier expert store:
 
-1. **VRAM slots** — fixed-size slots in a few slab buffers, LRU-replaced. Sized automatically from the free
+1. **VRAM slots** — fixed-size slots in a few slab buffers. Sized automatically from the free
    VRAM after the dense weights are resident (`--expert-vram-gb` to override).
-2. **RAM tier** — experts already repacked into the GPU layout, LRU with a byte budget
+2. **RAM tier** — experts already repacked into the GPU layout, with a byte budget
    (default 75% of system RAM, `--ram-cache-gb`).
-3. **NVMe** — unbuffered positioned reads straight from the GGUF shards (no double caching in the OS page cache).
+3. **NVMe** — unbuffered positioned reads straight from the GGUF shards (no double caching in the OS page cache),
+   one whole matrix per request. Reads a token is waiting for go before speculative ones.
+
+Both caches replace the expert with the lowest decayed use count (half-life 16 tokens), starting from a ranking of
+experts by routing frequency (built in, from [Basalt](https://github.com/jesdga95/basalt), MIT; or `--expert-profile`).
+While the disk is idle after loading, the caches are filled in that order (`--no-warm-up` disables this).
 
 On top of that:
 
 * **Hybrid CPU/GPU experts.** During decode a cold expert is used by one token, so instead of pushing 18.8 MB
   over PCIe it is computed on the CPU (AVX2 MXFP4×int8 dot products) directly from the RAM tier, concurrently
-  with the GPU computing the resident experts. Experts that keep getting picked are admitted to VRAM.
+  with the GPU computing the resident experts. Experts that keep getting picked, and are clearly
+  hotter than the one they would replace, are then copied to VRAM in the background.
   (`--gpu-only-experts` disables this.)
 * **Speculative prefetch.** After routing layer *l*, layer *l+1*'s router is applied to layer *l*'s FFN input on
-  the CPU and the likely experts are read from disk in the background while the GPU runs attention.
+  the CPU and the likely experts are read from disk in the background while the GPU runs attention. Reads
+  that have not started when the real routing is known are dropped (`--no-prefetch` disables prefetching).
 * **Layer-major prefill.** Prompts are processed in segments (`--segment`, default 1024 tokens): every token of a
   segment passes layer *l* before any passes layer *l+1*, so each routed expert is fetched at most once per layer
   per segment instead of once per token.
@@ -48,10 +55,10 @@ On top of that:
 ### What speed to expect
 
 Decode speed is bounded by how many expert bytes per token miss the faster tiers. On the development machine
-(RTX 5080 16 GB with ~4 GB used by the desktop, 128 GB RAM, NVMe at ~3 GB/s):
+(RTX 5080 16 GB with ~4 GB used by the desktop, 128 GB RAM, budget NVMe):
 
 * experts from RAM on the CPU: ~0.5 ms each (6 in parallel, ~35 GB/s)
-* experts from NVMe: ~6 ms each
+* experts from NVMe: ~25 ms each on cold data (a PNY CS2241 sustaining ~0.75 GB/s; check yours with `bench-io`)
 * the whole model's experts (289 GB) do not fit in RAM, so the steady-state speed depends on how skewed expert
   usage is for your workload; the TUI shows the hit rates per tier and per layer.
 
@@ -91,7 +98,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/jso
 | `bench-io` | expert streaming throughput from disk and CPU expert speed |
 
 Common model options: `--ctx` (context, default 32768), `--segment`, `--chunk`, `--expert-vram-gb`,
-`--ram-cache-gb`, `--backend vulkan|dx12|metal`, `--gpu-only-experts`, `--tokenizer`.
+`--ram-cache-gb`, `--backend vulkan|dx12|metal`, `--gpu-only-experts`, `--no-prefetch`, `--no-warm-up`, `--tokenizer`.
 
 ## API notes
 

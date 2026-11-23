@@ -47,9 +47,8 @@ impl Default for SamplingParams {
 }
 
 pub enum Event {
-    /// prompt was accepted: (prompt tokens, tokens reused from cache)
-    #[allow(dead_code)]
-    Started { prompt_tokens: usize, cached: usize },
+    /// prompt was accepted; `cached` of its tokens are reused
+    Started { cached: usize },
     Text(String),
     Done { finish: &'static str, prompt_tokens: usize, completion_tokens: usize, prefill_s: f64, decode_s: f64 },
     Error(String),
@@ -60,6 +59,10 @@ pub struct Request {
     pub params: SamplingParams,
     pub tx: UnboundedSender<Event>,
     pub cancel: Arc<AtomicBool>,
+    /// for the request log
+    pub endpoint: &'static str,
+    /// set by `submit`
+    pub id: u64,
 }
 
 #[derive(Clone)]
@@ -72,7 +75,8 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    pub fn submit(&self, r: Request) {
+    pub fn submit(&self, mut r: Request) {
+        r.id = self.stats.log_request(r.endpoint, r.prompt.len());
         Stats::add(&self.stats.requests_queued, 1);
         let _ = self.tx.send(r);
     }
@@ -165,6 +169,7 @@ pub fn spawn(mut model: Model, tok: Arc<Tokenizer>, stats: Arc<Stats>, model_id:
                 Stats::set(&st.requests_active, 1);
                 if let Err(e) = run_request(&mut model, &tk, &st, &req) {
                     st.event(format!("request failed: {e:#}"));
+                    st.update_request(req.id, |r| r.state = format!("failed: {e:#}"));
                     let _ = req.tx.send(Event::Error(format!("{e:#}")));
                     model.truncate(0);
                     model.drop_snapshot();
@@ -193,8 +198,18 @@ fn run_request(model: &mut Model, tok: &Tokenizer, st: &Stats, req: &Request) ->
     if prompt.len() >= model.max_ctx {
         anyhow::bail!("prompt of {} tokens exceeds the context window ({})", prompt.len(), model.max_ctx);
     }
+    // given up on while it was queued: a long prompt can take minutes
+    if req.cancel.load(Ordering::Relaxed) || req.tx.is_closed() {
+        st.update_request(req.id, |r| r.state = "cancelled".into());
+        let _ = req.tx.send(Event::Done { finish: "cancelled", prompt_tokens: prompt.len(), completion_tokens: 0, prefill_s: 0.0, decode_s: 0.0 });
+        return Ok(());
+    }
     let reuse = model.prepare(prompt);
-    let _ = req.tx.send(Event::Started { prompt_tokens: prompt.len(), cached: reuse });
+    st.update_request(req.id, |r| {
+        r.state = "prefill".into();
+        r.cached = reuse;
+    });
+    let _ = req.tx.send(Event::Started { cached: reuse });
     st.event(format!("request: {} prompt tokens ({} cached), max {} new", prompt.len(), reuse, p.max_tokens));
 
     st.set_phase(format!("prefill {} tokens", prompt.len() - reuse));
@@ -209,6 +224,12 @@ fn run_request(model: &mut Model, tok: &Tokenizer, st: &Stats, req: &Request) ->
     Stats::add(&st.prefill_ns, t0.elapsed().as_nanos() as u64);
     Stats::set(&st.last_prefill_tps_milli, (n_pre as f64 / prefill_s.max(1e-9) * 1000.0) as u64);
 
+    st.update_request(req.id, |r| {
+        r.state = "generating".into();
+        r.prefill_s = Some(prefill_s);
+        // sampling the first token from these logits takes no time worth counting
+        r.ttft_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs_f64() - r.at);
+    });
     let seed = p.seed.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64);
     let mut rng = Rng(seed | 1);
     let mut detok = Detok::new();
@@ -232,6 +253,10 @@ fn run_request(model: &mut Model, tok: &Tokenizer, st: &Stats, req: &Request) ->
             break;
         }
         generated.push(id);
+        st.update_request(req.id, |r| {
+            r.generated = generated.len();
+            r.tps = (generated.len() > 1).then(|| (generated.len() - 1) as f64 / t1.elapsed().as_secs_f64().max(1e-9));
+        });
         let piece = detok.push(tok, id);
         st.push_text(&piece);
         if !piece.is_empty() {
@@ -274,6 +299,7 @@ fn run_request(model: &mut Model, tok: &Tokenizer, st: &Stats, req: &Request) ->
         let _ = req.tx.send(Event::Text(pending));
     }
     let decode_s = t1.elapsed().as_secs_f64();
+    st.update_request(req.id, |r| r.state = finish.into());
     st.event(format!(
         "done: {} tokens in {:.1}s ({:.2} tok/s), prefill {:.1} tok/s, finish={finish}",
         generated.len(),

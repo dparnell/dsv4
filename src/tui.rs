@@ -14,25 +14,25 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::stats::Stats;
 
-struct Gpu {
+pub struct Gpu {
     nvml: Option<nvml_wrapper::Nvml>,
     index: u32,
 }
 
 #[derive(Default, Clone)]
-struct GpuSample {
-    name: String,
-    util: u32,
-    mem_used: u64,
-    mem_total: u64,
-    temp: u32,
-    power_w: f64,
+pub struct GpuSample {
+    pub name: String,
+    pub util: u32,
+    pub mem_used: u64,
+    pub mem_total: u64,
+    pub temp: u32,
+    pub power_w: f64,
     pcie_tx_kbs: u32,
     pcie_rx_kbs: u32,
 }
 
 impl Gpu {
-    fn new(adapter: &str) -> Self {
+    pub fn new(adapter: &str) -> Self {
         let nvml = nvml_wrapper::Nvml::init().ok();
         let mut index = 0;
         if let Some(n) = &nvml {
@@ -46,7 +46,7 @@ impl Gpu {
         }
         Self { nvml, index }
     }
-    fn sample(&self) -> Option<GpuSample> {
+    pub fn sample(&self) -> Option<GpuSample> {
         use nvml_wrapper::enum_wrappers::device::{PcieUtilCounter, TemperatureSensor};
         let d = self.nvml.as_ref()?.device_by_index(self.index).ok()?;
         let mem = d.memory_info().ok();

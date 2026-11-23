@@ -11,6 +11,7 @@ mod gguf;
 mod gpu;
 mod kernels;
 mod model;
+mod monitor;
 mod pack;
 mod quants;
 mod selftest;
@@ -153,6 +154,9 @@ enum Cmd {
         /// Show the live statistics dashboard
         #[arg(long)]
         tui: bool,
+        /// Do not serve the web UI (chat at /, status at /status)
+        #[arg(long)]
+        no_ui: bool,
         /// Default to chat mode (no thinking) when the request does not say
         #[arg(long)]
         no_think: bool,
@@ -468,7 +472,7 @@ fn generate_stdout(engine: &engine::EngineHandle, prompt: Vec<u32>, p: SamplingP
 
 fn generate_to(engine: &engine::EngineHandle, prompt: Vec<u32>, p: SamplingParams, thinking: bool, echo: bool) -> String {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    engine.submit(Request { prompt, params: p, tx, cancel: Arc::new(AtomicBool::new(false)) });
+    engine.submit(Request { prompt, params: p, tx, cancel: Arc::new(AtomicBool::new(false)), endpoint: "cli", id: 0 });
     let mut out = String::new();
     let mut in_think = thinking;
     if thinking && echo {
@@ -570,7 +574,7 @@ fn main() -> Result<()> {
             init_logging(false);
             selftest::run()
         }
-        Cmd::Serve { model, host, port, tui, no_think, model_id } => {
+        Cmd::Serve { model, host, port, tui, no_ui, no_think, model_id } => {
             init_logging(tui);
             let stats = Arc::new(Stats::default());
             let listen = format!("{host}:{port}");
@@ -579,17 +583,33 @@ fn main() -> Result<()> {
             let ma = model.clone();
             let mid = model_id.clone();
             let l2 = listen.clone();
-            // load + serve in the background so the TUI can show progress
+            // serve while loading, so the status page can show progress
             let server = std::thread::spawn(move || -> Result<()> {
-                let Loaded { model, tok, template } = load(&ma, st.clone())?;
-                let engine = engine::spawn(model, tok, st.clone(), mid);
-                let state = Arc::new(server::AppState { engine, template, default_thinking: !no_think });
-                rt.block_on(async move {
-                    let listener = tokio::net::TcpListener::bind(&l2).await?;
+                let run = || -> Result<()> {
+                    let listener = rt.block_on(tokio::net::TcpListener::bind(&l2)).with_context(|| format!("listening on {l2}"))?;
+                    let state = Arc::new(server::AppState {
+                        model_id: mid.clone(),
+                        stats: st.clone(),
+                        monitor: monitor::Monitor::start(st.clone()),
+                        default_thinking: !no_think,
+                        ready: Default::default(),
+                    });
+                    let app = server::router(state.clone(), !no_ui);
+                    let task = rt.spawn(async move { axum::serve(listener, app).await });
+                    if !no_ui {
+                        st.event(format!("web UI at http://{l2}/ (chat) and http://{l2}/status"));
+                    }
+                    let Loaded { model, tok, template } = load(&ma, st.clone())?;
+                    let engine = engine::spawn(model, tok, st.clone(), mid);
+                    let _ = state.ready.set(server::Ready { engine, template });
                     st.event(format!("listening on http://{l2}/v1"));
                     st.set_phase("idle");
-                    axum::serve(listener, server::router(state)).await?;
-                    anyhow::Ok(())
+                    rt.block_on(task)??;
+                    Ok(())
+                };
+                run().inspect_err(|e| {
+                    st.set_phase("failed");
+                    st.event(format!("{e:#}"));
                 })
             });
             if tui {

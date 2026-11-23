@@ -96,7 +96,11 @@ target/release/dsv4 selftest
 target/release/dsv4 serve --model F:/models/DeepSeek-V4.1-Flash-1017-GGUF --tui
 ```
 
-Then point any OpenAI client at `http://127.0.0.1:8080/v1`:
+Open `http://127.0.0.1:8080/` to chat, or `http://127.0.0.1:8080/status` for speeds, memory, expert tiers, recent
+requests and the log (`--no-ui` turns both off). The page is built in and also works while the model is loading; chats
+are kept in the browser. There is no login, so think before using `--host 0.0.0.0`.
+
+Or point any OpenAI client at `http://127.0.0.1:8080/v1`:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/json" -d '{
@@ -111,7 +115,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/jso
 | command | purpose |
 |---|---|
 | `download` | fetch a quant (`--quant`, `--list` to see all) with `--connections` parallel ranges; resumable; set `HF_TOKEN` if needed |
-| `serve` | OpenAI-compatible server (`--host`, `--port`, `--tui`, `--no-think`, `--model-id`) |
+| `serve` | OpenAI-compatible server (`--host`, `--port`, `--tui`, `--no-ui`, `--no-think`, `--model-id`) |
 | `run -p "..."` | one completion to stdout (`--raw` skips the chat template, `--tui` shows the dashboard) |
 | `chat` | interactive terminal chat with history (`/reset`) |
 | `prompt file.json` | render an OpenAI messages file with the model's chat template |
@@ -162,6 +166,8 @@ src/
   engine.rs      request queue, prefix reuse, sampling
   chat.rs        tokenizer, chat template, reasoning / tool-call parsing
   server.rs      OpenAI-compatible HTTP API
+  ui/index.html  built-in web UI (chat and status, no external assets)
+  monitor.rs     samples and snapshot for the status page
   tui.rs         ratatui dashboard
   selftest.rs    kernel verification
 ```

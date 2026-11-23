@@ -1,12 +1,12 @@
 //! OpenAI-compatible HTTP API: /v1/models, /v1/chat/completions, /v1/completions (streaming
-//! and non-streaming), plus /health and /metrics.
+//! and non-streaming), plus /health and /metrics, and the web UI (chat and status).
 
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,11 +16,31 @@ use tokio::sync::mpsc;
 
 use crate::chat::{ChatTemplate, parse_tool_calls, split_reasoning};
 use crate::engine::{EngineHandle, Event, Request, SamplingParams};
+use crate::monitor::Monitor;
+use crate::stats::Stats;
 
 pub struct AppState {
+    pub model_id: String,
+    pub stats: Arc<Stats>,
+    pub monitor: Arc<Monitor>,
+    pub default_thinking: bool,
+    /// set once the model is loaded
+    pub ready: OnceLock<Ready>,
+}
+
+pub struct Ready {
     pub engine: EngineHandle,
     pub template: ChatTemplate,
-    pub default_thinking: bool,
+}
+
+impl AppState {
+    fn ready(&self) -> Result<&Ready, Response> {
+        self.ready.get().ok_or_else(|| {
+            let mut r = err(StatusCode::SERVICE_UNAVAILABLE, "the model is still loading");
+            r.headers_mut().insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+            r
+        })
+    }
 }
 
 type S = State<Arc<AppState>>;
@@ -33,25 +53,65 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }
 
-pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+pub fn router(state: Arc<AppState>, ui: bool) -> Router {
+    let mut r = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(completions))
-        .route("/health", get(|| async { "ok" }))
-        .route("/metrics", get(metrics))
-        .with_state(state)
+        .route("/health", get(health))
+        .route("/metrics", get(metrics));
+    if ui {
+        r = r.route("/", get(ui_page)).route("/status", get(ui_page)).route("/status.json", get(status));
+    }
+    r.with_state(state)
 }
 
-async fn models(State(s): S) -> Json<Value> {
+/// The web UI: one self-contained page that uses the API like any other client.
+async fn ui_page() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+            // model output is shown as HTML: nothing in it may load or send anything
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            ),
+        ],
+        include_str!("ui/index.html"),
+    )
+        .into_response()
+}
+
+async fn status(State(s): S) -> Json<Value> {
+    let mut v = s.monitor.snapshot();
+    v["ready"] = json!(s.ready.get().is_some());
+    v["model_id"] = json!(s.model_id);
+    v["default_thinking"] = json!(s.default_thinking);
+    Json(v)
+}
+
+async fn health(State(s): S) -> Response {
+    match s.ready() {
+        Ok(_) => "ok".into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn models(State(s): S) -> Response {
+    let engine = match s.ready() {
+        Ok(r) => &r.engine,
+        Err(r) => return r,
+    };
     Json(json!({"object": "list", "data": [{
-        "id": s.engine.model_id, "object": "model", "created": now(), "owned_by": "dsv4",
-        "context_length": s.engine.max_ctx,
+        "id": engine.model_id, "object": "model", "created": now(), "owned_by": "dsv4",
+        "context_length": engine.max_ctx,
     }]}))
+    .into_response()
 }
 
 async fn metrics(State(s): S) -> Json<Value> {
-    Json(s.engine.stats.snapshot_json())
+    Json(s.stats.snapshot_json())
 }
 
 fn sampling(body: &Value) -> SamplingParams {
@@ -118,20 +178,25 @@ fn thinking_mode(body: &Value, default: bool) -> bool {
     default
 }
 
+fn usage_json(prompt: usize, cached: usize, completion: usize) -> Value {
+    json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion,
+           "prompt_tokens_details": {"cached_tokens": cached}})
+}
+
 struct Job {
     rx: mpsc::UnboundedReceiver<Event>,
     cancel: Arc<AtomicBool>,
 }
 
-fn start(s: &AppState, prompt: &str, params: SamplingParams) -> Result<(Job, usize), Response> {
-    let ids = s.engine.tok.encode(prompt).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    if ids.len() + 1 >= s.engine.max_ctx {
-        return Err(err(StatusCode::BAD_REQUEST, format!("prompt is {} tokens; context window is {}", ids.len(), s.engine.max_ctx)));
+fn start(engine: &EngineHandle, endpoint: &'static str, prompt: &str, params: SamplingParams) -> Result<(Job, usize), Response> {
+    let ids = engine.tok.encode(prompt).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if ids.len() + 1 >= engine.max_ctx {
+        return Err(err(StatusCode::BAD_REQUEST, format!("prompt is {} tokens; context window is {}", ids.len(), engine.max_ctx)));
     }
     let n = ids.len();
     let (tx, rx) = mpsc::unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    s.engine.submit(Request { prompt: ids, params, tx, cancel: cancel.clone() });
+    engine.submit(Request { prompt: ids, params, tx, cancel: cancel.clone(), endpoint, id: 0 });
     Ok((Job { rx, cancel }, n))
 }
 
@@ -143,39 +208,45 @@ impl Drop for CancelOnDrop {
 }
 
 async fn chat(State(s): S, Json(body): Json<Value>) -> Response {
+    let Ready { engine, template } = match s.ready() {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
     let Some(messages) = body.get("messages") else { return err(StatusCode::BAD_REQUEST, "missing messages") };
     let thinking = thinking_mode(&body, s.default_thinking);
     let tools = body.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty()));
     let effort = body.get("reasoning_effort").filter(|e| e.as_str() != Some("none"));
-    let prompt = match s.template.render(messages, tools, thinking, effort) {
+    let prompt = match template.render(messages, tools, thinking, effort) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("prompt formatting failed: {e:#}")),
     };
     let params = sampling(&body);
     let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let include_usage = body.pointer("/stream_options/include_usage").and_then(|v| v.as_bool()).unwrap_or(false);
-    let (mut job, _) = match start(&s, &prompt, params) {
+    let (mut job, _) = match start(engine, "chat", &prompt, params) {
         Ok(j) => j,
         Err(r) => return r,
     };
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    let model = s.engine.model_id.clone();
+    let model = engine.model_id.clone();
     let created = now();
 
     if !stream {
         let _guard = CancelOnDrop(job.cancel.clone());
         let mut text = String::new();
-        let mut usage = json!({});
+        let (mut usage, mut timings) = (json!({}), json!({}));
+        let mut cached_tokens = 0;
         let mut finish = "stop";
         while let Some(ev) = job.rx.recv().await {
             match ev {
                 Event::Text(t) => text.push_str(&t),
-                Event::Done { finish: f, prompt_tokens, completion_tokens, .. } => {
+                Event::Done { finish: f, prompt_tokens, completion_tokens, prefill_s, decode_s } => {
                     finish = f;
-                    usage = json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens});
+                    usage = usage_json(prompt_tokens, cached_tokens, completion_tokens);
+                    timings = json!({"prefill_s": prefill_s, "decode_s": decode_s});
                 }
                 Event::Error(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
-                Event::Started { .. } => {}
+                Event::Started { cached, .. } => cached_tokens = cached,
             }
         }
         let (reasoning, content) = split_reasoning(&text, thinking);
@@ -191,7 +262,7 @@ async fn chat(State(s): S, Json(body): Json<Value>) -> Response {
         return Json(json!({
             "id": id, "object": "chat.completion", "created": created, "model": model,
             "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-            "usage": usage,
+            "usage": usage, "timings": timings,
         }))
         .into_response();
     }
@@ -207,6 +278,7 @@ async fn chat(State(s): S, Json(body): Json<Value>) -> Response {
         let mut buf = String::new();     // text not yet classified (could be a split "</think>")
         let mut content_all = String::new();
         let mut tool_mode = false;
+        let mut cached_tokens = 0;
         while let Some(ev) = job.rx.recv().await {
             match ev {
                 Event::Text(t) => {
@@ -249,7 +321,7 @@ async fn chat(State(s): S, Json(body): Json<Value>) -> Response {
                         }
                     }
                 }
-                Event::Done { finish, prompt_tokens, completion_tokens, .. } => {
+                Event::Done { finish, prompt_tokens, completion_tokens, prefill_s, decode_s } => {
                     let mut finish = finish;
                     if tool_mode {
                         let (_, calls) = parse_tool_calls(&content_all);
@@ -265,14 +337,15 @@ async fn chat(State(s): S, Json(body): Json<Value>) -> Response {
                     yield Ok(SseEvent::default().data(chunk(json!({}), Some(finish)).to_string()));
                     if include_usage {
                         let u = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [],
-                            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}});
+                            "usage": usage_json(prompt_tokens, cached_tokens, completion_tokens),
+                            "timings": {"prefill_s": prefill_s, "decode_s": decode_s}});
                         yield Ok(SseEvent::default().data(u.to_string()));
                     }
                 }
                 Event::Error(e) => {
                     yield Ok(SseEvent::default().data(json!({"error": {"message": e}}).to_string()));
                 }
-                Event::Started { .. } => {}
+                Event::Started { cached, .. } => cached_tokens = cached,
             }
         }
         yield Ok(SseEvent::default().data("[DONE]"));
@@ -281,6 +354,10 @@ async fn chat(State(s): S, Json(body): Json<Value>) -> Response {
 }
 
 async fn completions(State(s): S, Json(body): Json<Value>) -> Response {
+    let engine = match s.ready() {
+        Ok(r) => &r.engine,
+        Err(r) => return r,
+    };
     let prompt = match body.get("prompt") {
         Some(Value::String(p)) => p.clone(),
         Some(Value::Array(a)) if a.len() == 1 => a[0].as_str().unwrap_or("").to_string(),
@@ -288,12 +365,12 @@ async fn completions(State(s): S, Json(body): Json<Value>) -> Response {
     };
     let params = sampling(&body);
     let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let (mut job, _) = match start(&s, &prompt, params) {
+    let (mut job, _) = match start(engine, "completions", &prompt, params) {
         Ok(j) => j,
         Err(r) => return r,
     };
     let id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-    let model = s.engine.model_id.clone();
+    let model = engine.model_id.clone();
     let created = now();
     if !stream {
         let _guard = CancelOnDrop(job.cancel.clone());

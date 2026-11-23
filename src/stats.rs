@@ -7,8 +7,30 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 
+/// One API request, for the status page.
+#[derive(Clone, serde::Serialize)]
+pub struct ReqRow {
+    pub id: u64,
+    pub endpoint: &'static str,
+    /// unix time it arrived
+    pub at: f64,
+    /// queued, prefill, generating, or how it ended
+    pub state: String,
+    pub prompt: usize,
+    pub cached: usize,
+    pub generated: usize,
+    pub prefill_s: Option<f64>,
+    /// time to the first token, waiting included
+    pub ttft_s: Option<f64>,
+    pub tps: Option<f64>,
+}
+
+const KEEP_REQUESTS: usize = 100;
+
 #[derive(Default)]
 pub struct Stats {
+    /// recent requests, oldest first, and the number of all there were
+    pub requests: Mutex<(VecDeque<ReqRow>, u64)>,
     // token throughput
     pub prompt_tokens: AtomicU64,
     pub gen_tokens: AtomicU64,
@@ -105,6 +127,29 @@ impl Stats {
 
     pub fn set_phase(&self, p: impl Into<String>) {
         *self.phase.lock() = p.into();
+    }
+
+    /// Log a new request; returns its id.
+    pub fn log_request(&self, endpoint: &'static str, prompt: usize) -> u64 {
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        let mut r = self.requests.lock();
+        r.1 += 1;
+        let id = r.1;
+        r.0.push_back(ReqRow { id, endpoint, at, state: "queued".into(), prompt, cached: 0, generated: 0, prefill_s: None, ttft_s: None, tps: None });
+        if r.0.len() > KEEP_REQUESTS {
+            r.0.pop_front();
+        }
+        id
+    }
+
+    pub fn update_request(&self, id: u64, f: impl FnOnce(&mut ReqRow)) {
+        if let Some(r) = self.requests.lock().0.iter_mut().rev().find(|r| r.id == id) {
+            f(r);
+        }
+    }
+
+    pub fn requests_json(&self) -> serde_json::Value {
+        serde_json::json!(self.requests.lock().0.iter().rev().collect::<Vec<_>>())
     }
 
     pub fn snapshot_json(&self) -> serde_json::Value {

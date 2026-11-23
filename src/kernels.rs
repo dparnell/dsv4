@@ -707,7 +707,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// Exact top-k per row by 4-pass radix select. Writes indices (any order), -1 padded.
+/// Exact top-k per row by 4-pass radix select. Writes indices in ascending order, -1 padded;
+/// ties at the threshold go to the lowest index, so the result never depends on scheduling.
 /// S [M][n_cols]. p0=n_cols p1=k p2=pos0 p3=ratio (n_vis = (pos0+m+1)/ratio, capped at n_cols)
 /// p4=out_stride p5=out_off p6=n_vis_override(0 = use formula) p7=add_offset
 const TOPK: &str = r#"
@@ -716,8 +717,8 @@ const TOPK: &str = r#"
 var<workgroup> hist: array<atomic<u32>, 256>;
 var<workgroup> prefix: u32;
 var<workgroup> remaining: u32;
-var<workgroup> cnt_gt: atomic<u32>;
-var<workgroup> cnt_eq: atomic<u32>;
+var<workgroup> n_gt: array<u32, 256>;
+var<workgroup> n_eq: array<u32, 256>;
 
 fn okey(f: f32) -> u32 {
   let b = bitcast<u32>(f);
@@ -739,7 +740,7 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
     }
     return;
   }
-  if (li == 0u) { prefix = 0u; remaining = k; atomicStore(&cnt_gt, 0u); atomicStore(&cnt_eq, 0u); }
+  if (li == 0u) { prefix = 0u; remaining = k; }
   for (var ps = 0u; ps < 4u; ps++) {
     let shift = 24u - ps * 8u;
     atomicStore(&hist[li], 0u);
@@ -767,15 +768,39 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
   }
   let thr = prefix;
   let need_eq = remaining;
-  let n_gt = k - need_eq;
-  for (var i = li; i < nvis; i += 256u) {
+  // Stable compaction: each invocation owns a contiguous block of columns.
+  let blk = (nvis + 255u) / 256u;
+  let lo = min(li * blk, nvis);
+  let hi = min(lo + blk, nvis);
+  var g = 0u;
+  var e = 0u;
+  for (var i = lo; i < hi; i++) {
+    let key = okey(S[row + i]);
+    if (key > thr) { g++; } else if (key == thr) { e++; }
+  }
+  n_gt[li] = g;
+  n_eq[li] = e;
+  workgroupBarrier();
+  if (li == 0u) {
+    var sg = 0u;
+    var se = 0u;
+    for (var i = 0u; i < 256u; i++) {
+      let cg = n_gt[i]; let ce = n_eq[i];
+      n_gt[i] = sg; n_eq[i] = se;
+      sg += cg; se += ce;
+    }
+  }
+  workgroupBarrier();
+  g = n_gt[li];
+  e = n_eq[li];
+  for (var i = lo; i < hi; i++) {
     let key = okey(S[row + i]);
     if (key > thr) {
-      let p = atomicAdd(&cnt_gt, 1u);
-      OUT[ob + p] = i32(i + P.p7);
+      OUT[ob + g + min(e, need_eq)] = i32(i + P.p7);
+      g++;
     } else if (key == thr) {
-      let p = atomicAdd(&cnt_eq, 1u);
-      if (p < need_eq) { OUT[ob + n_gt + p] = i32(i + P.p7); }
+      if (e < need_eq) { OUT[ob + g + e] = i32(i + P.p7); }
+      e++;
     }
   }
 }

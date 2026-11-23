@@ -386,10 +386,15 @@ pub fn run() -> Result<()> {
         all &= check("hc_post", &got, &wantp, 1e-4);
     }
 
-    // ---- top-k (radix select) ----
-    {
-        let (n, k, rows) = (3000usize, 512usize, 2usize);
-        let s = r.vec(rows * n, 10.0);
+    // ---- top-k (radix select): ascending indices, ties to the lowest index ----
+    for (n, k, tied) in [(3000usize, 512usize, false), (3000, 512, true), (513, 512, true), (700, 512, true), (300, 7, true), (400, 512, true)] {
+        let rows = 2usize;
+        let mut s = r.vec(rows * n, 10.0);
+        if tied {
+            for v in s.iter_mut() {
+                *v = v.round().max(0.0);
+            }
+        }
         let (sb, ob) = (fb(&s), gpu.buffer("o", (rows * k * 4) as u64));
         let mut b = gpu.begin();
         b.run("topk", &[sb.all(), ob.all()], &[n as u32, k as u32, 0, 1, k as u32, 0, n as u32, 0], (rows as u32, 1, 1));
@@ -398,15 +403,14 @@ pub fn run() -> Result<()> {
         let mut ok = true;
         for rr in 0..rows {
             let row = &s[rr * n..(rr + 1) * n];
-            let mut sorted: Vec<f32> = row.to_vec();
-            sorted.sort_by(|a, b| b.total_cmp(a));
-            let thr = sorted[k - 1];
-            let mut sel: Vec<i32> = got[rr * k..(rr + 1) * k].to_vec();
-            sel.sort();
-            sel.dedup();
-            ok &= sel.len() == k && sel.iter().all(|&i| i >= 0 && row[i as usize] >= thr);
+            let mut want: Vec<i32> = (0..n as i32).collect();
+            want.sort_by(|&x, &y| row[y as usize].total_cmp(&row[x as usize]).then(x.cmp(&y)));
+            want.truncate(k);
+            want.sort();
+            want.resize(k, -1);
+            ok &= got[rr * k..(rr + 1) * k] == want[..];
         }
-        println!("{} topk             {} rows of {n}, k={k}", if ok { "PASS" } else { "FAIL" }, rows);
+        println!("{} topk             {rows} rows of {n}, k={k}{}", if ok { "PASS" } else { "FAIL" }, if tied { ", ties" } else { "" });
         all &= ok;
     }
 

@@ -77,9 +77,12 @@ disk GB (prompts included) is the steadier measure of work.
 Only what the last `clamp(len/8, 16, 512)` positions need is computed past layer 20.
 
 - Exact: 490-token prompt (segment 128, chunk 64) + 14 tokens, `--gpu-only-experts`: logits
-  bit-identical with and without. Longer prompts are not reproducible run to run (the top-k shader
-  emits indices in arbitrary order): on 1,100 tokens the skip differs by KLD 0.008, a plain repeat
-  by 0.010.
+  bit-identical with and without. On 1,100 tokens + 16 with the deterministic top-k (below), KLD is
+  0.00000 with and without the skip.
+- Deterministic top-k: the shader used to emit indices, and pick among tied scores, in scheduling
+  order. Same 1,100-token test: old shader run to run KLD 0.009; new shader byte-identical logits,
+  with 0.015 (worst 0.064, top-1 100%) between old and new, about the size of the old noise. Speed difference not
+  measurable over drive variance.
 - Work: 4,500 tokens + 32: disk 1,016 -> 757 GB (-25%), uploads 1,118 -> 870 GB. 1,100 tokens: -4%;
   no benefit for short prompts. Wall time there was 691 -> 803 s, but the drive averaged 1.4 vs
   0.9 GB/s in the two runs, so no speedup has been demonstrated.

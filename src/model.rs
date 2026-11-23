@@ -28,6 +28,8 @@ pub struct ModelOptions {
     /// None: use the free VRAM measured after the dense weights are resident
     pub expert_vram_bytes: Option<u64>,
     pub expert_ram_bytes: u64,
+    /// experts in one file (see pack.rs)
+    pub expert_pack: Option<std::path::PathBuf>,
     pub backend: Option<String>,
     pub cpu_experts: bool,
     /// All experts, hottest first (None: built-in ranking)
@@ -437,7 +439,7 @@ impl Model {
             }
         };
         let ranking = opt.expert_ranking.clone().or_else(|| crate::experts::builtin_ranking(&cfg));
-        let experts = Arc::new(ExpertStore::new(&g, &gpu, &cfg, vram, opt.expert_ram_bytes, ranking.as_deref(), stats.clone())?);
+        let experts = Arc::new(ExpertStore::new(&g, &gpu, &cfg, vram, opt.expert_ram_bytes, ranking.as_deref(), opt.expert_pack.as_deref(), stats.clone())?);
         let allowed = match &opt.expert_subset {
             Some(sub) => {
                 stats.set_phase("pinning expert subset");
@@ -449,7 +451,7 @@ impl Model {
                     set.len(),
                     in_vram,
                     set.len() - in_vram,
-                    set.len() as f64 * experts.geom.expert_bytes as f64 / 1e9
+                    set.len() as f64 * experts.geom.mean_host / 1e9
                 ));
                 Some(
                     sub.iter()
@@ -470,9 +472,9 @@ impl Model {
         stats.event(format!(
             "expert cache: {} VRAM slots ({:.2} GB), RAM tier {:.1} GB, {:.1} MB/expert",
             experts.n_slots,
-            experts.n_slots as f64 * experts.geom.expert_bytes as f64 / 1e9,
+            experts.n_slots as f64 * experts.geom.slot_bytes as f64 / 1e9,
             opt.expert_ram_bytes as f64 / 1e9,
-            experts.geom.expert_bytes as f64 / 1e6
+            experts.geom.mean_host / 1e6
         ));
         if let (true, Some(r), None) = (opt.warm_up, ranking, &opt.expert_subset) {
             experts.warm_up(&gpu, r);
@@ -1069,7 +1071,7 @@ impl Model {
                         })
                         .collect();
                     let t_run = std::time::Instant::now();
-                    let ys = crate::cpu_moe::experts_forward(&jobs, geom.inter, d, geom.mat_bytes as usize, cfg.swiglu_limit);
+                    let ys = crate::cpu_moe::experts_forward(&jobs, geom.inter, d, geom.layers[l].host[0], cfg.swiglu_limit);
                     Stats::add(&self.stats.t_cpu_compute_ns, t_run.elapsed().as_nanos() as u64);
                     for ((e, _), ys) in batch.iter().zip(ys) {
                         out.rows.extend(routing.per_expert[*e].iter().zip(ys).map(|(&(t, k, _), y)| (t as usize * cfg.n_active + k as usize, y)));
@@ -1150,7 +1152,7 @@ impl Model {
         let gpu = &self.gpu;
         let cap = self.experts.streaming_slots();
         let geom = &self.experts.geom;
-        let mat_words = (geom.mat_bytes / 4) as u32;
+        let mat_words = (geom.layers[l].host[0] / 4) as u32;
         let mut waves = list.chunks(cap).peekable();
         while let Some(wave) = waves.next() {
             // read the next wave while this one is uploaded and recorded
@@ -1173,7 +1175,7 @@ impl Model {
             let mut b = gpu.begin();
             for (s, &(start, cnt)) in slots.iter().zip(&ranges) {
                 let slab = &self.experts.slabs[s.slab].buf;
-                let sb = slab.range(s.offset, geom.expert_bytes);
+                let sb = slab.range(s.offset, geom.slot_bytes);
                 let tm = if cnt == 1 { 1 } else { 8 };
                 let (gk, dk) = if tm == 1 { ("moe_gate_up_1", "moe_down_1") } else { ("moe_gate_up_8", "moe_down_8") };
                 b.run(

@@ -1,6 +1,7 @@
 //! Expert reads from disk.
 //!
-//! A load is split into pieces (one per matrix) served by a small set of I/O threads, so many reads are
+//! A load is split into parts (one per matrix of a GGUF expert, one for the whole expert of a
+//! pack) served by a small set of I/O threads, so many reads are
 //! queued at the drive at once. Each piece is read into the thread's own aligned scratch buffer
 //! and repacked straight into the expert's destination buffer: no intermediate copies.
 //!
@@ -16,14 +17,44 @@ use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::experts::{Key, MatLoc, key};
+use crate::experts::{Key, key};
 
 /// MXFP4 block: [scale: 1][values: 16]
 const BLK: usize = 17;
 pub const THREADS: usize = 16;
-/// Blocks per piece. Large enough that an expert matrix (6.3 MB) is one read: on the drive this
-/// was tuned on (DRAM-less NVMe) 1 MB pieces ran at 0.6 GB/s and whole matrices at 2 GB/s.
-const PIECE_BLOCKS: usize = (8 << 20) / BLK;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PartKind {
+    /// interleaved MXFP4 blocks, to be stored as [values][scales]
+    Mxfp4,
+    /// bytes kept as they are
+    Raw,
+    /// dev-partial stand-in for missing MXFP4: all-zero blocks with scale exponent 127
+    Zero,
+}
+
+/// A contiguous piece of every expert of one layer, read in one go: on the drive this was tuned
+/// on (DRAM-less NVMe) larger reads are faster throughout (1 MB: 0.6 GB/s, 6 MB: 1, 19 MB: 1.4).
+#[derive(Clone, Copy, Debug)]
+pub struct Part {
+    pub file: usize,
+    /// file offset of expert 0
+    pub offset: u64,
+    /// bytes from one expert to the next
+    pub stride: u64,
+    /// where it goes in the expert's buffer
+    pub dst: usize,
+    pub len: usize,
+    pub kind: PartKind,
+}
+
+/// How the experts of one layer are read.
+#[derive(Clone, Debug)]
+pub struct LayerParts {
+    /// bytes of one expert in memory
+    pub len: usize,
+    pub parts: Vec<Part>,
+}
 
 #[repr(C, align(4096))]
 #[derive(Clone, Copy)]
@@ -70,6 +101,7 @@ pub struct Job {
     key: Key,
     t0: Instant,
     dst: *mut u8,
+    len: usize,
     /// owns the allocation behind `dst`; taken when the last piece finishes
     buf: Mutex<Option<Vec<u8>>>,
     remaining: AtomicUsize,
@@ -103,9 +135,7 @@ impl Job {
 
 struct Piece {
     job: Arc<Job>,
-    mat: usize,
-    first: usize,
-    n: usize,
+    part: Part,
 }
 
 #[derive(Default)]
@@ -129,8 +159,7 @@ pub struct Finished<'a> {
 pub type OnDone = Box<dyn Fn(Finished) + Send + Sync>;
 
 struct Shared {
-    locs: Arc<Vec<[MatLoc; 3]>>,
-    mat_bytes: usize,
+    locs: Arc<Vec<LayerParts>>,
     q: Mutex<Queues>,
     cv: Condvar,
     on_done: OnDone,
@@ -145,8 +174,8 @@ pub struct Loader {
 impl Loader {
     /// `open` opens the shards; it is called once per thread, because Windows runs the reads on
     /// one synchronous file handle strictly one after another.
-    pub fn new(open: impl Fn() -> std::io::Result<Vec<File>>, locs: Arc<Vec<[MatLoc; 3]>>, mat_bytes: usize, threads: usize, on_done: OnDone) -> std::io::Result<Self> {
-        let sh = Arc::new(Shared { locs, mat_bytes, q: Default::default(), cv: Condvar::new(), on_done, max_background: (threads / 4).max(1) });
+    pub fn new(open: impl Fn() -> std::io::Result<Vec<File>>, locs: Arc<Vec<LayerParts>>, threads: usize, on_done: OnDone) -> std::io::Result<Self> {
+        let sh = Arc::new(Shared { locs, q: Default::default(), cv: Condvar::new(), on_done, max_background: (threads / 4).max(1) });
         let threads = (0..threads)
             .map(|i| {
                 let (s, files) = (sh.clone(), open()?);
@@ -209,15 +238,15 @@ impl Loader {
     }
 
     fn start(&self, q: &mut Queues, k: Key, kind: Kind, mut buf: Vec<u8>) -> Arc<Job> {
-        assert_eq!(buf.len(), self.sh.mat_bytes * 3);
-        let nblk = self.sh.mat_bytes / BLK;
-        let per_mat = nblk.div_ceil(PIECE_BLOCKS);
+        let layer = &self.sh.locs[(k >> 16) as usize];
+        assert_eq!(buf.len(), layer.len);
         let job = Arc::new(Job {
             key: k,
             t0: Instant::now(),
             dst: buf.as_mut_ptr(),
+            len: buf.len(),
             buf: Mutex::new(Some(buf)),
-            remaining: AtomicUsize::new(3 * per_mat),
+            remaining: AtomicUsize::new(layer.parts.len()),
             started: AtomicBool::new(false),
             kind,
             claimed: AtomicBool::new(false),
@@ -230,12 +259,7 @@ impl Loader {
             Kind::Prefetch => &mut q.prefetch,
             Kind::Warm => &mut q.warm,
         };
-        for mat in 0..3 {
-            for p in 0..per_mat {
-                let first = p * PIECE_BLOCKS;
-                queue.push_back(Piece { job: job.clone(), mat, first, n: (nblk - first).min(PIECE_BLOCKS) });
-            }
-        }
+        queue.extend(layer.parts.iter().map(|&part| Piece { job: job.clone(), part }));
         q.inflight.insert(k, job.clone());
         self.sh.cv.notify_all();
         job
@@ -314,7 +338,7 @@ fn worker(sh: &Shared, files: &[File]) {
                 sh.cv.wait(&mut q);
             }
         };
-        if let Err(e) = run_piece(sh, files, &piece, &mut scratch) {
+        if let Err(e) = run_piece(files, &piece, &mut scratch) {
             *piece.job.error.lock() = Some(e.to_string());
         }
         {
@@ -347,27 +371,26 @@ fn worker(sh: &Shared, files: &[File]) {
     }
 }
 
-fn run_piece(sh: &Shared, files: &[File], p: &Piece, scratch: &mut Vec<Page>) -> std::io::Result<()> {
-    let m = &sh.locs[(p.job.key >> 16) as usize][p.mat];
-    let nblk = sh.mat_bytes / BLK;
-    let base = p.mat * sh.mat_bytes;
-    // SAFETY: every piece owns a distinct block range of the job's buffer, which stays alive
-    // until `remaining` reaches zero.
-    let (qs, sc) = unsafe {
-        (
-            std::slice::from_raw_parts_mut(p.job.dst.add(base + p.first * 16), p.n * 16),
-            std::slice::from_raw_parts_mut(p.job.dst.add(base + nblk * 16 + p.first), p.n),
-        )
-    };
-    if m.shard == usize::MAX {
-        // dev-partial stand-in: all-zero blocks with scale exponent 127
-        qs.fill(0);
-        sc.fill(127);
+fn run_piece(files: &[File], p: &Piece, scratch: &mut Vec<Page>) -> std::io::Result<()> {
+    let m = &p.part;
+    // SAFETY: the parts of a job are disjoint ranges of its buffer, which stays alive until
+    // `remaining` reaches zero; `start` checked its length.
+    assert!(m.dst + m.len <= p.job.len);
+    let out = unsafe { std::slice::from_raw_parts_mut(p.job.dst.add(m.dst), m.len) };
+    let e = (p.job.key & 0xffff) as u64;
+    if m.kind != PartKind::Zero {
+        let raw = read_at(&files[m.file], m.offset + e * m.stride, m.len, scratch)?;
+        if m.kind == PartKind::Raw {
+            out.copy_from_slice(raw);
+        } else {
+            let (qs, sc) = out.split_at_mut(m.len / BLK * 16);
+            repack_mxfp4(raw, qs, sc);
+        }
         return Ok(());
     }
-    let e = (p.job.key & 0xffff) as u64;
-    let raw = read_at(&files[m.shard], m.offset + e * m.stride + (p.first * BLK) as u64, p.n * BLK, scratch)?;
-    repack_mxfp4(raw, qs, sc);
+    let (qs, sc) = out.split_at_mut(m.len / BLK * 16);
+    qs.fill(0);
+    sc.fill(127);
     Ok(())
 }
 
@@ -383,20 +406,20 @@ fn repack_mxfp4(raw: &[u8], qs: &mut [u8], sc: &mut [u8]) {
 mod tests {
     use super::*;
 
-    fn fixture(blocks: usize, experts: usize) -> (std::path::PathBuf, Vec<u8>, Arc<Vec<[MatLoc; 3]>>) {
+    fn fixture(blocks: usize, experts: usize) -> (std::path::PathBuf, Vec<u8>, Arc<Vec<LayerParts>>) {
         static N: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!("dsv4-io-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let stride = blocks * BLK;
         let pad = 123; // unaligned tensor start
         let data: Vec<u8> = (0..pad + 3 * experts * stride).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
         std::fs::write(&path, &data).unwrap();
-        let loc = |m: usize| MatLoc { shard: 0, offset: (pad + m * experts * stride) as u64, stride: stride as u64 };
-        (path, data, Arc::new(vec![[loc(0), loc(1), loc(2)]]))
+        let part = |m: usize| Part { file: 0, offset: (pad + m * experts * stride) as u64, stride: stride as u64, dst: m * stride, len: stride, kind: PartKind::Mxfp4 };
+        (path, data, Arc::new(vec![LayerParts { len: 3 * stride, parts: (0..3).map(part).collect() }]))
     }
 
-    fn expect(data: &[u8], locs: &[[MatLoc; 3]], e: usize, blocks: usize) -> Vec<u8> {
+    fn expect(data: &[u8], locs: &[LayerParts], e: usize, blocks: usize) -> Vec<u8> {
         let mut out = Vec::new();
-        for m in &locs[0] {
+        for m in &locs[0].parts {
             let raw = &data[m.offset as usize + e * m.stride as usize..][..m.stride as usize];
             raw.chunks(BLK).for_each(|b| out.extend(&b[1..]));
             raw.chunks(BLK).for_each(|b| out.push(b[0]));
@@ -407,12 +430,12 @@ mod tests {
 
     #[test]
     fn loads_match_file_and_join() {
-        let blocks = PIECE_BLOCKS * 2 + 77;
+        let blocks = 1_000_077;
         let (path, data, locs) = fixture(blocks, 4);
         let mb = blocks * BLK;
         let done = Arc::new(AtomicUsize::new(0));
         let d2 = done.clone();
-        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs.clone(), mb, 4, Box::new(move |_| { d2.fetch_add(1, Ordering::Relaxed); })).unwrap();
+        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs.clone(), 4, Box::new(move |_| { d2.fetch_add(1, Ordering::Relaxed); })).unwrap();
         for e in 0..3 {
             assert!(l.prefetch(0, e, || Ok(vec![0; 3 * mb])));
         }
@@ -430,7 +453,7 @@ mod tests {
     #[test]
     fn read_errors_reach_the_waiter() {
         let (path, _, locs) = fixture(64, 1);
-        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs, 64 * BLK, 2, Box::new(|_| {})).unwrap();
+        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs, 2, Box::new(|_| {})).unwrap();
         // expert 5 lies past the end of the file
         let j = l.demand(0, 5, || None, || Ok(vec![0; 3 * 64 * BLK])).unwrap();
         assert!(j.wait().is_err());
@@ -440,10 +463,10 @@ mod tests {
 
     #[test]
     fn cancelled_prefetches_never_run() {
-        let blocks = PIECE_BLOCKS * 4;
+        let blocks = 1_000_000;
         let (path, data, locs) = fixture(blocks, 4);
         let mb = blocks * BLK;
-        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs.clone(), mb, 1, Box::new(|_| {})).unwrap();
+        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs.clone(), 1, Box::new(|_| {})).unwrap();
         for e in 0..4 {
             l.prefetch(0, e, || Ok(vec![0; 3 * mb]));
         }

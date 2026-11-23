@@ -110,3 +110,12 @@ Single-token work is limited by DRAM. Sharing the weights between tokens is the 
   within the sample; int8 activations cost ~0.02 either way.
 - Repeats of one build differed by KLD 0.012-0.014 when free VRAM changed the slot count, since
   placement decides whether an expert is computed by the CPU or the GPU.
+
+# Expert pack
+
+- Random reads at 16 threads on F:, Q4_K_XL, in randomized order (GB/s, mean of 3): 2.1 MB 0.69,
+  2.9 MB 0.88, 6.3 MB 0.96, 7.9 MB 1.09, 18.8 MB 1.40.
+- `bench-io --layers 3`, GGUF vs a 3-layer pack, alternating, 16 loaders: 2.39 / 2.51 / 1.22 vs
+  3.45 / 3.03 / 3.09 GB/s. The pack had just been written (drive cache), and repeated reads of 3
+  layers flatter both. End-to-end speed with a full pack: not measured.
+- Logits with and without the pack are bit-identical (gpu-only, 24 + 4 tokens).

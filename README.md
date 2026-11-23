@@ -107,6 +107,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/jso
 | `info` | GGUF metadata, tensor types and model configuration |
 | `selftest` | every WGSL kernel (and the CPU expert path) against a CPU reference |
 | `eval` | teacher-forced perplexity and speed on text files; `--save` / `--base` compare two configurations |
+| `repack` | copies the experts into one file (`experts.pack`, 289 GB for Q4_K_XL) with each expert contiguous, so a miss is one 19 MB read instead of three 6 MB ones; lossless, resumable, found by itself next to the model, `--expert-pack` elsewhere; `--layers N` for part of them |
 | `bench-io` | expert streaming throughput from disk |
 | `bench-cpu` | speed of routed experts on the CPU by thread count (no model needed); `DSV4_CPU_ISA=avx2\|avxvnni\|avx512vnni` picks the kernel |
 
@@ -142,6 +143,7 @@ src/
                  hyper-connection Sinkhorn mixing, Engram gating, quantisation simulation, ...)
   weights.rs     dense weight loading / repacking
   experts.rs     three-tier routed-expert store (VRAM slots, RAM LRU, NVMe)
+  pack.rs        expert packs (`repack`)
   cpu_moe.rs     MXFP4 expert execution on the CPU (AVX2 / VNNI kernels)
   engram.rs      n-gram hashing and MXFP8 row gathers
   model.rs       the forward pass (layer-major segments, chunked attention, hybrid MoE)

@@ -3,8 +3,8 @@
 //! Three tiers:
 //!   VRAM  - fixed slots in a few large slab buffers
 //!   RAM   - repacked (GPU-ready) expert bytes with a byte budget
-//!   disk  - positioned reads straight from the GGUF shards (unbuffered on Windows so the
-//!           OS page cache does not duplicate the RAM tier)
+//!   disk  - positioned reads straight from the GGUF shards, or from an expert pack (see
+//!           pack.rs); unbuffered on Windows so the OS page cache does not duplicate the RAM tier
 //!
 //! Both caches evict the expert with the lowest *heat*: a use count that halves every
 //! `HEAT_HALF_LIFE` forward steps, started from a routing profile. The profile also decides what
@@ -22,8 +22,8 @@ use anyhow::{Result, bail};
 use parking_lot::Mutex;
 
 use crate::config::Config;
-use crate::expert_io::{Finished, Load, Loader, THREADS};
-use crate::gguf::{GGML_MXFP4, Gguf};
+use crate::expert_io::{Finished, LayerParts, Load, Loader, Part, PartKind, THREADS};
+use crate::gguf::{GGML_MXFP4, Gguf, type_block};
 use crate::gpu::{Buf, Gpu};
 use crate::stats::Stats;
 
@@ -32,19 +32,64 @@ pub fn key(layer: usize, e: usize) -> Key {
     (layer as u32) << 16 | e as u32
 }
 
-#[derive(Clone, Copy)]
-pub struct MatLoc {
-    pub shard: usize,
-    pub offset: u64, // file offset of expert 0
-    pub stride: u64, // bytes per expert
+/// The expert matrices of one layer, in the order gate, up, down.
+#[derive(Clone, Copy, Debug)]
+pub struct LayerGeom {
+    /// ggml types
+    pub types: [u32; 3],
+    /// bytes of each in the RAM tier: what it takes in the GGUF
+    pub host: [usize; 3],
+}
+
+impl LayerGeom {
+    pub fn host_len(&self) -> usize {
+        self.host.iter().sum()
+    }
 }
 
 pub struct ExpertGeom {
     pub inter: usize,
     pub dim: usize,
-    /// bytes of one repacked matrix (all three are equal in size)
-    pub mat_bytes: u64,
-    pub expert_bytes: u64,
+    pub layers: Vec<LayerGeom>,
+    /// bytes of a VRAM slot: the largest expert
+    pub slot_bytes: u64,
+    /// mean bytes of an expert in the RAM tier
+    pub mean_host: f64,
+}
+
+/// The expert matrices of every layer, and where they are in the shards.
+pub fn layer_geoms(g: &Gguf, cfg: &Config) -> Result<(Vec<LayerGeom>, Vec<LayerParts>)> {
+    let (mut geoms, mut layers) = (Vec::new(), Vec::new());
+    for l in 0..cfg.n_layers {
+        let mut geom = LayerGeom { types: [GGML_MXFP4; 3], host: [0; 3] };
+        let mut parts = Vec::new();
+        let mut dst = 0;
+        for (i, nm) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().enumerate() {
+            let name = format!("blk.{l}.{nm}.weight");
+            let (k, rows) = if i == 2 { (cfg.moe_inter, cfg.dim) } else { (cfg.dim, cfg.moe_inter) };
+            let part = if crate::gguf::dev_partial() && !g.has(&name) {
+                Part { file: 0, offset: 0, stride: 0, dst, len: rows * k / 32 * 17, kind: PartKind::Zero }
+            } else {
+                let t = g.tensor(&name)?;
+                if t.ty != GGML_MXFP4 {
+                    bail!("blk.{l}.{nm}: expected MXFP4 experts (type 39), got {}", t.ty);
+                }
+                let (be, bb) = type_block(t.ty).unwrap();
+                let len = (rows * k) as u64 / be * bb;
+                if t.dims != [k as u64, rows as u64, cfg.n_experts as u64] || t.nbytes != len * cfg.n_experts as u64 {
+                    bail!("blk.{l}.{nm}: unexpected shape {:?}", t.dims);
+                }
+                geom.types[i] = t.ty;
+                Part { file: t.shard, offset: t.file_offset, stride: len, dst, len: len as usize, kind: PartKind::Mxfp4 }
+            };
+            geom.host[i] = part.len;
+            dst += part.len;
+            parts.push(part);
+        }
+        geoms.push(geom);
+        layers.push(LayerParts { len: dst, parts });
+    }
+    Ok((geoms, layers))
 }
 
 /// forward steps after which a use counts half (chosen by replaying recorded routing traces)
@@ -124,6 +169,11 @@ impl RamCache {
         }
         true
     }
+    /// A recycled buffer of `n` bytes, if there is one.
+    fn reuse(&mut self, n: usize) -> Option<Vec<u8>> {
+        let i = self.free.iter().position(|b| b.len() == n)?;
+        Some(self.free.swap_remove(i))
+    }
     fn recycle(&mut self, b: Vec<u8>) {
         if self.free.len() < RECYCLE {
             self.free.push(b);
@@ -179,7 +229,8 @@ const MAX_PROMOTIONS: usize = 2;
 
 pub struct ExpertStore {
     pub geom: ExpertGeom,
-    locs: Arc<Vec<[MatLoc; 3]>>,
+    /// layers with missing (dev-partial) experts are not worth reading
+    real_layers: Vec<usize>,
     loader: Loader,
     ram: Arc<Mutex<RamCache>>,
     heat: Arc<Mutex<Heat>>,
@@ -208,7 +259,7 @@ pub struct SlotRef {
     pub offset: u64,
 }
 
-fn open_direct(path: &std::path::Path) -> std::io::Result<File> {
+pub fn open_direct(path: &std::path::Path) -> std::io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -224,42 +275,29 @@ fn open_direct(path: &std::path::Path) -> std::io::Result<File> {
 }
 
 impl ExpertStore {
-    pub fn new(g: &Gguf, gpu: &Gpu, cfg: &Config, vram_bytes: u64, ram_bytes: u64, ranking: Option<&[Key]>, stats: Arc<Stats>) -> Result<Self> {
-        let mut locs = Vec::new();
-        for l in 0..cfg.n_layers {
-            let mut m = [MatLoc { shard: 0, offset: 0, stride: 0 }; 3];
-            for (i, nm) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().enumerate() {
-                let name = format!("blk.{l}.{nm}.weight");
-                if crate::gguf::dev_partial() && !g.has(&name) {
-                    // stand-in geometry; load_disk returns zeros for shard == usize::MAX
-                    let (k, rows) = if i == 2 { (cfg.moe_inter, cfg.dim) } else { (cfg.dim, cfg.moe_inter) };
-                    m[i] = MatLoc { shard: usize::MAX, offset: 0, stride: (rows * k / 32 * 17) as u64 };
-                    continue;
-                }
-                let t = g.tensor(&name)?;
-                if t.ty != GGML_MXFP4 {
-                    bail!("blk.{l}.{nm}: expected MXFP4 experts (type 39), got {}", t.ty);
-                }
-                let ne = t.dims[2];
-                m[i] = MatLoc { shard: t.shard, offset: t.file_offset, stride: t.nbytes / ne };
+    pub fn new(g: &Gguf, gpu: &Gpu, cfg: &Config, vram_bytes: u64, ram_bytes: u64, ranking: Option<&[Key]>, pack: Option<&std::path::Path>, stats: Arc<Stats>) -> Result<Self> {
+        let (layers, mut locs) = layer_geoms(g, cfg)?;
+        let real_layers = (0..locs.len()).filter(|&l| locs[l].parts.iter().all(|p| p.kind != PartKind::Zero)).collect();
+        if let Some(p) = pack {
+            let packed = crate::pack::open(p, g, &layers, cfg.n_experts, g.shards.len())?;
+            stats.event(format!("expert pack: {} of {} layers", packed.len(), locs.len()));
+            for (l, p) in locs.iter_mut().zip(packed) {
+                *l = p;
             }
-            locs.push(m);
         }
-        let mat_bytes = locs[0][0].stride;
-        if locs.iter().any(|m| m.iter().any(|x| x.stride != mat_bytes)) {
-            bail!("expert matrices of unequal size are not supported");
-        }
-        let geom = ExpertGeom { inter: cfg.moe_inter, dim: cfg.dim, mat_bytes, expert_bytes: mat_bytes * 3 };
+        let slot_bytes = layers.iter().map(|l| l.host_len() as u64).max().unwrap();
+        let mean_host = layers.iter().map(|l| l.host_len() as f64).sum::<f64>() / layers.len() as f64;
+        let geom = ExpertGeom { inter: cfg.moe_inter, dim: cfg.dim, layers, slot_bytes, mean_host };
 
         let max_bind = gpu.max_binding().min(1 << 31);
-        let slots_per_slab = ((max_bind / geom.expert_bytes) as usize).clamp(1, 64);
-        let mut n_slots = (vram_bytes / geom.expert_bytes) as usize;
+        let slots_per_slab = ((max_bind / geom.slot_bytes) as usize).clamp(1, 64);
+        let mut n_slots = (vram_bytes / geom.slot_bytes) as usize;
         n_slots = n_slots.max(cfg.n_active * 2);
         let mut slabs = Vec::new();
         let mut left = n_slots;
         while left > 0 {
             let s = left.min(slots_per_slab);
-            slabs.push(Slab { buf: gpu.buffer("expert_slab", s as u64 * geom.expert_bytes) });
+            slabs.push(Slab { buf: gpu.buffer("expert_slab", s as u64 * geom.slot_bytes) });
             left -= s;
         }
         Stats::set(&stats.vram_slots_total, n_slots as u64);
@@ -269,7 +307,7 @@ impl ExpertStore {
                 let (l, p) = v.split_once(':').ok_or_else(|| anyhow::anyhow!("DSV4_EXPERT_OVERRIDE must be layer:path"))?;
                 let l: usize = l.parse()?;
                 let f = File::open(p).map_err(|e| anyhow::anyhow!("override file {p}: {e}"))?;
-                let want = geom.expert_bytes * cfg.n_experts as u64;
+                let want = (geom.layers[l].host_len() * cfg.n_experts) as u64;
                 if f.metadata()?.len() != want {
                     bail!("override file {p} is {} bytes, expected {want}", f.metadata()?.len());
                 }
@@ -288,7 +326,7 @@ impl ExpertStore {
         }
         let heat = Arc::new(Mutex::new(heat));
         let ram = Arc::new(Mutex::new(RamCache { map: HashMap::new(), order: BTreeSet::new(), bytes: 0, limit: ram_bytes, free: Vec::new() }));
-        let locs = Arc::new(locs);
+        let paths: Vec<_> = g.shards.iter().map(|s| s.path.as_path()).chain(pack).collect();
         let (r2, h2, s2) = (ram.clone(), heat.clone(), stats.clone());
         let on_done = move |f: Finished| {
             Stats::add(&s2.disk_bytes, f.data.len() as u64);
@@ -303,10 +341,10 @@ impl ExpertStore {
             Stats::set(&s2.ram_cache_bytes, r.bytes);
             Stats::set(&s2.ram_cache_entries, r.map.len() as u64);
         };
-        let loader = Loader::new(|| g.shards.iter().map(|s| open_direct(&s.path)).collect(), locs.clone(), geom.mat_bytes as usize, THREADS, Box::new(on_done))?;
+        let loader = Loader::new(|| paths.iter().map(|p| open_direct(p)).collect(), Arc::new(locs), THREADS, Box::new(on_done))?;
         Ok(Self {
             geom,
-            locs,
+            real_layers,
             loader,
             ram,
             heat,
@@ -331,13 +369,13 @@ impl ExpertStore {
     }
 
     fn slot_ref(&self, slot: usize) -> SlotRef {
-        SlotRef { slab: slot / self.slots_per_slab, offset: (slot % self.slots_per_slab) as u64 * self.geom.expert_bytes }
+        SlotRef { slab: slot / self.slots_per_slab, offset: (slot % self.slots_per_slab) as u64 * self.geom.slot_bytes }
     }
 
-    /// A buffer for one expert: recycled if possible.
-    fn buffer(&self) -> Result<Vec<u8>> {
-        let n = self.geom.expert_bytes as usize;
-        if let Some(b) = self.ram.lock().free.pop() {
+    /// A buffer for one expert of `layer`: recycled if possible.
+    fn buffer(&self, layer: usize) -> Result<Vec<u8>> {
+        let n = self.geom.layers[layer].host_len();
+        if let Some(b) = self.ram.lock().reuse(n) {
             return Ok(b);
         }
         if let Some(b) = alloc_buffer(n) {
@@ -355,8 +393,8 @@ impl ExpertStore {
     fn load(&self, layer: usize, e: usize, cached: impl FnOnce() -> Option<Arc<Vec<u8>>>) -> Result<Load> {
         if let Some((ol, f)) = &self.override_layer {
             if *ol == layer {
-                let n = self.geom.expert_bytes as usize;
-                let mut out = self.buffer()?;
+                let n = self.geom.layers[layer].host_len();
+                let mut out = self.buffer(layer)?;
                 #[cfg(windows)]
                 std::os::windows::fs::FileExt::seek_read(f, &mut out, (e * n) as u64)?;
                 #[cfg(unix)]
@@ -369,19 +407,19 @@ impl ExpertStore {
                 return Ok(Load::Ready(out));
             }
         }
-        self.loader.demand(layer, e, cached, || self.buffer())
+        self.loader.demand(layer, e, cached, || self.buffer(layer))
     }
 
     /// Read `n` random experts from disk with `threads` requested at a time (I/O benchmark).
-    pub fn bench_disk(&self, n: usize, threads: usize) -> Result<(f64, f64)> {
+    pub fn bench_disk(&self, n: usize, threads: usize, max_layers: usize) -> Result<(f64, f64)> {
         // a fresh set every time: drives are faster on regions read recently
         let mut seed = 0x2545f4914f6cdd1du64 ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let real: Vec<usize> = self.real_layers.iter().copied().filter(|&l| l < max_layers).collect();
         let picks: Vec<(usize, usize)> = (0..n)
             .map(|_| {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
-                let real: Vec<usize> = (0..self.locs.len()).filter(|&l| self.locs[l].iter().all(|m| m.shard != usize::MAX)).collect();
                 (real[(seed % real.len() as u64) as usize], ((seed >> 20) % 384) as usize)
             })
             .collect();
@@ -441,7 +479,7 @@ impl ExpertStore {
             {
                 continue;
             }
-            if self.loader.prefetch(layer, e, || self.buffer()) {
+            if self.loader.prefetch(layer, e, || self.buffer(layer)) {
                 Stats::add(&self.stats.expert_prefetches, 1);
             }
         }
@@ -472,14 +510,14 @@ impl ExpertStore {
                 while queue.len() < WARM_QUEUE {
                     let Some(k) = it.next() else { break };
                     let (l, e) = ((k >> 16) as usize, (k & 0xffff) as usize);
-                    if l >= s.locs.len() || s.override_layer.as_ref().is_some_and(|o| o.0 == l) || s.ram.lock().map.contains_key(&k) {
+                    if l >= s.geom.layers.len() || s.override_layer.as_ref().is_some_and(|o| o.0 == l) || s.ram.lock().map.contains_key(&k) {
                         continue;
                     }
-                    if !s.ram.lock().fits(s.geom.expert_bytes * (queue.len() as u64 + 1)) {
+                    if !s.ram.lock().fits(s.geom.slot_bytes * (queue.len() as u64 + 1)) {
                         it.by_ref().for_each(drop);
                         break;
                     }
-                    if let Some(j) = s.loader.warm(l, e, || s.buffer()) {
+                    if let Some(j) = s.loader.warm(l, e, || s.buffer(l)) {
                         queue.push_back((k, j));
                     }
                 }

@@ -11,6 +11,7 @@ mod gguf;
 mod gpu;
 mod kernels;
 mod model;
+mod pack;
 mod selftest;
 mod server;
 mod stats;
@@ -60,6 +61,10 @@ struct ModelArgs {
     /// capped by the memory that is actually free at startup)
     #[arg(long)]
     ram_cache_gb: Option<f64>,
+    /// Expert pack written by `dsv4 repack` (default: experts.pack next to the shards, if there
+    /// is one; "none": read the shards)
+    #[arg(long)]
+    expert_pack: Option<PathBuf>,
     /// GPU backend: vulkan | dx12 | metal (default: best available)
     #[arg(long)]
     backend: Option<String>,
@@ -267,6 +272,19 @@ enum Cmd {
         #[arg(long, default_value_t = 2304)]
         inter: usize,
     },
+    /// Copy the experts into one file where each is contiguous, which drives read faster
+    /// (lossless; takes as much space as the experts). An interrupted run resumes.
+    Repack {
+        #[arg(long, short, default_value = DEFAULT_MODEL_DIR, env = "DSV4_MODEL")]
+        model: PathBuf,
+        /// Output file (default: experts.pack next to the shards, where it is found by itself).
+        /// Needs --expert-pack when it is anywhere else, such as a faster drive
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Pack only the first N layers; the others are still read from the shards
+        #[arg(long)]
+        layers: Option<usize>,
+    },
     /// Measure expert streaming throughput from disk
     BenchIo {
         #[arg(long, short, default_value = DEFAULT_MODEL_DIR)]
@@ -274,6 +292,12 @@ enum Cmd {
         /// Experts to read per run
         #[arg(long, default_value_t = 200)]
         n: usize,
+        /// Read only experts of the first N layers
+        #[arg(long)]
+        layers: Option<usize>,
+        /// As for `run`
+        #[arg(long)]
+        expert_pack: Option<PathBuf>,
     },
     /// Show GGUF metadata and tensor summary
     Info {
@@ -336,6 +360,30 @@ fn default_ram_cache() -> u64 {
 }
 
 
+/// The expert pack to read: the one asked for, else one next to the model if it matches.
+fn find_pack(asked: Option<&Path>, first: &Path, g: &gguf::Gguf, cfg: &config::Config) -> Result<Option<PathBuf>> {
+    let path = match asked {
+        Some(p) if p.as_os_str() == "none" => return Ok(None),
+        Some(p) => p.to_path_buf(),
+        None => pack::default_path(first),
+    };
+    if asked.is_none() && !path.exists() {
+        return Ok(None);
+    }
+    let (geoms, _) = experts::layer_geoms(g, cfg)?;
+    match pack::open(&path, g, &geoms, cfg.n_experts, 0) {
+        Ok(_) => {
+            tracing::info!("reading experts from {}", path.display());
+            Ok(Some(path))
+        }
+        Err(e) if asked.is_none() => {
+            tracing::warn!("not using the expert pack: {e:#}");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 struct Loaded {
     model: Model,
     tok: Arc<Tokenizer>,
@@ -358,6 +406,11 @@ fn load(args: &ModelArgs, stats: Arc<Stats>) -> Result<Loaded> {
         Some(p) => Some(experts::load_profile(p).with_context(|| format!("reading expert profile {}", p.display()))?),
         None => None,
     };
+    let expert_pack = {
+        let g = gguf::Gguf::open(&first)?;
+        let cfg = config::Config::from_gguf(&g)?;
+        find_pack(args.expert_pack.as_deref(), &first, &g, &cfg)?
+    };
     let expert_subset = args.expert_subset.and_then(|n| counts.as_ref().map(|c| experts::top_experts(c, n)));
     let opt = ModelOptions {
         max_ctx: args.ctx,
@@ -365,6 +418,7 @@ fn load(args: &ModelArgs, stats: Arc<Stats>) -> Result<Loaded> {
         seg: args.segment,
         expert_vram_bytes: vram,
         expert_ram_bytes: ram,
+        expert_pack,
         backend: args.backend.clone(),
         cpu_experts: !args.gpu_only_experts,
         expert_subset,
@@ -457,19 +511,27 @@ fn main() -> Result<()> {
             rt.block_on(download::run(&repo, &quant, &dir, connections, list))
         }
         Cmd::Info { model, tensors } => info(&model, tensors),
-        Cmd::BenchIo { model, n } => {
+        Cmd::BenchIo { model, n, layers, expert_pack } => {
             init_logging(false);
             let first = gguf::resolve_model_path(&model)?;
             let g = gguf::Gguf::open(&first)?;
             let cfg = config::Config::from_gguf(&g)?;
             let stats = Arc::new(Stats::default());
             let gpu = gpu::Gpu::new(stats.clone(), None)?;
-            let store = experts::ExpertStore::new(&g, &gpu, &cfg, 1, 0, None, stats)?;
+            let store = experts::ExpertStore::new(&g, &gpu, &cfg, 1, 0, None, find_pack(expert_pack.as_deref(), &first, &g, &cfg)?.as_deref(), stats)?;
             for threads in [1, 4, 8, 16, 32] {
-                let (gbps, ms) = store.bench_disk(n, threads)?;
+                let (gbps, ms) = store.bench_disk(n, threads, layers.unwrap_or(usize::MAX))?;
                 println!("{threads:>3} loaders: {gbps:>6.2} GB/s  ({ms:.2} ms/expert amortized, 18.8 MB each)");
             }
             Ok(())
+        }
+        Cmd::Repack { model, out, layers } => {
+            init_logging(false);
+            let first = gguf::resolve_model_path(&model)?;
+            let g = gguf::Gguf::open(&first)?;
+            let cfg = config::Config::from_gguf(&g)?;
+            let (geoms, parts) = experts::layer_geoms(&g, &cfg)?;
+            pack::repack(&g, &geoms, parts, layers.unwrap_or(cfg.n_layers), cfg.n_experts, &out.unwrap_or_else(|| pack::default_path(&first)))
         }
         Cmd::BenchCpu { dim, inter } => cpu_moe::bench(dim, inter),
         Cmd::Prompt { model, file, no_think } => {

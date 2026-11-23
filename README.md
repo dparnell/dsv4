@@ -37,7 +37,7 @@ While the disk is idle after loading, the caches are filled in that order (`--no
 On top of that:
 
 * **Hybrid CPU/GPU experts.** During decode a cold expert is used by one token, so instead of pushing 18.8 MB
-  over PCIe it is computed on the CPU (AVX2 MXFP4×int8 dot products) directly from the RAM tier, concurrently
+  over PCIe it is computed on the CPU (MXFP4×int8 dot products; AVX2, AVX-VNNI or AVX-512 VNNI) directly from the RAM tier, concurrently
   with the GPU computing the resident experts. Experts that keep getting picked, and are clearly
   hotter than the one they would replace, are then copied to VRAM in the background.
   (`--gpu-only-experts` disables this.)
@@ -107,7 +107,8 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/jso
 | `info` | GGUF metadata, tensor types and model configuration |
 | `selftest` | every WGSL kernel (and the CPU expert path) against a CPU reference |
 | `eval` | teacher-forced perplexity and speed on text files; `--save` / `--base` compare two configurations |
-| `bench-io` | expert streaming throughput from disk and CPU expert speed |
+| `bench-io` | expert streaming throughput from disk |
+| `bench-cpu` | speed of routed experts on the CPU by thread count (no model needed); `DSV4_CPU_ISA=avx2\|avxvnni\|avx512vnni` picks the kernel |
 
 Common model options: `--ctx` (context, default 32768), `--segment`, `--chunk`, `--expert-vram-gb`,
 `--ram-cache-gb`, `--backend vulkan|dx12|metal`, `--gpu-only-experts`, `--no-prefetch`, `--no-warm-up`, `--tokenizer`.
@@ -141,7 +142,7 @@ src/
                  hyper-connection Sinkhorn mixing, Engram gating, quantisation simulation, ...)
   weights.rs     dense weight loading / repacking
   experts.rs     three-tier routed-expert store (VRAM slots, RAM LRU, NVMe)
-  cpu_moe.rs     AVX2 MXFP4 expert execution on the CPU
+  cpu_moe.rs     MXFP4 expert execution on the CPU (AVX2 / VNNI kernels)
   engram.rs      n-gram hashing and MXFP8 row gathers
   model.rs       the forward pass (layer-major segments, chunked attention, hybrid MoE)
   engine.rs      request queue, prefix reuse, sampling

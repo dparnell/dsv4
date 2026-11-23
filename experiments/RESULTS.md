@@ -60,7 +60,10 @@ tok/s; `--no-warm-up` 0.4 / 0.51.
 
 `dsv4 eval`, 3 texts x (64 prompt + 60 teacher-forced tokens, 177 decode steps), 26 VRAM slots,
 36 GB RAM tier. "Held" = in VRAM or RAM. Reference: the same build without the flags (a repeat of
-it is bit-identical, so the quality noise floor is 0). One run each; the drive's speed varies, so
+it is bit-identical, so the quality noise floor is 0). Later runs (see "CPU experts") show that any change of
+placement or kernel alone moves KLD by 0.012-0.025, so the KLDs below 0.03 here are not
+distinguishable from that, and one later tail-skip 5 run got 0.75 tok/s against 0.65-0.76
+without: treat its speedup as unconfirmed. One run each; the drive's speed varies, so
 disk GB (prompts included) is the steadier measure of work.
 
 | | Decode tok/s | Disk GB | PPL | KLD | Worst KLD | Same top-1 |
@@ -86,3 +89,24 @@ Only what the last `clamp(len/8, 16, 512)` positions need is computed past layer
 - Work: 4,500 tokens + 32: disk 1,016 -> 757 GB (-25%), uploads 1,118 -> 870 GB. 1,100 tokens: -4%;
   no benefit for short prompts. Wall time there was 691 -> 803 s, but the drive averaged 1.4 vs
   0.9 GB/s in the two runs, so no speedup has been demonstrated.
+
+# CPU experts
+
+Ryzen 9 9950X, DDR5-3600 (~40 GB/s in practice), `bench-cpu`, ms per expert (18.8 MB):
+
+| | Before (AVX2) | New AVX2 | New AVX-512 VNNI |
+|---|---|---|---|
+| 1 thread, 1 token | 0.97-1.04 | 1.00 | 0.74 |
+| 32 threads, 1 expert | 0.73-0.78 | 0.73 | 0.66 (tasks of 128 rows; the rest used 64) |
+| 32 threads, 6 experts | 0.53 | 0.56 | 0.55 |
+| 32 threads, 6 experts x 4 tokens | 1.45 | 0.63 | 0.65 |
+
+Single-token work is limited by DRAM. Sharing the weights between tokens is the real gain.
+
+- End to end (2 texts x (64 + 60 tokens)): decode 0.76 / 0.76 before, 0.75 / 0.65 after: no gain.
+  Computing is 23 s of ~275 s; the CPU path otherwise waits for the disk.
+- Quality against `--gpu-only-experts` (42 slots, 30 GB RAM, 120 tokens): old AVX2 KLD 0.022
+  (PPL 7.53), new AVX-512 0.024 (7.22), new AVX2 0.025 (7.69); GPU-only PPL 7.29. Equivalent
+  within the sample; int8 activations cost ~0.02 either way.
+- Repeats of one build differed by KLD 0.012-0.014 when free VRAM changed the slot count, since
+  placement decides whether an expert is computed by the CPU or the GPU.

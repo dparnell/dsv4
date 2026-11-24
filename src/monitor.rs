@@ -166,6 +166,8 @@ impl Monitor {
                 "vram_total": st.samples.back().and_then(|x| x.gpu).map(|g| g.2),
             },
             "layers": layers,
+            "cpu": crate::cpu::describe(),
+            "decode_breakdown": s.decode_breakdown().map(|b| b.map(|(name, ms)| json!([name, ms]))),
             "requests": s.requests_json(),
             "events": events,
         })

@@ -88,13 +88,73 @@ pub struct Stats {
     pub events: Mutex<VecDeque<(Instant, String)>>,
     /// per-layer expert hit counters: (vram hits, misses)
     pub layer_hits: Mutex<Vec<(u64, u64)>>,
+    /// where the time of recent decoded tokens went
+    pub decode_times: Mutex<VecDeque<DecodeTime>>,
     /// recent decode tok/s samples for the sparkline
     pub tps_history: Mutex<VecDeque<u64>>,
     /// tail of the text being generated (for the dashboard)
     pub transcript: Mutex<String>,
 }
 
+/// Nanoseconds of one decoded token, or the running totals they are differences of.
+#[derive(Clone, Copy, Default)]
+pub struct DecodeTime {
+    pub total: u64,
+    gpu_wait: u64,
+    moe: u64,
+    cpu_moe: u64,
+    cpu_compute: u64,
+}
+
+impl DecodeTime {
+    /// The counters now; `total` is left to the caller.
+    pub fn read(s: &Stats) -> Self {
+        let g = Stats::get;
+        DecodeTime { total: 0, gpu_wait: g(&s.t_gpu_wait_ns), moe: g(&s.t_moe_ns), cpu_moe: g(&s.t_cpu_moe_ns), cpu_compute: g(&s.t_cpu_compute_ns) }
+    }
+
+    /// From `before` to now, taking `total` ns.
+    pub fn since(s: &Stats, before: &Self, total: u64) -> Self {
+        let n = Self::read(s);
+        DecodeTime {
+            total,
+            gpu_wait: n.gpu_wait - before.gpu_wait,
+            moe: n.moe - before.moe,
+            cpu_moe: n.cpu_moe - before.cpu_moe,
+            cpu_compute: n.cpu_compute - before.cpu_compute,
+        }
+    }
+}
+
+const KEEP_DECODE_TIMES: usize = 100;
+
 impl Stats {
+    pub fn push_decode_time(&self, t: DecodeTime) {
+        let mut d = self.decode_times.lock();
+        d.push_back(t);
+        if d.len() > KEEP_DECODE_TIMES {
+            d.pop_front();
+        }
+    }
+
+    /// Mean milliseconds per recent token: computing experts on the CPU, the rest of the CPU path
+    /// (nearly all of it waiting for experts to be read), expert work on the GPU side that outlasts
+    /// the CPU path, waiting for the rest of the model on the GPU, anything else.
+    pub fn decode_breakdown(&self) -> Option<[(&'static str, f64); 5]> {
+        let d = self.decode_times.lock();
+        if d.is_empty() {
+            return None;
+        }
+        let ms = |f: &dyn Fn(&DecodeTime) -> u64| d.iter().map(f).sum::<u64>() as f64 / 1e6 / d.len() as f64;
+        Some([
+            ("CPU experts", ms(&|t| t.cpu_compute)),
+            ("waiting for disk", ms(&|t| t.cpu_moe.saturating_sub(t.cpu_compute))),
+            ("GPU experts", ms(&|t| t.moe.saturating_sub(t.cpu_moe))),
+            ("rest of the model (GPU)", ms(&|t| t.gpu_wait)),
+            ("other", ms(&|t| t.total.saturating_sub(t.moe + t.gpu_wait))),
+        ])
+    }
+
     pub fn add(c: &AtomicU64, v: u64) {
         c.fetch_add(v, Ordering::Relaxed);
     }

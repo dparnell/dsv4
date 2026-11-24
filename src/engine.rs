@@ -11,7 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chat::{Detok, Tokenizer};
 use crate::model::Model;
-use crate::stats::Stats;
+use crate::stats::{DecodeTime, Stats};
 
 #[derive(Clone, Debug)]
 pub struct SamplingParams {
@@ -280,8 +280,10 @@ fn run_request(model: &mut Model, tok: &Tokenizer, st: &Stats, req: &Request) ->
             }
         }
         let td = Instant::now();
+        let before = DecodeTime::read(st);
         logits = model.forward(&[id])?;
         let dt = td.elapsed();
+        st.push_decode_time(DecodeTime::since(st, &before, dt.as_nanos() as u64));
         Stats::add(&st.gen_tokens, 1);
         Stats::add(&st.decode_ns, dt.as_nanos() as u64);
         Stats::set(&st.last_decode_ns, dt.as_nanos() as u64);

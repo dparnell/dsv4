@@ -246,7 +246,13 @@ fn draw(f: &mut Frame, st: &Stats, s: &Snap, cpu_hist: &[u64], disk_hist: &[u64]
         Line::from(format!("uploads    {:>9}   CPU runs {}", g(&st.expert_uploads), g(&st.expert_cpu_runs))),
         Line::from(format!("prefetches {:>9}", g(&st.expert_prefetches))),
         Line::from(format!("disk read  {}", gb(g(&st.disk_bytes) as f64))),
-        Line::from(format!("disk latency {:.1} ms/expert", g(&st.disk_ns) as f64 / 1e6 / dl.max(1) as f64)),
+        Line::from(match st.decode_breakdown() {
+            Some([cpu, disk, gpu, rest, other]) => format!(
+                "ms/token   CPU experts {:.0}  disk wait {:.0}  GPU experts {:.0}  rest of GPU {:.0}  other {:.0}",
+                cpu.1, disk.1, gpu.1, rest.1, other.1
+            ),
+            None => "ms/token   –".into(),
+        }),
         Line::from(format!("uploaded   {}", gb(g(&st.upload_bytes) as f64))),
     ])
     .block(Block::default().borders(Borders::ALL).title(Span::styled(" Expert cache ", title)));
@@ -284,7 +290,7 @@ fn draw(f: &mut Frame, st: &Stats, s: &Snap, cpu_hist: &[u64], disk_hist: &[u64]
     let bw = ((r3[0].width.saturating_sub(2)) / (lh.len().max(1) as u16)).saturating_sub(1).max(1);
     f.render_widget(
         BarChart::default()
-            .block(Block::default().borders(Borders::ALL).title(" VRAM expert hit rate % by layer "))
+            .block(Block::default().borders(Borders::ALL).title(" experts run on the GPU: already in VRAM, % by layer "))
             .data(BarGroup::default().bars(&bars))
             .bar_width(bw)
             .bar_gap(1)

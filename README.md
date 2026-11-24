@@ -134,6 +134,11 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/jso
 Common model options: `--ctx` (context, default 32768), `--segment`, `--chunk`, `--expert-vram-gb`,
 `--ram-cache-gb`, `--backend vulkan|dx12|metal`, `--gpu-only-experts`, `--no-prefetch`, `--no-warm-up`, `--tokenizer`.
 
+CPU threads: on Windows machines with more than 64 logical processors (several processor groups, typically dual-socket
+servers) there is one worker thread per core over all groups; elsewhere one per logical processor. `--threads N` or
+`DSV4_THREADS` changes the number; `bench-cpu` compares one group with all of them. The status page shows where the
+time per token goes.
+
 ## API notes
 
 * **Thinking mode** is on by default (the model's native mode). Turn it off per request with
@@ -158,6 +163,7 @@ src/
   download.rs    resumable parallel Hugging Face downloader
   gguf.rs        multi-shard GGUF reader (mmap)
   config.rs      hyper-parameters from GGUF metadata
+  cpu.rs         worker threads across Windows processor groups
   gpu.rs         wgpu device, buffers, pipelines, bind-group cache, batches, readback
   kernels.rs     WGSL kernels (Q8_0/MXFP4 matmuls, sparse attention, indexer top-k, RoPE/YaRN,
                  hyper-connection Sinkhorn mixing, Engram gating, quantisation simulation, ...)

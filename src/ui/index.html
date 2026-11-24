@@ -11,7 +11,7 @@
   --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --text: #17191c; --muted: #636b75;
   --border: #dde1e6; --accent: #3b5bdb; --accent-text: #ffffff; --danger: #c4314b; --danger-soft: #fbe9ec;
   --good: #1a7f4b; --grid: #e8ebef;
-  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4;
   --shadow: 0 1px 2px rgba(16,24,40,.06), 0 4px 16px rgba(16,24,40,.06);
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
@@ -21,7 +21,7 @@
     --bg: #111315; --panel: #1a1d20; --panel-2: #23272b; --text: #e8eaed; --muted: #9aa2ab;
     --border: #2e3338; --accent: #7c93f5; --accent-text: #0b1020; --danger: #ff6b81; --danger-soft: #3a1d24;
     --good: #4cc38a; --grid: #272c31;
-    --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
     --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 16px rgba(0,0,0,.25);
   }
 }
@@ -209,11 +209,16 @@ td.state { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
         <div id="meters"></div>
       </div>
       <div class="card">
-        <h2>VRAM hit rate by layer</h2>
+        <h2>Experts run on the GPU: already in VRAM, by layer</h2>
         <div id="layers"></div>
         <div class="axis"><span>layer 0</span><span id="layerMax"></span></div>
-        <p class="none" style="margin:8px 0 0">Full height is 100%. Counts experts run on the GPU; those run on the CPU are not included.</p>
+        <p class="none" style="margin:8px 0 0">Full height is 100%. Experts run on the CPU are not included.</p>
       </div>
+    </div>
+    <div class="card">
+      <h2>Time per token</h2>
+      <div id="times"></div>
+      <p class="none" style="margin:8px 0 0"><span id="cpuInfo"></span>. Average of the last 100 tokens.</p>
     </div>
     <div class="card"><h2>Requests</h2><div class="scroll" id="requests" tabindex="0" aria-label="Requests"></div></div>
     <div class="card"><h2>Log</h2><div class="scroll log" id="log" tabindex="0" aria-label="Log"></div></div>
@@ -608,6 +613,21 @@ function drawStatus(s) {
   for (const [k, v] of [["run on the CPU", s.cpu_runs], ["uploads", s.uploads], ["prefetches", s.prefetches], ["of them used", s.prefetch_hits]]) { const e = el("div", "", num(v) + " "); e.append(el("span", "", k)); extra.append(e); }
   mm.append(extra);
 
+  $("#cpuInfo").textContent = s.cpu;
+  const tm = $("#times"), parts = s.decode_breakdown;
+  tm.textContent = "";
+  if (!parts) tm.append(el("p", "none", "Nothing yet."));
+  else {
+    const all = parts.reduce((a, p) => a + p[1], 0), bar = el("div", "split"), leg = el("div", "legend");
+    parts.forEach(([name, ms], i) => {
+      const color = `var(--s${i + 1})`;
+      if (ms > 0) { const b = el("i"); b.style.cssText = `flex:${ms};background:${color}`; b.dataset.tip = `${name}: ${ms.toFixed(1)} ms (${pct(ms / all)})`; bar.append(b); }
+      const e = el("div"), k = el("i"); k.style.background = color;
+      e.append(k, name + " ", el("span", "", ms.toFixed(0) + " ms")); leg.append(e);
+    });
+    tm.append(bar, leg);
+  }
+
   const lay = $("#layers");
   while (lay.children.length < s.layers.length) lay.append(el("i"));
   s.layers.forEach(([h, miss], i) => {
@@ -639,7 +659,7 @@ function drawStatus(s) {
   lg.textContent = "";
   for (const e of s.events) { const d = el("div"); d.append(el("time", "", new Date(Date.now() - e.age * 1000).toLocaleTimeString([], { hour12: false })), el("span", "", e.text)); lg.append(d); }
 }
-for (const id of ["#tiers", "#layers"]) {
+for (const id of ["#tiers", "#times", "#layers"]) {
   $(id).addEventListener("pointermove", (e) => { const t = e.target.closest("[data-tip]"); t ? showTip(e, t.dataset.tip) : hideTip(); });
   $(id).addEventListener("pointerleave", hideTip);
 }

@@ -574,6 +574,12 @@ pub struct Job<'a> {
 /// Rows per parallel task: a few hundred KB of weights, large next to the cost of handing it out.
 const TASK: usize = 128;
 
+/// Rows per task. The usual size leaves many threads without work (one expert has 18 tasks), so
+/// beyond 32 threads tasks shrink until every thread gets a few.
+fn task_rows(rows: usize, threads: usize) -> usize {
+    if threads <= 32 { TASK } else { (rows / (threads * 3)).clamp(16, TASK) }
+}
+
 /// y = W2 (w * silu(min(W1 x, l)) * clamp(W3 x, -l, l)) for several experts at once, each with
 /// several tokens. Returns one dim-vector per token of each job.
 pub fn experts_forward(jobs: &[Job], inter: usize, dim: usize, limit: f32) -> Vec<Vec<Vec<f32>>> {
@@ -585,16 +591,18 @@ fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa) -> 
     let xq: Vec<Vec<Q8x>> = jobs.iter().map(|j| j.xs.iter().map(|x| quant_x(x, isa)).collect()).collect();
     // row-major: hidden[i][t]
     let mut hidden: Vec<Vec<f32>> = jobs.iter().map(|j| vec![0f32; j.xs.len() * inter]).collect();
+    let threads = rayon::current_num_threads();
+    let task = task_rows(jobs.len() * inter, threads);
     let mut tasks = Vec::new();
     for ((j, xq), h) in jobs.iter().zip(&xq).zip(&mut hidden) {
         let (gate, up) = (j.mat(0, inter, dim), j.mat(1, inter, dim));
-        tasks.extend(h.chunks_mut(TASK * j.xs.len().max(1)).enumerate().map(|(c, out)| (c, out, j, xq, gate, up)));
+        tasks.extend(h.chunks_mut(task * j.xs.len().max(1)).enumerate().map(|(c, out)| (c, out, j, xq, gate, up)));
     }
     tasks.into_par_iter().with_max_len(1).for_each_init(Row::default, |buf, (c, out, j, xq, gate, up)| {
         let n = j.xs.len();
         let (mut g, mut u) = (vec![0f32; n], vec![0f32; n]);
         for (o, row) in out.chunks_mut(n).enumerate() {
-            let i = c * TASK + o;
+            let i = c * task + o;
             gate.row(isa, i, xq, buf, &mut g);
             up.row(isa, i, xq, buf, &mut u);
             for t in 0..n {
@@ -610,14 +618,15 @@ fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa) -> 
         .map(|(j, h)| (0..j.xs.len()).map(|t| quant_x(&column(h, j.xs.len(), t), isa)).collect())
         .collect();
     let mut out: Vec<Vec<f32>> = jobs.iter().map(|j| vec![0f32; j.xs.len() * dim]).collect();
+    let task = 2 * task_rows(jobs.len() * dim / 2, threads);
     let mut tasks = Vec::new();
     for ((j, hq), o) in jobs.iter().zip(&hq).zip(&mut out) {
         let down = j.mat(2, dim, inter);
-        tasks.extend(o.chunks_mut(2 * TASK * hq.len().max(1)).enumerate().map(|(c, out)| (c, out, hq, down)));
+        tasks.extend(o.chunks_mut(task * hq.len().max(1)).enumerate().map(|(c, out)| (c, out, hq, down)));
     }
     tasks.into_par_iter().with_max_len(1).for_each_init(Row::default, |buf, (c, out, hq, down)| {
         for (o, row) in out.chunks_mut(hq.len()).enumerate() {
-            down.row(isa, c * 2 * TASK + o, hq, buf, row);
+            down.row(isa, c * task + o, hq, buf, row);
         }
     });
     jobs.iter().zip(&out).map(|(j, o)| (0..j.xs.len()).map(|t| column(o, j.xs.len(), t)).collect()).collect()
@@ -658,13 +667,36 @@ pub fn bench(dim: usize, inter: usize, types: [u32; 3]) -> anyhow::Result<()> {
     let x: Vec<f32> = (0..dim).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
     let have: Vec<Isa> = Isa::ALL.into_iter().filter(|i| i.available()).collect();
     println!("expert {:.1} MB, kernels {have:?}, using {:?}", 3.0 * mat / 1e6, isa());
-    let cores = std::thread::available_parallelism()?.get();
-    let mut counts = vec![1, 4, 8, cores / 2, cores * 3 / 4, cores];
-    counts.sort();
-    counts.dedup();
-    for threads in counts.into_iter().filter(|&t| t > 0) {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
-        let mut line = format!("{threads:>3} threads:");
+    let groups = crate::cpu::groups();
+    let mut runs: Vec<(usize, &[crate::cpu::Group])> = Vec::new();
+    if groups.is_empty() {
+        let cores = std::thread::available_parallelism()?.get();
+        let mut counts = vec![1, 4, 8, cores / 2, cores * 3 / 4, cores];
+        counts.sort();
+        counts.dedup();
+        runs.extend(counts.into_iter().filter(|&t| t > 0).map(|t| (t, &groups[..])));
+    } else {
+        println!("{}", crate::cpu::describe());
+        // one group, then all of them; in each: one thread per core, then every hyper-thread
+        let one = &groups[..1];
+        let sum = |g: &[crate::cpu::Group], f: fn(&crate::cpu::Group) -> usize| g.iter().map(f).sum::<usize>();
+        for g in [one, &groups[..]] {
+            let (cores, logical) = (sum(g, |g| g.cores), sum(g, |g| g.logical));
+            let mut counts = vec![cores / 2, cores, logical];
+            if g.len() == 1 {
+                counts.extend([1, 8]);
+            }
+            counts.sort();
+            counts.dedup();
+            runs.extend(counts.into_iter().filter(|&t| t > 0).map(|t| (t, g)));
+        }
+    }
+    for (threads, on) in runs {
+        let pool = crate::cpu::pool(on, threads).build()?;
+        let mut line = match on.len() {
+            0 => format!("{threads:>3} threads:"),
+            n => format!("{threads:>3} threads, {n} group{}:", if n > 1 { "s" } else { " " }),
+        };
         for (name, group, nt) in [("1 expert", 1, 1), ("6 experts", 6, 1), ("6 experts x 4 tokens", 6, 4)] {
             let mut best = f64::MAX;
             for _ in 0..3 {

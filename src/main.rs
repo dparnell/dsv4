@@ -1,6 +1,7 @@
 mod chat;
 mod distill;
 mod config;
+mod cpu;
 mod cpu_moe;
 mod download;
 mod engine;
@@ -60,6 +61,10 @@ fn default_model_dir() -> PathBuf {
 #[derive(Parser)]
 #[command(name = "dsv4", version, about = "DeepSeek-V4.1-Flash inference on wgpu with streamed MoE experts")]
 struct Cli {
+    /// CPU worker threads (default: one per core over all processor groups where Windows has
+    /// several, else one per logical processor)
+    #[arg(long, global = true, env = "DSV4_THREADS")]
+    threads: Option<usize>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -465,6 +470,7 @@ fn load(args: &ModelArgs, stats: Arc<Stats>) -> Result<Loaded> {
             args.route_prior, args.route_tail_skip
         ));
     }
+    stats.event(cpu::describe());
     let mut model = Model::load(&first, &opt, stats.clone())?;
     model.profile_out = args.save_expert_profile.clone();
     let template = ChatTemplate::new(model.g.str("tokenizer.chat_template"));
@@ -534,6 +540,7 @@ fn generate_to(engine: &engine::EngineHandle, prompt: Vec<u32>, p: SamplingParam
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    cpu::init(cli.threads)?;
     match cli.cmd {
         Cmd::Download { quant, dir, repo, connections, list } => {
             init_logging(false);

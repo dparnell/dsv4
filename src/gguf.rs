@@ -268,7 +268,7 @@ pub fn resolve_model_path(p: &Path) -> Result<PathBuf> {
             return Ok(f);
         }
     }
-    bail!("could not find a GGUF model at {}", p.display())
+    bail!("could not find a GGUF model at {} (pass --model, or fetch one with `dsv4 download`)", p.display())
 }
 
 impl Gguf {

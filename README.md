@@ -89,12 +89,17 @@ against BF16 for UD-IQ2_XXS and 0.28 for UD-IQ1_M). `download --quant UD-IQ2_XXS
 ```bash
 cargo build --release
 # 1. download the 4-bit quant (~501 GB) + tokenizer
-target/release/dsv4 download --quant UD-Q4_K_XL --dir F:/models/DeepSeek-V4.1-Flash-1017-GGUF
+target/release/dsv4 download --quant UD-Q4_K_XL
 # 2. check the GPU kernels on your adapter
 target/release/dsv4 selftest
 # 3. serve with the dashboard
-target/release/dsv4 serve --model F:/models/DeepSeek-V4.1-Flash-1017-GGUF --tui
+target/release/dsv4 serve --tui
 ```
+
+Models are kept in `%LOCALAPPDATA%\dsv4\models` (Windows), `~/Library/Application Support/dsv4/models` (macOS) or
+`$XDG_DATA_HOME/dsv4/models`, normally `~/.local/share/dsv4/models` (Linux). They are large and speed depends on the
+drive, so you may want them elsewhere: set `DSV4_MODELS_DIR` to another folder (a fast NVMe drive) and every command
+uses it, or pass `--dir` to `download` and `--model` (or set `DSV4_MODEL`) for the rest.
 
 Open `http://127.0.0.1:8080/` to chat, or `http://127.0.0.1:8080/status` for speeds, memory, expert tiers, recent
 requests and the log (`--no-ui` turns both off). The page is built in and also works while the model is loading; chats

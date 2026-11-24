@@ -33,7 +33,29 @@ use crate::engine::{Event, Request, SamplingParams};
 use crate::model::{Model, ModelOptions};
 use crate::stats::Stats;
 
-const DEFAULT_MODEL_DIR: &str = "F:/models/DeepSeek-V4.1-Flash-1017-GGUF";
+const MODEL_FOLDER: &str = "DeepSeek-V4.1-Flash-1017-GGUF";
+
+/// Where models are kept unless --model / --dir say otherwise: DSV4_MODELS_DIR, or the folder for
+/// application data that belongs to this user and machine.
+fn models_dir(var: impl Fn(&str) -> Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    if let Some(d) = var("DSV4_MODELS_DIR").filter(|d| !d.as_os_str().is_empty()) {
+        return d;
+    }
+    // the XDG specification says to ignore relative paths
+    let abs = |name: &str| var(name).filter(|d| d.is_absolute());
+    let data = if cfg!(windows) {
+        abs("LOCALAPPDATA").or(home.map(|h| h.join("AppData").join("Local")))
+    } else if cfg!(target_os = "macos") {
+        home.map(|h| h.join("Library").join("Application Support"))
+    } else {
+        abs("XDG_DATA_HOME").or(home.map(|h| h.join(".local").join("share")))
+    };
+    data.map_or_else(|| "models".into(), |d| d.join("dsv4").join("models"))
+}
+
+fn default_model_dir() -> PathBuf {
+    models_dir(|n| std::env::var_os(n).map(PathBuf::from), std::env::home_dir()).join(MODEL_FOLDER)
+}
 
 #[derive(Parser)]
 #[command(name = "dsv4", version, about = "DeepSeek-V4.1-Flash inference on wgpu with streamed MoE experts")]
@@ -45,7 +67,7 @@ struct Cli {
 #[derive(Args, Clone)]
 struct ModelArgs {
     /// Model directory, quant folder, or first GGUF shard
-    #[arg(long, short, default_value = DEFAULT_MODEL_DIR, env = "DSV4_MODEL")]
+    #[arg(long, short, default_value_os_t = default_model_dir(), env = "DSV4_MODEL")]
     model: PathBuf,
     /// Maximum context length (tokens)
     #[arg(long, default_value_t = 32768)]
@@ -131,8 +153,8 @@ enum Cmd {
         /// Quant folder in the repo
         #[arg(long, default_value = "UD-Q4_K_XL")]
         quant: String,
-        /// Destination directory
-        #[arg(long, default_value = DEFAULT_MODEL_DIR)]
+        /// Destination directory (set DSV4_MODELS_DIR to keep models elsewhere by default)
+        #[arg(long, default_value_os_t = default_model_dir())]
         dir: PathBuf,
         #[arg(long, default_value = download::DEFAULT_REPO)]
         repo: String,
@@ -190,7 +212,7 @@ enum Cmd {
     /// Experiment: fit compressed replacements for one layer's experts on captured inputs and
     /// report their error on held-out samples
     DistillPilot {
-        #[arg(long, short, default_value = DEFAULT_MODEL_DIR)]
+        #[arg(long, short, default_value_os_t = default_model_dir(), env = "DSV4_MODEL")]
         model: PathBuf,
         #[arg(long)]
         layer: usize,
@@ -260,7 +282,7 @@ enum Cmd {
     },
     /// Render a chat (OpenAI messages JSON file) with the model's template and print the prompt
     Prompt {
-        #[arg(long, short, default_value = DEFAULT_MODEL_DIR)]
+        #[arg(long, short, default_value_os_t = default_model_dir(), env = "DSV4_MODEL")]
         model: PathBuf,
         /// JSON file: either a messages array or {"messages": [...], "tools": [...]}
         file: PathBuf,
@@ -283,7 +305,7 @@ enum Cmd {
     /// Copy the experts into one file where each is contiguous, which drives read faster
     /// (lossless; takes as much space as the experts). An interrupted run resumes.
     Repack {
-        #[arg(long, short, default_value = DEFAULT_MODEL_DIR, env = "DSV4_MODEL")]
+        #[arg(long, short, default_value_os_t = default_model_dir(), env = "DSV4_MODEL")]
         model: PathBuf,
         /// Output file (default: experts.pack next to the shards, where it is found by itself).
         /// Needs --expert-pack when it is anywhere else, such as a faster drive
@@ -295,7 +317,7 @@ enum Cmd {
     },
     /// Measure expert streaming throughput from disk
     BenchIo {
-        #[arg(long, short, default_value = DEFAULT_MODEL_DIR)]
+        #[arg(long, short, default_value_os_t = default_model_dir(), env = "DSV4_MODEL")]
         model: PathBuf,
         /// Experts to read per run
         #[arg(long, default_value_t = 200)]
@@ -309,7 +331,7 @@ enum Cmd {
     },
     /// Show GGUF metadata and tensor summary
     Info {
-        #[arg(long, short, default_value = DEFAULT_MODEL_DIR)]
+        #[arg(long, short, default_value_os_t = default_model_dir(), env = "DSV4_MODEL")]
         model: PathBuf,
         /// List every tensor
         #[arg(long)]
@@ -877,4 +899,23 @@ fn info(model: &Path, tensors: bool) -> Result<()> {
         cfg.index_source_layers
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_are_kept_in_the_users_own_folder() {
+        let home = std::env::temp_dir().join("home");
+        let none = |_: &str| None;
+        assert!(models_dir(none, Some(home.clone())).starts_with(&home));
+        assert!(models_dir(none, Some(home.clone())).ends_with("dsv4/models"));
+        assert_eq!(models_dir(none, None), PathBuf::from("models"));
+        let set = |n: &str| (n == "DSV4_MODELS_DIR").then(|| PathBuf::from("big/drive"));
+        assert_eq!(models_dir(set, Some(home.clone())), PathBuf::from("big/drive"));
+        // empty and relative settings count as unset
+        let empty = |_: &str| Some(PathBuf::new());
+        assert_eq!(models_dir(empty, Some(home.clone())), models_dir(none, Some(home)));
+    }
 }

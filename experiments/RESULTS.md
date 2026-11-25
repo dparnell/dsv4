@@ -183,7 +183,12 @@ own node first.
 
 - Two Xeon E5-2699 v4 (Windows 10), 44 threads, NUMA-local, without -> with the pause: 1 expert
   0.33 -> 0.93, 6 experts 0.27 -> 0.35, about 0.5 ms per call; the High performance power plan
-  changes nothing. With `--cpu-spin`: not measured yet.
+  changes nothing. Asleep -> awake, with the pause: 1 expert 0.89 -> 0.37, 3 experts 0.47 -> 0.26,
+  6 experts 0.35 -> 0.25, 6 x 4 tokens 0.53 -> 0.42. 22 threads awake: 0.38, 0.29, 0.25, 0.56.
+- Server there (same setup as above), ms per token over the last 100, `34a1736` -> `cbafa28`: CPU
+  experts 61 -> 38, disk wait 14 -> 9, GPU experts 6 -> 4, rest of GPU 53 -> 52, other 12 -> 12.
+  Requests 1 to 5: 3.50, 5.72, 5.84, 6.48, 6.74 -> 3.87, 6.67, 7.09, 7.70, 8.25 tok/s (sampled, so
+  the answers differ).
 - Linux in WSL2 (9950X), 16 threads, asleep -> awake: 1 expert 1.85 -> 0.53, 3 experts 0.83 -> 0.50,
   6 experts 0.64 -> 0.52.
 - Windows 11 (9950X), 16 threads: 1 expert 0.63 -> 0.51, 3 experts 0.56 -> 0.52, 6 experts 0.57 -> 0.48.

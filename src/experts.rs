@@ -24,7 +24,7 @@ use anyhow::{Result, bail};
 use parking_lot::Mutex;
 
 use crate::config::Config;
-use crate::expert_io::{Finished, LayerParts, Load, Loader, Part, PartKind, THREADS};
+use crate::expert_io::{Finished, Homes, LayerParts, Load, Loader, Part, PartKind, THREADS};
 use crate::gguf::{GGML_MXFP4, Gguf, type_block};
 use crate::gpu::{Buf, Gpu};
 use crate::quants;
@@ -47,6 +47,25 @@ pub struct LayerGeom {
 impl LayerGeom {
     pub fn host_len(&self) -> usize {
         self.host.iter().sum()
+    }
+    /// The NUMA node of every part of an expert in the RAM tier: each matrix's rows are divided
+    /// among the nodes. Empty with one node.
+    pub fn homes(&self, inter: usize, dim: usize, shares: &[usize]) -> Homes {
+        let mut h = Vec::new();
+        if shares.len() < 2 {
+            return h;
+        }
+        let mut at = 0;
+        for i in 0..3 {
+            let (rows, k) = if i == 2 { (dim, inter) } else { (inter, dim) };
+            // MXFP4: all values, then all scales
+            let regions = if self.types[i] == GGML_MXFP4 { vec![k / 2, k / 32] } else { vec![self.host[i] / rows] };
+            for row in regions {
+                h.extend(crate::cpu::split(shares, rows).into_iter().enumerate().map(|(n, r)| (n, at + r.start * row..at + r.end * row)));
+                at += rows * row;
+            }
+        }
+        h
     }
     /// bytes of each matrix in a VRAM slot
     pub fn slot_lens(&self, inter: usize, dim: usize) -> [usize; 3] {
@@ -236,7 +255,7 @@ impl RamCache {
 }
 
 /// `n` zeroed bytes straight from the allocator (untouched pages until written).
-fn alloc_buffer(n: usize) -> Option<Vec<u8>> {
+pub fn alloc_buffer(n: usize) -> Option<Vec<u8>> {
     let layout = std::alloc::Layout::array::<u8>(n).ok()?;
     let p = unsafe { std::alloc::alloc_zeroed(layout) };
     // SAFETY: allocated with Vec<u8>'s own layout, zero-initialized
@@ -375,7 +394,8 @@ impl ExpertStore {
             Stats::set(&s2.ram_cache_bytes, r.bytes);
             Stats::set(&s2.ram_cache_entries, r.map.len() as u64);
         };
-        let loader = Loader::new(|| paths.iter().map(|p| open_direct(p)).collect(), Arc::new(locs), THREADS, Box::new(on_done))?;
+        let homes = geom.layers.iter().map(|l| l.homes(cfg.moe_inter, cfg.dim, crate::cpu::shares())).collect();
+        let loader = Loader::new(|| paths.iter().map(|p| open_direct(p)).collect(), Arc::new(locs), homes, THREADS, Box::new(on_done))?;
         Ok(Self {
             geom,
             real_layers,
@@ -855,6 +875,24 @@ mod tests {
         r.put(4, Arc::new(vec![4; 10]), 4.0, false);
         assert!(!r.map.contains_key(&3) && r.map.len() == 3 && r.bytes == 30);
         assert_eq!(r.free.len(), 1);
+    }
+
+    #[test]
+    fn homes_cover_every_byte_once() {
+        let (inter, dim) = (2304, 5120);
+        let mx = LayerGeom { types: [GGML_MXFP4; 3], host: [dim * inter / 32 * 17; 3] };
+        let low = LayerGeom { types: [quants::Q2_K; 3], host: [dim * inter / 256 * 84; 3] };
+        for g in [mx, low] {
+            assert!(g.homes(inter, dim, &[1]).is_empty());
+            for shares in [&[1, 1][..], &[32, 8], &[1, 2, 3]] {
+                let mut at = 0;
+                for (n, r) in g.homes(inter, dim, shares) {
+                    assert!(n < shares.len() && r.start == at);
+                    at = r.end;
+                }
+                assert_eq!(at, g.host_len());
+            }
+        }
     }
 
     #[test]

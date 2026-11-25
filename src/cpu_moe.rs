@@ -5,6 +5,9 @@
 //! MXFP4 matrices use the same repacked layout as the GPU slots ([qs rows*nb*16][e8m0 rows*nb]);
 //! the low-bit formats are kept as they are in the GGUF and decoded row by row.
 
+use std::collections::VecDeque;
+
+use parking_lot::Mutex;
 use rayon::prelude::*;
 
 use crate::experts::LayerGeom;
@@ -580,13 +583,49 @@ fn task_rows(rows: usize, threads: usize) -> usize {
     if threads <= 32 { TASK } else { (rows / (threads * 3)).clamp(16, TASK) }
 }
 
+/// Run `tasks`, given with the NUMA node whose memory each works on, over the thread pool: threads
+/// take those of their own node first, then help with the others'.
+fn run_tasks<T: Send>(nodes: usize, tasks: Vec<(usize, T)>, f: impl Fn(&mut Row, T) + Sync) {
+    let threads = rayon::current_num_threads().min(tasks.len());
+    let mut queues: Vec<VecDeque<T>> = (0..nodes).map(|_| VecDeque::new()).collect();
+    for (n, t) in tasks {
+        queues[n].push_back(t);
+    }
+    let queues: Vec<Mutex<VecDeque<T>>> = queues.into_iter().map(Mutex::new).collect();
+    (0..threads).into_par_iter().with_max_len(1).for_each(|_| {
+        let mut buf = Row::default();
+        let me = crate::cpu::node();
+        for i in 0..nodes {
+            let take = || {
+                let mut q = queues[(me + i) % nodes].lock();
+                if i == 0 { q.pop_front() } else { q.pop_back() }
+            };
+            while let Some(t) = take() {
+                f(&mut buf, t);
+            }
+        }
+    });
+}
+
+/// Cut `out` (`n` values per row) into tasks of at most `task` rows, none of which spans two nodes.
+/// Returns (node, first row, its part of `out`).
+fn cut<'a>(shares: &[usize], rows: usize, n: usize, task: usize, mut out: &'a mut [f32]) -> Vec<(usize, usize, &'a mut [f32])> {
+    let mut v = Vec::new();
+    for (node, r) in crate::cpu::split(shares, rows).into_iter().enumerate() {
+        let (a, b) = out.split_at_mut(r.len() * n);
+        out = b;
+        v.extend(a.chunks_mut((task * n).max(1)).enumerate().map(|(c, o)| (node, r.start + c * task, o)));
+    }
+    v
+}
+
 /// y = W2 (w * silu(min(W1 x, l)) * clamp(W3 x, -l, l)) for several experts at once, each with
 /// several tokens. Returns one dim-vector per token of each job.
 pub fn experts_forward(jobs: &[Job], inter: usize, dim: usize, limit: f32) -> Vec<Vec<Vec<f32>>> {
-    forward_isa(jobs, inter, dim, limit, isa())
+    forward_isa(jobs, inter, dim, limit, isa(), crate::cpu::shares())
 }
 
-fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa) -> Vec<Vec<Vec<f32>>> {
+fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa, shares: &[usize]) -> Vec<Vec<Vec<f32>>> {
     // every expert's rows go into one list of tasks, so the threads meet twice however many experts
     let xq: Vec<Vec<Q8x>> = jobs.iter().map(|j| j.xs.iter().map(|x| quant_x(x, isa)).collect()).collect();
     // row-major: hidden[i][t]
@@ -596,13 +635,13 @@ fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa) -> 
     let mut tasks = Vec::new();
     for ((j, xq), h) in jobs.iter().zip(&xq).zip(&mut hidden) {
         let (gate, up) = (j.mat(0, inter, dim), j.mat(1, inter, dim));
-        tasks.extend(h.chunks_mut(task * j.xs.len().max(1)).enumerate().map(|(c, out)| (c, out, j, xq, gate, up)));
+        tasks.extend(cut(shares, inter, j.xs.len(), task, h).into_iter().map(|(n, first, out)| (n, (first, out, j, xq, gate, up))));
     }
-    tasks.into_par_iter().with_max_len(1).for_each_init(Row::default, |buf, (c, out, j, xq, gate, up)| {
+    run_tasks(shares.len(), tasks, |buf, (first, out, j, xq, gate, up)| {
         let n = j.xs.len();
         let (mut g, mut u) = (vec![0f32; n], vec![0f32; n]);
         for (o, row) in out.chunks_mut(n).enumerate() {
-            let i = c * task + o;
+            let i = first + o;
             gate.row(isa, i, xq, buf, &mut g);
             up.row(isa, i, xq, buf, &mut u);
             for t in 0..n {
@@ -622,11 +661,11 @@ fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa) -> 
     let mut tasks = Vec::new();
     for ((j, hq), o) in jobs.iter().zip(&hq).zip(&mut out) {
         let down = j.mat(2, dim, inter);
-        tasks.extend(o.chunks_mut(task * hq.len().max(1)).enumerate().map(|(c, out)| (c, out, hq, down)));
+        tasks.extend(cut(shares, dim, hq.len(), task, o).into_iter().map(|(n, first, out)| (n, (first, out, hq, down))));
     }
-    tasks.into_par_iter().with_max_len(1).for_each_init(Row::default, |buf, (c, out, hq, down)| {
+    run_tasks(shares.len(), tasks, |buf, (first, out, hq, down)| {
         for (o, row) in out.chunks_mut(hq.len()).enumerate() {
-            down.row(isa, c * task + o, hq, buf, row);
+            down.row(isa, first + o, hq, buf, row);
         }
     });
     jobs.iter().zip(&out).map(|(j, o)| (0..j.xs.len()).map(|t| column(o, j.xs.len(), t)).collect()).collect()
@@ -637,13 +676,29 @@ pub fn expert_forward(blob: &[u8], inter: usize, dim: usize, mat_bytes: usize, x
     experts_forward(&[Job { geom: LayerGeom { types: [GGML_MXFP4; 3], host: [mat_bytes; 3] }, blob, xs: xs.to_vec(), ws: ws.to_vec() }], inter, dim, limit).pop().unwrap()
 }
 
+/// Copies of `blobs` in memory of the nodes `homes` names.
+fn place_all(blobs: &[Vec<u8>], homes: &crate::expert_io::Homes) -> anyhow::Result<Vec<Vec<u8>>> {
+    let copy = |b: &Vec<u8>| {
+        let mut v = crate::experts::alloc_buffer(b.len()).ok_or_else(|| anyhow::anyhow!("out of memory"))?;
+        crate::cpu::place(&mut v, 0, homes, 0);
+        v.copy_from_slice(b);
+        Ok(v)
+    };
+    // a thread of its own: placing binds the thread
+    std::thread::scope(|s| s.spawn(|| blobs.iter().map(copy).collect()).join().unwrap())
+}
+
+fn count_placed(blobs: &[Vec<u8>], homes: &crate::expert_io::Homes) -> (usize, usize) {
+    blobs.iter().map(|b| crate::cpu::placed(b, homes)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+}
+
 /// Time experts on the CPU for the batch shapes decode and short prompts produce.
 pub fn bench(dim: usize, inter: usize, types: [u32; 3]) -> anyhow::Result<()> {
     let size = |t: u32| crate::gguf::type_block(t).map(|(e, b)| dim * inter / e as usize * b as usize);
     let geom = LayerGeom { types, host: [size(types[0]).unwrap(), size(types[1]).unwrap(), size(types[2]).unwrap()] };
     let mat = geom.host_len() as f64 / 3.0;
     // enough experts that every pass comes from DRAM, not a cache
-    let blobs: Vec<Vec<u8>> = (0..48u64)
+    let mut blobs: Vec<Vec<u8>> = (0..48u64)
         .into_par_iter()
         .map(|i| {
             let mut z = i * 0x9E37_79B9 + 1;
@@ -664,36 +719,51 @@ pub fn bench(dim: usize, inter: usize, types: [u32; 3]) -> anyhow::Result<()> {
             b
         })
         .collect();
+    let mut blobs_local: Vec<Vec<u8>> = Vec::new();
     let x: Vec<f32> = (0..dim).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
     let have: Vec<Isa> = Isa::ALL.into_iter().filter(|i| i.available()).collect();
     println!("expert {:.1} MB, kernels {have:?}, using {:?}", 3.0 * mat / 1e6, isa());
     let groups = crate::cpu::groups();
-    let mut runs: Vec<(usize, &[crate::cpu::Group])> = Vec::new();
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new(); // threads, groups, nodes
     if groups.is_empty() {
         let cores = std::thread::available_parallelism()?.get();
         let mut counts = vec![1, 4, 8, cores / 2, cores * 3 / 4, cores];
         counts.sort();
         counts.dedup();
-        runs.extend(counts.into_iter().filter(|&t| t > 0).map(|t| (t, &groups[..])));
+        runs.extend(counts.into_iter().filter(|&t| t > 0).map(|t| (t, 0, 1)));
     } else {
         println!("{}", crate::cpu::describe());
         // one group, then all of them; in each: one thread per core, then every hyper-thread
-        let one = &groups[..1];
         let sum = |g: &[crate::cpu::Group], f: fn(&crate::cpu::Group) -> usize| g.iter().map(f).sum::<usize>();
-        for g in [one, &groups[..]] {
-            let (cores, logical) = (sum(g, |g| g.cores), sum(g, |g| g.logical));
+        for g in [&groups[..1], groups] {
+            let (cores, logical) = (sum(g, |g| g.cores), sum(g, |g| g.logical()));
             let mut counts = vec![cores / 2, cores, logical];
             if g.len() == 1 {
                 counts.extend([1, 8]);
             }
             counts.sort();
             counts.dedup();
-            runs.extend(counts.into_iter().filter(|&t| t > 0).map(|t| (t, g)));
+            runs.extend(counts.into_iter().filter(|&t| t > 0).map(|t| (t, g.len(), 1)));
         }
     }
-    for (threads, on) in runs {
+    let shares = crate::cpu::shares();
+    if shares.len() > 1 {
+        let local: Vec<_> = runs.iter().filter(|r| r.1 == groups.len()).map(|r| (r.0, r.1, shares.len())).collect();
+        runs.extend(local);
+    }
+    for (threads, on, nodes) in runs {
+        if nodes > 1 && blobs_local.is_empty() {
+            let homes = geom.homes(inter, dim, shares);
+            let (right, wrong) = count_placed(&blobs, &homes);
+            blobs_local = place_all(&blobs, &homes)?;
+            blobs = Vec::new();
+            let (r2, w2) = count_placed(&blobs_local, &homes);
+            let pct = |r: usize, w: usize| 100.0 * r as f64 / (r + w).max(1) as f64;
+            println!("rows in their node's memory: {:.0}% of pages so far, {:.0}% below", pct(right, wrong), pct(r2, w2));
+        }
+        let (blobs, shares) = if nodes > 1 { (&blobs_local, shares) } else { (&blobs, &[1][..]) };
         let pool = crate::cpu::pool(on, threads).build()?;
-        let mut line = match on.len() {
+        let mut line = match on {
             0 => format!("{threads:>3} threads:"),
             n => format!("{threads:>3} threads, {n} group{}:", if n > 1 { "s" } else { " " }),
         };
@@ -704,7 +774,7 @@ pub fn bench(dim: usize, inter: usize, types: [u32; 3]) -> anyhow::Result<()> {
                 pool.install(|| {
                     for g in blobs.chunks(group) {
                         let jobs: Vec<Job> = g.iter().map(|b| Job { geom, blob: b, xs: vec![&x[..]; nt], ws: vec![1.0; nt] }).collect();
-                        std::hint::black_box(experts_forward(&jobs, inter, dim, 10.0));
+                        std::hint::black_box(forward_isa(&jobs, inter, dim, 10.0, isa(), shares));
                     }
                 });
                 best = best.min(t0.elapsed().as_secs_f64() * 1e3 / blobs.len() as f64);
@@ -827,11 +897,15 @@ mod tests {
                 .enumerate()
                 .map(|(i, b)| Job { geom, blob: b, xs: xs[..i + 3].iter().map(|x| &x[..]).collect(), ws: (0..i + 3).map(|t| 0.5 + t as f32).collect() })
                 .collect();
-            let all = forward_isa(&jobs, inter, dim, 10.0, isa);
+            let all = forward_isa(&jobs, inter, dim, 10.0, isa, &[1]);
+            // however the rows are divided among NUMA nodes, bit for bit
+            for shares in [&[1, 1][..], &[5, 2], &[1, 1, 1, 1, 1, 1, 1]] {
+                assert!(forward_isa(&jobs, inter, dim, 10.0, isa, shares) == all);
+            }
             for (j, got) in jobs.iter().zip(&all) {
                 for t in 0..j.xs.len() {
                     let one = Job { geom, blob: j.blob, xs: vec![j.xs[t]], ws: vec![j.ws[t]] };
-                    let want = &forward_isa(&[one], inter, dim, 10.0, Isa::Scalar)[0][0];
+                    let want = &forward_isa(&[one], inter, dim, 10.0, Isa::Scalar, &[1])[0][0];
                     let range = want.iter().fold(0f32, |a, v| a.max(v.abs()));
                     let worst = got[t].iter().zip(want).fold(0f32, |a, (g, w)| a.max((g - w).abs()));
                     assert!(worst <= 0.02 * range, "{isa:?} token {t}: {worst} of {range}");

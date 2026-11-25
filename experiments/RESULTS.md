@@ -151,3 +151,13 @@ Decode, Ryzen 9 9950X + RTX 5080, per token, from temporary timers and GPU times
 - `hc_mix` rounds differently. KLD against the old build, GPU-only experts: 0.0079 and 0.033 on two
   texts; the old build with only its summation order reversed: 0.0028 and 0.029. Routing near-ties
   amplify any rounding.
+
+# NUMA-local experts
+
+Rows of every expert divided among the nodes' memories by first touch; threads take rows of their
+own node first. Speed on a machine with several nodes: not measured yet.
+
+- One node (9950X), `bench-cpu` before/after: the same within noise. Windows with `DSV4_NUMA=2` and
+  `3` (pretended nodes) and Linux (WSL, one real node, 2 pretended): the same within noise.
+- Results are identical bit for bit however the rows are divided (unit test).
+- macOS: `cpu.rs` type-checks for aarch64-apple-darwin; the whole program was not built there.

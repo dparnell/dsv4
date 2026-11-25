@@ -61,8 +61,8 @@ fn default_model_dir() -> PathBuf {
 #[derive(Parser)]
 #[command(name = "dsv4", version, about = "DeepSeek-V4.1-Flash inference on wgpu with streamed MoE experts")]
 struct Cli {
-    /// CPU worker threads (default: one per core over all processor groups where Windows has
-    /// several, else one per logical processor)
+    /// CPU worker threads (default: one per core over all NUMA nodes and Windows processor
+    /// groups where there are several, else one per logical processor)
     #[arg(long, global = true, env = "DSV4_THREADS")]
     threads: Option<usize>,
     #[command(subcommand)]

@@ -56,6 +56,9 @@ pub struct LayerParts {
     pub parts: Vec<Part>,
 }
 
+/// The NUMA node of each range of an expert's buffer (empty: wherever it ends up).
+pub type Homes = Vec<(usize, std::ops::Range<usize>)>;
+
 #[repr(C, align(4096))]
 #[derive(Clone, Copy)]
 struct Page([u8; 4096]);
@@ -160,6 +163,7 @@ pub type OnDone = Box<dyn Fn(Finished) + Send + Sync>;
 
 struct Shared {
     locs: Arc<Vec<LayerParts>>,
+    homes: Vec<Homes>,
     q: Mutex<Queues>,
     cv: Condvar,
     on_done: OnDone,
@@ -172,14 +176,14 @@ pub struct Loader {
 }
 
 impl Loader {
-    /// `open` opens the shards; it is called once per thread, because Windows runs the reads on
+    /// `homes` (one per layer, or none) places the experts in memory. `open` opens the shards; it is called once per thread, because Windows runs the reads on
     /// one synchronous file handle strictly one after another.
-    pub fn new(open: impl Fn() -> std::io::Result<Vec<File>>, locs: Arc<Vec<LayerParts>>, threads: usize, on_done: OnDone) -> std::io::Result<Self> {
-        let sh = Arc::new(Shared { locs, q: Default::default(), cv: Condvar::new(), on_done, max_background: (threads / 4).max(1) });
+    pub fn new(open: impl Fn() -> std::io::Result<Vec<File>>, locs: Arc<Vec<LayerParts>>, homes: Vec<Homes>, threads: usize, on_done: OnDone) -> std::io::Result<Self> {
+        let sh = Arc::new(Shared { locs, homes, q: Default::default(), cv: Condvar::new(), on_done, max_background: (threads / 4).max(1) });
         let threads = (0..threads)
             .map(|i| {
                 let (s, files) = (sh.clone(), open()?);
-                std::thread::Builder::new().name(format!("expert-io-{i}")).spawn(move || worker(&s, &files))
+                std::thread::Builder::new().name(format!("expert-io-{i}")).spawn(move || worker(&s, &files, i))
             })
             .collect::<std::io::Result<Vec<_>>>()?;
         Ok(Self { sh, threads })
@@ -310,7 +314,7 @@ impl Load {
     }
 }
 
-fn worker(sh: &Shared, files: &[File]) {
+fn worker(sh: &Shared, files: &[File], thread: usize) {
     let mut scratch: Vec<Page> = Vec::new();
     loop {
         let (piece, background) = {
@@ -338,7 +342,7 @@ fn worker(sh: &Shared, files: &[File]) {
                 sh.cv.wait(&mut q);
             }
         };
-        if let Err(e) = run_piece(files, &piece, &mut scratch) {
+        if let Err(e) = run_piece(sh, files, &piece, &mut scratch, thread) {
             *piece.job.error.lock() = Some(e.to_string());
         }
         {
@@ -371,12 +375,16 @@ fn worker(sh: &Shared, files: &[File]) {
     }
 }
 
-fn run_piece(files: &[File], p: &Piece, scratch: &mut Vec<Page>) -> std::io::Result<()> {
+fn run_piece(sh: &Shared, files: &[File], p: &Piece, scratch: &mut Vec<Page>, thread: usize) -> std::io::Result<()> {
     let m = &p.part;
     // SAFETY: the parts of a job are disjoint ranges of its buffer, which stays alive until
     // `remaining` reaches zero; `start` checked its length.
     assert!(m.dst + m.len <= p.job.len);
     let out = unsafe { std::slice::from_raw_parts_mut(p.job.dst.add(m.dst), m.len) };
+    if let Some(h) = sh.homes.get((p.job.key >> 16) as usize) {
+        // the threads end on different nodes
+        crate::cpu::place(out, m.dst, h, thread);
+    }
     let e = (p.job.key & 0xffff) as u64;
     if m.kind != PartKind::Zero {
         let raw = read_at(&files[m.file], m.offset + e * m.stride, m.len, scratch)?;
@@ -435,7 +443,7 @@ mod tests {
         let mb = blocks * BLK;
         let done = Arc::new(AtomicUsize::new(0));
         let d2 = done.clone();
-        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs.clone(), 4, Box::new(move |_| { d2.fetch_add(1, Ordering::Relaxed); })).unwrap();
+        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs.clone(), vec![], 4, Box::new(move |_| { d2.fetch_add(1, Ordering::Relaxed); })).unwrap();
         for e in 0..3 {
             assert!(l.prefetch(0, e, || Ok(vec![0; 3 * mb])));
         }
@@ -453,7 +461,7 @@ mod tests {
     #[test]
     fn read_errors_reach_the_waiter() {
         let (path, _, locs) = fixture(64, 1);
-        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs, 2, Box::new(|_| {})).unwrap();
+        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs, vec![], 2, Box::new(|_| {})).unwrap();
         // expert 5 lies past the end of the file
         let j = l.demand(0, 5, || None, || Ok(vec![0; 3 * 64 * BLK])).unwrap();
         assert!(j.wait().is_err());
@@ -466,7 +474,7 @@ mod tests {
         let blocks = 1_000_000;
         let (path, data, locs) = fixture(blocks, 4);
         let mb = blocks * BLK;
-        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs.clone(), 1, Box::new(|_| {})).unwrap();
+        let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs.clone(), vec![], 1, Box::new(|_| {})).unwrap();
         for e in 0..4 {
             l.prefetch(0, e, || Ok(vec![0; 3 * mb]));
         }

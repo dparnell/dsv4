@@ -134,10 +134,11 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/jso
 Common model options: `--ctx` (context, default 32768), `--segment`, `--chunk`, `--expert-vram-gb`,
 `--ram-cache-gb`, `--backend vulkan|dx12|metal`, `--gpu-only-experts`, `--no-prefetch`, `--no-warm-up`, `--tokenizer`.
 
-CPU threads: on Windows machines with more than 64 logical processors (several processor groups, typically dual-socket
-servers) there is one worker thread per core over all groups; elsewhere one per logical processor. `--threads N` or
-`DSV4_THREADS` changes the number; `bench-cpu` compares one group with all of them. The status page shows where the
-time per token goes.
+CPU threads: one per logical processor, except on machines with several NUMA nodes (Windows, Linux; typically dual-socket
+servers) or Windows processor groups (more than 64 logical processors), where there is one per core over all of them.
+`--threads N` or `DSV4_THREADS` changes the number. With several NUMA nodes threads are bound to their node, and each
+expert's rows are divided among the nodes' memories so that threads mostly read their own; `DSV4_NUMA=off` turns that
+off, and `bench-cpu` compares both. macOS has no NUMA nodes. The status page shows where the time per token goes.
 
 ## API notes
 
@@ -163,7 +164,7 @@ src/
   download.rs    resumable parallel Hugging Face downloader
   gguf.rs        multi-shard GGUF reader (mmap)
   config.rs      hyper-parameters from GGUF metadata
-  cpu.rs         worker threads across Windows processor groups
+  cpu.rs         worker threads and expert memory across NUMA nodes and processor groups
   gpu.rs         wgpu device, buffers, pipelines, bind-group cache, batches, readback
   kernels.rs     WGSL kernels (Q8_0/MXFP4 matmuls, sparse attention, indexer top-k, RoPE/YaRN,
                  hyper-connection Sinkhorn mixing, Engram gating, quantisation simulation, ...)

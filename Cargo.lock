@@ -903,6 +903,7 @@ dependencies = [
  "futures",
  "half",
  "indicatif",
+ "libc",
  "memmap2",
  "minijinja",
  "minijinja-contrib",

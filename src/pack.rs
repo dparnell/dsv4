@@ -236,7 +236,7 @@ pub fn repack(g: &Gguf, geoms_all: &[LayerGeom], mut gguf: Vec<LayerParts>, n_la
 
 fn loader(g: &Gguf, parts: Vec<LayerParts>, pack: Option<&Path>) -> Result<Loader> {
     let paths: Vec<PathBuf> = g.shards.iter().map(|s| s.path.clone()).chain(pack.map(Path::to_path_buf)).collect();
-    Ok(Loader::new(|| paths.iter().map(|p| crate::experts::open_direct(p)).collect(), Arc::new(parts), THREADS, Box::new(|_| {}))?)
+    Ok(Loader::new(|| paths.iter().map(|p| crate::experts::open_direct(p)).collect(), Arc::new(parts), Vec::new(), THREADS, Box::new(|_| {}))?)
 }
 
 /// Compare experts spread over the whole pack with the GGUF.

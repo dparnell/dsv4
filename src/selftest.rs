@@ -232,6 +232,11 @@ pub fn run() -> Result<()> {
             (q::IQ2_S, q::IQ3_XXS, "iq2_s/iq3_xxs"),
             (q::Q3_K, q::IQ3_S, "q3_k/iq3_s"),
             (q::Q2_K, q::IQ1_S, "q2_k/iq1_s"),
+            (q::IQ1_M, q::IQ4_XS, "iq1_m/iq4_xs"),
+            (q::Q4_K, q::Q6_K, "q4_k/q6_k"),
+            (q::Q5_K, q::Q4_K, "q5_k/q4_k"),
+            (q::IQ4_XS, q::Q5_K, "iq4_xs/q5_k"),
+            (q::Q6_K, q::IQ1_M, "q6_k/iq1_m"),
         ] {
             let types = [ty, ty, dn];
             let mut host = Vec::new();
@@ -275,18 +280,18 @@ pub fn run() -> Result<()> {
             let mut b = gpu.begin();
             let mut gp = vec![inter as u32, dim as u32, 3, 0, bits(lim), (sl[0] / 4) as u32, dim as u32];
             gp.extend(lutp(ty));
-            b.run("moe_gate_up_lut_8", &[sb.all(), xb.all(), rb.all(), hb.all()], &gp, ((inter as u32).div_ceil(8), 1, 1));
+            b.run(crate::kernels::moe(ty)[1], &[sb.all(), xb.all(), rb.all(), hb.all()], &gp, ((inter as u32).div_ceil(8), 1, 1));
             let mut dp = vec![dim as u32, inter as u32, 3, 0, 0, ((sl[0] + sl[1]) / 4) as u32, 0];
             dp.extend(lutp(dn));
-            b.run("moe_down_lut_8", &[sb.all(), hb.all(), rb.all(), ob.all()], &dp, ((dim as u32).div_ceil(8), 1, 1));
+            b.run(crate::kernels::moe(dn)[3], &[sb.all(), hb.all(), rb.all(), ob.all()], &dp, ((dim as u32).div_ceil(8), 1, 1));
             let got = gpu.read_f32(b, &ob, 0, toks * dim);
             let range = want.iter().fold(0f32, |a, v| a.max(v.abs()));
             let worst = |got: &[f32]| got.iter().zip(&want).fold(0f32, |a, (g, w)| a.max((g - w).abs())) / range;
             // and one token through the single-token kernels
             let mut b = gpu.begin();
             (gp[2], dp[2]) = (1, 1);
-            b.run("moe_gate_up_lut_1", &[sb.all(), xb.all(), rb.all(), hb.all()], &gp, ((inter as u32).div_ceil(8), 1, 1));
-            b.run("moe_down_lut_1", &[sb.all(), hb.all(), rb.all(), ob.all()], &dp, ((dim as u32).div_ceil(8), 1, 1));
+            b.run(crate::kernels::moe(ty)[0], &[sb.all(), xb.all(), rb.all(), hb.all()], &gp, ((inter as u32).div_ceil(8), 1, 1));
+            b.run(crate::kernels::moe(dn)[2], &[sb.all(), hb.all(), rb.all(), ob.all()], &dp, ((dim as u32).div_ceil(8), 1, 1));
             let got1 = gpu.read_f32(b, &ob, 0, toks * dim);
             let (e8, e1) = (worst(&got), worst(&got1));
             let ok = e8 < 1e-4 && e1 < 1e-4 && range > 0.0;

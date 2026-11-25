@@ -221,10 +221,48 @@ impl Downloader {
     }
 }
 
-/// Files that make up one quant: its shard folder. The engram/dspark/mmproj extras are optional.
-pub fn select_quant(entries: &[RepoEntry], quant: &str) -> Vec<RepoEntry> {
-    let prefix = format!("{quant}/");
-    entries.iter().filter(|e| e.path.starts_with(&prefix) && e.path.ends_with(".gguf")).cloned().collect()
+/// `-00002-of-00006` at the end of a file name without extension: the rest of it, and the count.
+fn split_shard(stem: &str) -> Option<(&str, usize)> {
+    let (rest, count) = stem.rsplit_once("-of-")?;
+    let (name, index) = rest.rsplit_once('-')?;
+    index.parse::<usize>().ok()?;
+    Some((name, count.parse().ok()?))
+}
+
+/// The quant a GGUF of the repo belongs to: its folder, or its name up to the shard number.
+fn quant_of(path: &str) -> Option<&str> {
+    let stem = path.strip_suffix(".gguf")?;
+    Some(match path.split_once('/') {
+        Some((folder, _)) => folder,
+        None => split_shard(stem).map_or(stem, |s| s.0),
+    })
+}
+
+/// Files that make up one quant: its shard folder, or the files named so (the end of the name is
+/// enough). An Engram table kept in a file of its own comes along if a shard is missing.
+pub fn select_quant(entries: &[RepoEntry], quant: &str) -> Result<Vec<RepoEntry>> {
+    let ggufs = || entries.iter().filter(|e| e.path.ends_with(".gguf"));
+    let named = |e: &&RepoEntry| quant_of(&e.path) == Some(quant);
+    let mut files: Vec<RepoEntry> = ggufs().filter(named).cloned().collect();
+    if files.is_empty() {
+        let end = format!("-{}", quant.to_lowercase());
+        files = ggufs().filter(|e| !e.path.contains('/') && quant_of(&e.path).is_some_and(|q| q.to_lowercase().ends_with(&end))).cloned().collect();
+        let mut names: Vec<&str> = files.iter().filter_map(|f| quant_of(&f.path)).collect();
+        names.sort_unstable();
+        names.dedup();
+        if names.len() > 1 {
+            bail!("several quants end in {quant}: {}", names.join(", "));
+        }
+    }
+    let shards = files.iter().find_map(|f| split_shard(f.path.strip_suffix(".gguf")?)).map_or(files.len(), |s| s.1);
+    if files.len() < shards {
+        let engram = |e: &&RepoEntry| e.path.to_lowercase().contains("engram") && !files.iter().any(|f| f.path == e.path);
+        match ggufs().filter(engram).min_by_key(|e| &e.path) {
+            Some(e) if files.len() + 1 == shards => files.push(e.clone()),
+            _ => bail!("{quant} has {} of {shards} shards in the repo", files.len()),
+        }
+    }
+    Ok(files)
 }
 
 pub async fn run(repo: &str, quant: &str, dir: &Path, connections: usize, list_only: bool) -> Result<()> {
@@ -233,12 +271,10 @@ pub async fn run(repo: &str, quant: &str, dir: &Path, connections: usize, list_o
     if list_only {
         let mut quants: Vec<(String, u64)> = Vec::new();
         for e in &entries {
-            if let Some((q, _)) = e.path.split_once('/') {
-                if e.path.ends_with(".gguf") {
-                    match quants.iter_mut().find(|(n, _)| n == q) {
-                        Some((_, s)) => *s += e.size,
-                        None => quants.push((q.to_string(), e.size)),
-                    }
+            if let Some(q) = quant_of(&e.path) {
+                match quants.iter_mut().find(|(n, _)| n == q) {
+                    Some((_, s)) => *s += e.size,
+                    None => quants.push((q.to_string(), e.size)),
                 }
             }
         }
@@ -248,7 +284,7 @@ pub async fn run(repo: &str, quant: &str, dir: &Path, connections: usize, list_o
         }
         return Ok(());
     }
-    let mut files = select_quant(&entries, quant);
+    let mut files = select_quant(&entries, quant)?;
     // metadata + dense shards first, the big expert / engram shards last
     files.sort_by_key(|f| f.size);
     if files.is_empty() {
@@ -267,4 +303,30 @@ pub async fn run(repo: &str, quant: &str, dir: &Path, connections: usize, list_o
     dl.fetch(repo, &files, dir).await?;
     println!("done.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_quants_in_folders_and_flat() {
+        let entries: Vec<RepoEntry> = [
+            "UD-IQ1_S/m-00001-of-00002.gguf",
+            "UD-IQ1_S/m-00002-of-00002.gguf",
+            "m-IQ2_XS-00001-of-00003.gguf",
+            "m-IQ2_XS-00003-of-00003.gguf",
+            "m-Engram-IQ4_NL.gguf",
+            "m-Q2.gguf",
+            "b-IQ3_S-00001-of-00009.gguf",
+        ]
+        .map(|p| RepoEntry { kind: "file".into(), path: p.into(), size: 1 })
+        .into();
+        let names = |q: &str| select_quant(&entries, q).map(|v| v.into_iter().map(|e| e.path).collect::<Vec<_>>());
+        assert_eq!(names("UD-IQ1_S").unwrap().len(), 2);
+        assert_eq!(names("iq2_xs").unwrap(), ["m-IQ2_XS-00001-of-00003.gguf", "m-IQ2_XS-00003-of-00003.gguf", "m-Engram-IQ4_NL.gguf"]);
+        assert_eq!(names("m-Q2").unwrap(), ["m-Q2.gguf"]);
+        assert!(names("IQ3_S").is_err());
+        assert!(names("nope").unwrap().is_empty());
+    }
 }

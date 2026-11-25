@@ -1,10 +1,10 @@
 //! Decoders for ggml's block formats.
 //!
-//! The low-bit formats used for routed experts all have the form
-//!     weight = w * s * d  (- m * dm, Q2_K only)
+//! The formats used for routed experts all have the form
+//!     weight = w * s * d  (- m * dm for Q2_K, Q4_K and Q5_K)
 //! with a small integer w, an integer s per 16 weights and a float d per 256. `decode` returns
-//! those parts; w takes at most 16 values per format, so on the GPU it is stored as 4-bit codes
-//! into a table (`codes`). Nothing is rounded on the way.
+//! those parts; w takes at most 16 values in most formats, so on the GPU it is stored as 4-bit codes
+//! into a table (`codes`), except for the `wide` ones, which keep a byte. Nothing is rounded on the way.
 //!
 //! Formats, tables and bit layouts are ggml's (MIT, see data/NOTICE).
 
@@ -16,6 +16,7 @@ use crate::gguf::{GGML_BF16, GGML_F16, GGML_F32, GGML_MXFP4, GGML_Q8_0};
 
 pub const Q2_K: u32 = 10;
 pub const Q3_K: u32 = 11;
+pub const Q4_K: u32 = 12;
 pub const Q5_K: u32 = 13;
 pub const Q6_K: u32 = 14;
 pub const IQ2_XXS: u32 = 16;
@@ -25,15 +26,24 @@ pub const IQ1_S: u32 = 19;
 pub const IQ4_NL: u32 = 20;
 pub const IQ3_S: u32 = 21;
 pub const IQ2_S: u32 = 22;
+pub const IQ4_XS: u32 = 23;
+pub const IQ1_M: u32 = 29;
 
 /// Formats `decode` handles, i.e. those routed experts can have besides MXFP4.
 pub fn is_low_bit(ty: u32) -> bool {
-    matches!(ty, Q2_K | Q3_K | IQ1_S | IQ2_XXS | IQ2_XS | IQ2_S | IQ3_XXS | IQ3_S)
+    LOW_BIT.contains(&ty)
+}
+
+pub const LOW_BIT: [u32; 13] = [Q2_K, Q3_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, Q4_K, Q5_K, Q6_K];
+
+/// Does w take more values than 4-bit codes can tell apart?
+pub fn wide(ty: u32) -> bool {
+    matches!(ty, Q5_K | Q6_K)
 }
 
 /// Does the format have the `m * dm` offset?
 pub fn has_min(ty: u32) -> bool {
-    ty == Q2_K
+    matches!(ty, Q2_K | Q4_K | Q5_K)
 }
 
 struct Tables {
@@ -209,11 +219,12 @@ pub fn decode(ty: u32, b: &[u8], o: &mut Block) {
                 let hi = s[8 + i % 4] >> (2 * (i / 4)) & 3;
                 o.s[i] = (lo | hi << 4) as i8 - 32;
             }
-            for (i, w) in o.w.iter_mut().enumerate() {
-                let (n, j, l) = (i / 128, i % 128 / 32, i % 32);
-                let q = b[32 + n * 32 + l] >> (2 * j) & 3;
-                let h = b[l] >> (n * 4 + j) & 1;
-                *w = q as i8 - 4 * (1 - h as i8);
+            for (j, w) in o.w.chunks_exact_mut(32).enumerate() {
+                let q = &b[32 + j / 4 * 32..][..32];
+                let sh = 2 * (j % 4);
+                for ((w, q), h) in w.iter_mut().zip(q).zip(&b[..32]) {
+                    *w = ((q >> sh & 3) | (h >> j & 1) << 2) as i8 - 4;
+                }
             }
         }
         Q2_K => {
@@ -224,22 +235,97 @@ pub fn decode(ty: u32, b: &[u8], o: &mut Block) {
                 o.s[i] = (b[i] & 15) as i8;
                 o.m[i] = b[i] >> 4;
             }
-            for (i, w) in o.w.iter_mut().enumerate() {
-                *w = (b[16 + i / 128 * 32 + i % 32] >> (2 * (i % 128 / 32)) & 3) as i8;
+            for (j, w) in o.w.chunks_exact_mut(32).enumerate() {
+                let q = &b[16 + j / 4 * 32..][..32];
+                let sh = 2 * (j % 4);
+                for (w, q) in w.iter_mut().zip(q) {
+                    *w = (q >> sh & 3) as i8;
+                }
+            }
+        }
+        IQ1_M => {
+            let b: &[u8; 56] = b.try_into().unwrap();
+            let sc: [usize; 4] = std::array::from_fn(|i| le16(48 + 2 * i));
+            o.d = f16::from_bits((sc[0] >> 12 | sc[1] >> 8 & 0xf0 | sc[2] >> 4 & 0xf00 | sc[3] & 0xf000) as u16).to_f32() / 8.0;
+            for i in 0..16 {
+                let h = b[32 + i] as usize;
+                o.s[i] = odd((sc[i / 4] >> (3 * (i % 4)) & 7) as u32);
+                put(o, 2 * i, t.g1[h >> 3 & 1][b[2 * i] as usize | (h & 7) << 8]);
+                put(o, 2 * i + 1, t.g1[h >> 7][b[2 * i + 1] as usize | (h >> 4 & 7) << 8]);
+            }
+        }
+        IQ4_XS => {
+            let b: &[u8; 136] = b.try_into().unwrap();
+            o.d = half_at(b, 0);
+            let hi = le16(2);
+            for j in 0..8 {
+                let s = (b[4 + j / 2] >> (4 * (j & 1)) & 15) as i8 | ((hi >> (2 * j) & 3) << 4) as i8;
+                o.s[2 * j] = s - 32;
+                o.s[2 * j + 1] = s - 32;
+                for l in 0..16 {
+                    o.w[32 * j + l] = IQ4_NL_VALUES[(b[8 + 16 * j + l] & 15) as usize];
+                    o.w[32 * j + 16 + l] = IQ4_NL_VALUES[(b[8 + 16 * j + l] >> 4) as usize];
+                }
+            }
+        }
+        Q4_K | Q5_K => {
+            let low = if ty == Q4_K { 16 } else { 48 };
+            let b = &b[..low + 128];
+            o.d = half_at(b, 0);
+            o.dm = half_at(b, 2);
+            let s = &b[4..16];
+            for j in 0..8 {
+                let (sc, m) = if j < 4 {
+                    (s[j] & 63, s[j + 4] & 63)
+                } else {
+                    (s[j + 4] & 15 | s[j - 4] >> 6 << 4, s[j + 4] >> 4 | s[j] >> 6 << 4)
+                };
+                (o.s[2 * j], o.s[2 * j + 1]) = (sc as i8, sc as i8);
+                (o.m[2 * j], o.m[2 * j + 1]) = (m, m);
+            }
+            for (j, w) in o.w.chunks_exact_mut(32).enumerate() {
+                let q = &b[low + j / 2 * 32..][..32];
+                let sh = 4 * (j & 1);
+                for (w, q) in w.iter_mut().zip(q) {
+                    *w = (q >> sh & 15) as i8;
+                }
+                if ty == Q5_K {
+                    for (w, h) in w.iter_mut().zip(&b[16..48]) {
+                        *w |= ((h >> j & 1) << 4) as i8;
+                    }
+                }
+            }
+        }
+        Q6_K => {
+            let b: &[u8; 210] = b.try_into().unwrap();
+            o.d = half_at(b, 208);
+            for i in 0..16 {
+                o.s[i] = b[192 + i] as i8;
+            }
+            for (j, w) in o.w.chunks_exact_mut(32).enumerate() {
+                let (n, part) = (j / 4, j % 4);
+                let lo = &b[n * 64 + 32 * (part & 1)..][..32];
+                let hi = &b[128 + n * 32..][..32];
+                let (a, c) = (4 * (part >> 1), 2 * part);
+                for ((w, lo), hi) in w.iter_mut().zip(lo).zip(hi) {
+                    *w = ((lo >> a & 15) | (hi >> c & 3) << 4) as i8 - 32;
+                }
             }
         }
         _ => unreachable!("not a low-bit format: {ty}"),
     }
 }
 
-/// The values w can take, as a 16-entry table, and the table entry of each value.
+/// The values w can take in a format that is not `wide`, as a 16-entry table, and the table entry of each value.
 pub fn codes(ty: u32) -> (&'static [i8; 16], &'static [u8; 256]) {
-    static T: [OnceLock<([i8; 16], [u8; 256])>; 5] = [const { OnceLock::new() }; 5];
+    static T: [OnceLock<([i8; 16], [u8; 256])>; 7] = [const { OnceLock::new() }; 7];
     let (which, vals): (usize, &[i8]) = match ty {
-        IQ1_S => (0, &[-9, -7, -1, 1, 7, 9]),
+        IQ1_S | IQ1_M => (0, &[-9, -7, -1, 1, 7, 9]),
         IQ2_XXS | IQ2_XS | IQ2_S => (1, &[8, 25, 43, -8, -25, -43]),
         IQ3_S => (4, &[1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15]),
         IQ3_XXS => (2, &[4, 12, 20, 28, 36, 44, 52, 62, -4, -12, -20, -28, -36, -44, -52, -62]),
+        IQ4_XS => (5, &IQ4_NL_VALUES),
+        Q4_K => (6, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
         // Q3_K, Q2_K
         _ => (3, &[-4, -3, -2, -1, 0, 1, 2, 3]),
     };
@@ -260,28 +346,28 @@ pub fn slot_len(ty: u32, rows: usize, k: usize) -> usize {
     if ty == GGML_MXFP4 {
         return n / 2 + n / 32;
     }
-    (n / 2 + n / 16 + n / 64) + if has_min(ty) { n / 16 + n / 64 } else { 0 }
+    (if wide(ty) { n } else { n / 2 }) + n / 16 + n / 64 + if has_min(ty) { n / 16 + n / 64 } else { 0 }
 }
 
-/// Convert a low-bit matrix to the form of the `*_lut` kernels:
-/// [4-bit codes: of 32 weights the first 16 in the low nibbles][s: i8][d: f32] (Q2_K: [m: u8][dm: f32])
+/// Convert a low-bit matrix to the form of the `*_lut` kernels (`*_wide` ones: an int8 per weight, in order):
+/// [4-bit codes: of 32 weights the first 16 in the low nibbles][s: i8][d: f32] (`has_min`: [m: u8][dm: f32])
 pub fn to_slot(ty: u32, raw: &[u8], rows: usize, k: usize, out: &mut [u8]) {
     use rayon::prelude::*;
     let (be, bb) = crate::gguf::type_block(ty).unwrap();
     let (nb, bb) = (k / be as usize, bb as usize);
     assert!(be == 256 && k % 256 == 0 && raw.len() == rows * nb * bb && out.len() == slot_len(ty, rows, k));
     let n = rows * k;
-    let (q, rest) = out.split_at_mut(n / 2);
+    let (qk, inv) = if wide(ty) { (k, None) } else { (k / 2, Some(codes(ty).1)) };
+    let (q, rest) = out.split_at_mut(rows * qk);
     let (s, rest) = rest.split_at_mut(n / 16);
     let (d, rest) = rest.split_at_mut(n / 64);
     // keep the parallel zip uniform: without offsets, every row gets empty slices
     let (mk, dk) = if has_min(ty) { (n / 16, n / 64) } else { (0, 0) };
     let (m, dm) = rest.split_at_mut(mk);
     assert_eq!(dm.len(), dk);
-    let inv = codes(ty).1;
     let mut m_rows: Vec<&mut [u8]> = if mk > 0 { m.chunks_mut(k / 16).collect() } else { (0..rows).map(|_| Default::default()).collect() };
     let mut dm_rows: Vec<&mut [u8]> = if dk > 0 { dm.chunks_mut(k / 64).collect() } else { (0..rows).map(|_| Default::default()).collect() };
-    q.par_chunks_mut(k / 2)
+    q.par_chunks_mut(qk)
         .zip(s.par_chunks_mut(k / 16))
         .zip(d.par_chunks_mut(k / 64))
         .zip(m_rows.par_iter_mut().zip(dm_rows.par_iter_mut()))
@@ -290,10 +376,14 @@ pub fn to_slot(ty: u32, raw: &[u8], rows: usize, k: usize, out: &mut [u8]) {
         .for_each_init(Block::new, |blk, (r, (((q, s), d), (m, dm)))| {
             for b in 0..nb {
                 decode(ty, &raw[(r * nb + b) * bb..][..bb], blk);
-                for (c, o) in blk.w.chunks_exact(32).zip(q[b * 128..].chunks_exact_mut(16)) {
-                    for j in 0..16 {
-                        o[j] = inv[c[j] as u8 as usize] | inv[c[j + 16] as u8 as usize] << 4;
+                if let Some(inv) = inv {
+                    for (c, o) in blk.w.chunks_exact(32).zip(q[b * 128..].chunks_exact_mut(16)) {
+                        for j in 0..16 {
+                            o[j] = inv[c[j] as u8 as usize] | inv[c[j + 16] as u8 as usize] << 4;
+                        }
                     }
+                } else {
+                    q[b * 256..][..256].copy_from_slice(bytemuck::cast_slice(&blk.w));
                 }
                 s[b * 16..b * 16 + 16].copy_from_slice(bytemuck::cast_slice(&blk.s));
                 d[b * 4..b * 4 + 4].copy_from_slice(&blk.d.to_le_bytes());
@@ -309,7 +399,7 @@ const IQ4_NL_VALUES: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13
 
 /// Can `dequantize` read it?
 pub fn can_dequantize(ty: u32) -> bool {
-    is_low_bit(ty) || matches!(ty, GGML_F32 | GGML_F16 | GGML_BF16 | GGML_Q8_0 | Q5_K | Q6_K | IQ4_NL)
+    is_low_bit(ty) || matches!(ty, GGML_F32 | GGML_F16 | GGML_BF16 | GGML_Q8_0 | GGML_MXFP4 | IQ4_NL)
 }
 
 /// Whole blocks to f32.
@@ -333,31 +423,13 @@ pub fn dequantize(ty: u32, b: &[u8], out: &mut [f32]) {
                 }
             }
         }
-        Q5_K => {
-            for (c, o) in b.chunks_exact(176).zip(out.chunks_exact_mut(256)) {
-                let (d, dm, s) = (half_at(c, 0), half_at(c, 2), &c[4..16]);
-                for (j, o) in o.chunks_exact_mut(32).enumerate() {
-                    let (sc, m) = if j < 4 {
-                        (s[j] & 63, s[j + 4] & 63)
-                    } else {
-                        (s[j + 4] & 15 | s[j - 4] >> 6 << 4, s[j + 4] >> 4 | s[j] >> 6 << 4)
-                    };
-                    let (a, off) = (d * sc as f32, dm * m as f32);
-                    for (l, o) in o.iter_mut().enumerate() {
-                        let q = c[48 + j / 2 * 32 + l] >> (4 * (j & 1)) & 15 | (c[16 + l] >> j & 1) << 4;
-                        *o = a * q as f32 - off;
-                    }
-                }
-            }
-        }
-        Q6_K => {
-            for (c, o) in b.chunks_exact(210).zip(out.chunks_exact_mut(256)) {
-                let d = half_at(c, 208);
-                for (i, o) in o.iter_mut().enumerate() {
-                    let (n, part, l) = (i / 128, i % 128 / 32, i % 32);
-                    let lo = c[n * 64 + l + 32 * (part & 1)] >> (4 * (part >> 1)) & 15;
-                    let hi = c[128 + n * 32 + l] >> (2 * part) & 3;
-                    *o = d * (c[192 + i / 16] as i8) as f32 * ((lo | hi << 4) as i32 - 32) as f32;
+        GGML_MXFP4 => {
+            const V: [f32; 16] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0];
+            for (c, o) in b.chunks_exact(17).zip(out.chunks_exact_mut(32)) {
+                let d = 2f32.powi(c[0] as i32 - 127);
+                for j in 0..16 {
+                    o[j] = d * V[(c[1 + j] & 15) as usize];
+                    o[j + 16] = d * V[(c[1 + j] >> 4) as usize];
                 }
             }
         }
@@ -394,12 +466,21 @@ pub fn random_blocks(ty: u32, n: usize, mut byte: impl FnMut() -> u8) -> Vec<u8>
     let at = match ty {
         Q2_K => 80,
         Q3_K => 108,
+        Q6_K => 208,
         _ => 0,
     };
     for (i, b) in out.chunks_exact_mut(bb).enumerate() {
-        b[at..at + 2].copy_from_slice(&f16::from_f32(0.001 * (1 + i % 7) as f32).to_le_bytes());
-        if ty == Q2_K {
-            b[82..84].copy_from_slice(&f16::from_f32(0.0015).to_le_bytes());
+        let d = f16::from_f32(0.001 * (1 + i % 7) as f32);
+        if ty == IQ1_M {
+            // spread over the top nibbles of four words
+            for j in 0..4 {
+                b[49 + 2 * j] = b[49 + 2 * j] & 15 | ((d.to_bits() >> (4 * j) & 15) as u8) << 4;
+            }
+            continue;
+        }
+        b[at..at + 2].copy_from_slice(&d.to_le_bytes());
+        if has_min(ty) {
+            b[at + 2..at + 4].copy_from_slice(&f16::from_f32(0.0015).to_le_bytes());
         }
     }
     out
@@ -427,7 +508,7 @@ mod tests {
     #[test]
     fn decoders_match_reference() {
         let v = vectors();
-        assert_eq!(v.len(), 11);
+        assert_eq!(v.len(), 14);
         for (ty, raw, want) in v {
             let mut got = vec![0f32; 512];
             dequantize(ty, raw, &mut got);
@@ -448,24 +529,35 @@ mod tests {
             (z >> 9) as u8
         };
         let (rows, k) = (3usize, 512usize);
-        for ty in [Q2_K, Q3_K, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S] {
+        for ty in LOW_BIT {
             let raw = random_blocks(ty, rows * k / 256, &mut byte);
             let mut want = vec![0f32; rows * k];
             dequantize(ty, &raw, &mut want);
             let mut slot = vec![0u8; slot_len(ty, rows, k)];
             to_slot(ty, &raw, rows, k, &mut slot);
             let (n, lut) = (rows * k, codes(ty).0);
+            let qn = if wide(ty) { n } else { n / 2 };
             let f = |o: usize| f32::from_le_bytes(slot[o..o + 4].try_into().unwrap());
             for (i, w) in want.iter().enumerate() {
                 let q = slot[i / 32 * 16 + i % 16] >> (if i % 32 < 16 { 0 } else { 4 }) & 15;
-                let mut g = lut[q as usize] as f32 * (slot[n / 2 + i / 16] as i8 as f32 * f(n / 2 + n / 16 + i / 256 * 4));
+                let v = if wide(ty) { slot[i] as i8 } else { lut[q as usize] };
+                let mut g = v as f32 * (slot[qn + i / 16] as i8 as f32 * f(qn + n / 16 + i / 256 * 4));
                 if has_min(ty) {
-                    let o = n / 2 + n / 16 + n / 64;
+                    let o = qn + n / 16 + n / 64;
                     g -= slot[o + i / 16] as f32 * f(o + n / 16 + i / 256 * 4);
                 }
                 assert_eq!(g, *w, "type {ty} at {i}");
             }
         }
+    }
+
+    #[test]
+    fn mxfp4_values() {
+        let mut b = [0u8; 17];
+        (b[0], b[1], b[2], b[16]) = (126, 0x71, 0xf2, 0x80);
+        let mut y = [0f32; 32];
+        dequantize(GGML_MXFP4, &b, &mut y);
+        assert_eq!((y[0], y[16], y[1], y[17], y[15], y[31]), (0.25, 3.0, 0.5, -3.0, 0.0, 0.0));
     }
 
     #[test]

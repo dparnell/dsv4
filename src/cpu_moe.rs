@@ -30,6 +30,8 @@ pub struct Q8x {
     d: Vec<f32>,
     /// -64 * (sum of each 4 values of q): undoes the +64 that makes weights unsigned for VNNI
     corr: Vec<i32>,
+    /// d * (sum of each 16 values of q), for formats with offsets
+    sum: Vec<f32>,
 }
 
 fn quant_x(x: &[f32], isa: Isa) -> Q8x {
@@ -55,7 +57,8 @@ fn quant_x(x: &[f32], isa: Isa) -> Q8x {
         Isa::AvxVnni | Isa::Avx512Vnni => q.chunks_exact(4).map(|c| -64 * c.iter().map(|&v| v as i32).sum::<i32>()).collect(),
         _ => Vec::new(),
     };
-    Q8x { q, d, corr }
+    let sum = q.chunks_exact(16).take(nb * 2).enumerate().map(|(g, c)| c.iter().map(|&v| v as i32).sum::<i32>() as f32 * d[g / 2]).collect();
+    Q8x { q, d, corr, sum }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -394,7 +397,8 @@ unsafe fn w8_avx2<const N: usize, const ACC: usize>(w: &[i8], s: &[f32], x: [&Q8
 unsafe fn w8_avxvnni<const N: usize, const ACC: usize>(w: &[i8], s: &[f32], x: [&Q8x; N]) -> [f32; N] {
     use std::arch::x86_64::*;
     unsafe {
-        let bias = _mm256_set1_epi8(64);
+        // w goes down to -127, so it takes +128, and twice the correction, to make it unsigned
+        let bias = _mm256_set1_epi8(-128);
         let mut acc = [[_mm256_setzero_ps(); ACC]; N];
         for b in 0..w.len() / 32 {
             let wv = _mm256_add_epi8(_mm256_loadu_si256(w.as_ptr().add(b * 32) as *const __m256i), bias);
@@ -402,7 +406,7 @@ unsafe fn w8_avxvnni<const N: usize, const ACC: usize>(w: &[i8], s: &[f32], x: [
             for t in 0..N {
                 let xv = _mm256_loadu_si256(x[t].q.as_ptr().add(b * 32) as *const __m256i);
                 let c = _mm256_loadu_si256(x[t].corr.as_ptr().add(b * 8) as *const __m256i);
-                let p32 = _mm256_dpbusd_avx_epi32(c, wv, xv);
+                let p32 = _mm256_dpbusd_avx_epi32(_mm256_slli_epi32(c, 1), wv, xv);
                 let scale = _mm256_mul_ps(ws, _mm256_set1_ps(*x[t].d.get_unchecked(b)));
                 let a = &mut acc[t][b % ACC];
                 *a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), scale, *a);
@@ -426,7 +430,7 @@ unsafe fn w8_avxvnni<const N: usize, const ACC: usize>(w: &[i8], s: &[f32], x: [
 unsafe fn w8_avx512<const N: usize, const ACC: usize>(w: &[i8], s: &[f32], x: [&Q8x; N]) -> [f32; N] {
     use std::arch::x86_64::*;
     unsafe {
-        let bias = _mm512_set1_epi8(64);
+        let bias = _mm512_set1_epi8(-128);
         let quad = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
         let pair = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
         let mut acc = [[_mm512_setzero_ps(); ACC]; N];
@@ -436,7 +440,7 @@ unsafe fn w8_avx512<const N: usize, const ACC: usize>(w: &[i8], s: &[f32], x: [&
             for t in 0..N {
                 let xv = _mm512_loadu_si512(x[t].q.as_ptr().add(i * 64) as *const __m512i);
                 let c = _mm512_loadu_si512(x[t].corr.as_ptr().add(i * 16) as *const __m512i);
-                let p32 = _mm512_dpbusd_epi32(c, wv, xv);
+                let p32 = _mm512_dpbusd_epi32(_mm512_slli_epi32(c, 1), wv, xv);
                 let xd = _mm_castpd_ps(_mm_load_sd(x[t].d.as_ptr().add(2 * i) as *const f64));
                 let scale = _mm512_mul_ps(ws, _mm512_permutexvar_ps(pair, _mm512_castps128_ps512(xd)));
                 let a = &mut acc[t][i % ACC];
@@ -523,9 +527,7 @@ impl Row {
             }
             if !self.m.is_empty() {
                 for (x, o) in xs.iter().zip(out) {
-                    for (g, (q, m)) in x.q.chunks_exact(16).zip(&self.m).enumerate() {
-                        *o -= q.iter().map(|&v| v as i32).sum::<i32>() as f32 * x.d[g / 2] * m;
-                    }
+                    *o -= x.sum.iter().zip(&self.m).map(|(s, m)| s * m).sum::<f32>();
                 }
             }
         }
@@ -880,7 +882,7 @@ mod tests {
             (z >> 9) as u8
         };
         let k = 1280;
-        for ty in [quants::Q2_K, quants::Q3_K, quants::IQ1_S, quants::IQ2_XXS, quants::IQ2_XS, quants::IQ2_S, quants::IQ3_XXS, quants::IQ3_S] {
+        for ty in quants::LOW_BIT {
             let raw = quants::random_blocks(ty, k / 256, &mut byte);
             let mut w = vec![0f32; k];
             quants::dequantize(ty, &raw, &mut w);

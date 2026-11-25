@@ -1192,18 +1192,8 @@ impl Model {
                 let slab = &self.experts.slabs[s.slab].buf;
                 let sb = slab.range(s.offset, geom.slot_bytes);
                 let tm = if cnt == 1 { 1 } else { 8 };
-                let gk = match (lut[0], tm) {
-                    (false, 1) => "moe_gate_up_1",
-                    (false, _) => "moe_gate_up_8",
-                    (true, 1) => "moe_gate_up_lut_1",
-                    (true, _) => "moe_gate_up_lut_8",
-                };
-                let dk = match (lut[2], tm) {
-                    (false, 1) => "moe_down_1",
-                    (false, _) => "moe_down_8",
-                    (true, 1) => "moe_down_lut_1",
-                    (true, _) => "moe_down_lut_8",
-                };
+                let n = (tm != 1) as usize;
+                let (gk, dk) = (crate::kernels::moe(types[0])[n], crate::kernels::moe(types[2])[2 + n]);
                 let mut gp = vec![geom.inter as u32, geom.dim as u32, cnt as u32, start as u32, f(cfg.swiglu_limit), up_word, cfg.dim as u32];
                 if lut[0] {
                     gp.extend(extra(types[0]));

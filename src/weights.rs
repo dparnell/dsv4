@@ -213,7 +213,17 @@ impl Layer {
             None
         };
         let engram = if cfg.engram_layers.contains(&l) {
-            Some(Engram { gate: f("engram_gate.weight")?, kv: q8("engram_kv.weight")? })
+            // some files keep the two factors of the gate: the weights of its key and query norms
+            let gate = if g.has(&n("engram_gate.weight")) {
+                f("engram_gate.weight")?
+            } else {
+                let mut v = read_f32(g, g.tensor(&n("engram_k.weight"))?)?;
+                for (v, q) in v.iter_mut().zip(read_f32(g, g.tensor(&n("engram_q.weight"))?)?) {
+                    *v *= q;
+                }
+                gpu.buffer_init("engram_gate", bytemuck::cast_slice(&v))
+            };
+            Some(Engram { gate, kv: q8("engram_kv.weight")? })
         } else {
             None
         };

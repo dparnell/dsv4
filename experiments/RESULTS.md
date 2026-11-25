@@ -136,6 +136,22 @@ Not run end to end: no low-bit model was downloaded.
 - Simulated from a 300-step routing trace, LRU, 38 GB of RAM, decode: GB read per token
   Q4_K_XL 1.21, IQ3_XXS 0.78, Q2_K_XL 0.58, IQ2_XXS 0.39, IQ1_M 0.27, IQ1_S 0.20.
 
+# Other quants and layouts
+
+Not run with real weights: only headers and a few blocks of these files were fetched.
+
+- Decoders vs the same tensors of UD-Q4_K_XL (first 2048 values): IQ1_M 0.84, IQ4_XS 0.997, Q4_K 0.998,
+  Q5_K 0.9994, Q6_K 0.9999 (cosine).
+- `engram_k * engram_q` of mrfakename, mxxm-t and antirez equals `engram_gate` exactly or to cosine 1.0;
+  per-layer Engram rows match (Q4_K 0.997, MXFP4 0.994, Q6_K 0.9999, antirez byte for byte once reordered).
+- Files of zeros with the real headers of 8 quants (mrfakename Q3_K_M and Q4_K_M, Adolphsson, antirez,
+  ISTA-DASLab, AtomicChat, mxxm-t, peasantsmith) give the same configuration as UD-Q4_K_XL, load, and
+  decode 3 tokens with CPU and with GPU experts.
+- UD-Q4_K_XL, gpu-only, 64 + 64 tokens: ppl 1.7131 before, after, and with its metadata rewritten to per-layer
+  Engram tables without source-layer lists.
+- CPU, 32 threads, 6 experts, ms per expert: MXFP4 0.50, Q4_K+Q6_K 0.64, Q4_K+IQ4_XS 0.61,
+  IQ1_M+IQ2_XS 0.47. Q3_K and Q2_K decode faster now: Q3_K+Q5_K 1.92 -> 0.53, IQ1_S+Q2_K 0.65 -> 0.36.
+
 # Time outside the experts
 
 Decode, Ryzen 9 9950X + RTX 5080, per token, from temporary timers and GPU timestamps:

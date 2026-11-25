@@ -73,16 +73,25 @@ Decode speed is bounded by how many expert bytes per token miss the faster tiers
 * the whole model's experts (289 GB) do not fit in RAM, so the steady-state speed depends on how skewed expert
   usage is for your workload; the TUI shows the hit rates per tier and per layer.
 
-### Smaller quants
+### Other quants
 
-Routed experts may also be IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, Q2_K or Q3_K (mixed per layer), and the
-other weights any type Unsloth's UD-IQ1_S to UD-Q3_K_XL use, so those quants are meant to load; they have not been
-run end to end yet. They need less disk and fit more experts in RAM, at a cost in quality (Basalt measured KLD 0.24
-against BF16 for UD-IQ2_XXS and 0.28 for UD-IQ1_M). `download --quant UD-IQ2_XXS`, then pass that folder as `--model`.
+Routed experts may be MXFP4, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, Q2_K, Q3_K, Q4_K, Q5_K or Q6_K
+(mixed per layer, gate and up alike). Other weights may be any of those, F32, F16, BF16, Q8_0 or IQ4_NL. That covers
+every quant in Unsloth's repo. Except for UD-Q4_K_XL they have **not been run with their real weights**; see
+[experiments/RESULTS.md](experiments/RESULTS.md) for what was checked. Low-bit ones need less disk and fit more experts
+in RAM, at a cost in quality (Basalt measured KLD 0.24 against BF16 for UD-IQ2_XXS and 0.28 for UD-IQ1_M).
+`download --quant UD-IQ2_XXS`, then pass that folder as `--model`.
 
 * RAM and packs hold the compact GGUF bytes; the CPU decodes rows as it multiplies them. In VRAM they become
-  4-bit codes plus scales (about 20 MB per expert), without further rounding.
-* Dense weights that are not Q8_0 are requantized to Q8_0 when loaded.
+  4-bit codes plus scales (about 20 MB per expert; Q5_K and Q6_K matrices take a byte per weight), without further
+  rounding. VRAM slots have the size of the largest expert.
+* Dense weights that are not Q8_0 are requantized to Q8_0 when loaded, so UD-Q8_K_XL (BF16) gains little over UD-Q4_K_XL.
+
+Other repos' files load too (`download --repo R --list`, `--quant` takes a folder or the end of a file name): Engram
+tables per layer or in a file of their own (put it next to the model, with `engram` in its name), and the tensor and
+key names of mrfakename, Adolphsson, peasantsmith, mxxm-t, ISTA-DASLab, AtomicChat and antirez (ds4). Files without a
+chat template use a built-in formatter. Not supported: ik_llama.cpp's types (IQ4_KS), plain Q4_0 or Q8_0 experts, and
+formats other than GGUF.
 
 ## Quick start
 
@@ -175,7 +184,7 @@ src/
   weights.rs     dense weight loading / repacking
   experts.rs     three-tier routed-expert store (VRAM slots, RAM LRU, NVMe)
   pack.rs        expert packs (`repack`)
-  quants.rs      decoders for ggml's low-bit formats
+  quants.rs      decoders for ggml's formats
   cpu_moe.rs     MXFP4 expert execution on the CPU (AVX2 / VNNI kernels)
   engram.rs      n-gram hashing and MXFP8 row gathers
   model.rs       the forward pass (layer-major segments, chunked attention, hybrid MoE)

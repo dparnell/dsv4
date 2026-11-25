@@ -46,7 +46,6 @@ pub struct Config {
     pub engram_heads: usize,
     pub engram_head_dim: usize,
     pub engram_multipliers: Vec<i64>,
-    pub engram_offsets: Vec<i64>,
     pub engram_primes: Vec<i64>,
     pub engram_pad_token: u32,
     pub engram_token_map: Vec<i64>,
@@ -58,58 +57,81 @@ impl Config {
         if a != "deepseek41" {
             bail!("unsupported architecture '{a}' (expected deepseek41)");
         }
-        let k = |s: &str| format!("deepseek41.{s}");
-        let u = |s: &str| g.u64(&k(s)).map(|v| v as usize);
-        let f = |s: &str| g.f64(&k(s)).map(|v| v as f32);
-        let arr = |s: &str| -> Result<Vec<usize>> { Ok(g.arr_i64(&k(s))?.into_iter().map(|v| v as usize).collect()) };
-        let n_layers = u("block_count")?;
+        // Converters disagree about key names. Aliases after the first: llama.cpp forks, then
+        // Hugging Face's names as ds4 keeps them.
+        let key = |names: &[&str]| -> String {
+            let full = |s: &&str| format!("deepseek41.{s}");
+            names.iter().map(full).find(|k| g.get(k).is_some()).unwrap_or_else(|| full(&names[0]))
+        };
+        let u = |names: &[&str]| g.u64(&key(names)).map(|v| v as usize);
+        let f = |names: &[&str]| g.f64(&key(names)).map(|v| v as f32);
+        let ints = |names: &[&str]| g.arr_i64(&key(names));
+        let arr = |names: &[&str]| -> Result<Vec<usize>> { Ok(ints(names)?.into_iter().map(|v| v as usize).collect()) };
+        let n_layers = u(&["block_count", "num_hidden_layers"])?;
         let vocab = g.get("tokenizer.ggml.tokens").and_then(|v| v.as_arr()).map(|a| a.len()).unwrap_or(129280);
-        let swiglu = g.arr_f64(&k("swiglu_clamp_exp")).ok().and_then(|v| v.first().copied()).unwrap_or(10.0) as f32;
-        let cand = g.u64(&k("attention.indexer.candidate_source_layer")).ok().map(|v| v as usize);
+        let swiglu = g.arr_f64(&key(&["swiglu_clamp_exp"])).ok().and_then(|v| v.first().copied()).map(|v| v as f32);
+        let swiglu = swiglu.or_else(|| f(&["swiglu_limit"]).ok()).unwrap_or(10.0);
+        // without the lists of source layers, those are the ones that have the weights
+        let with = |t: &str| (0..n_layers).filter(|l| g.has(&format!("blk.{l}.{t}.weight"))).collect::<Vec<_>>();
+        let listed = arr(&["attention.kv_source_layers", "attention.kv_source_layer_ids", "kv_source_layer_ids"]).ok();
+        let derived = listed.is_none();
+        let kv_source_layers = listed.unwrap_or_else(|| with("attn_compressor_kv"));
+        let index_source_layers = arr(&["attention.indexer.source_layers", "attention.index_source_layer_ids", "index_source_layer_ids"])
+            .unwrap_or_else(|_| with("indexer.attn_q_b"));
+        // files that lack those also lack the two-level search, which the model always has
+        let mut candidate_source = u(&["attention.indexer.candidate_source_layer", "attention.candidate_source_layer_id", "candidate_source_layer_id"]).ok();
+        let mut candidate_topk_blocks = u(&["attention.indexer.candidate_top_k_blocks", "attention.candidate_topk_blocks", "candidate_topk_blocks"]).unwrap_or(0);
+        let mut candidate_block = u(&["attention.indexer.candidate_block_size", "attention.candidate_block_size", "candidate_block_size"]).unwrap_or(1);
+        if derived && candidate_source.is_none() {
+            (candidate_source, candidate_topk_blocks, candidate_block) = (kv_source_layers.iter().copied().max(), 2048, 8);
+        }
+        let engram_layers = arr(&["ple.layers", "engram.layer_ids", "engram.layers"]).unwrap_or_default();
+        let int_list = |names: &[&str], tensor: &str| ints(names).ok().or_else(|| g.int_tensor(tensor)).unwrap_or_default();
+        let engram_primes = int_list(&["ple.head_vocab_sizes", "engram.primes"], "engram_primes.weight");
+        let (ngram, heads) = if engram_layers.is_empty() { (0, 0) } else { (4, 8) };
         Ok(Self {
             n_layers,
-            dim: u("embedding_length")?,
+            dim: u(&["embedding_length", "hidden_size"])?,
             vocab,
-            n_heads: u("attention.head_count")?,
-            head_dim: u("attention.key_length")?,
-            rope_dim: u("rope.dimension_count")?,
-            q_lora_rank: u("attention.q_lora_rank")?,
-            o_groups: u("attention.output_group_count")?,
-            o_lora_rank: u("attention.output_lora_rank")?,
-            window: u("attention.sliding_window")?,
-            n_experts: u("expert_count")?,
-            n_active: u("expert_used_count")?,
-            moe_inter: u("expert_feed_forward_length")?,
-            route_scale: f("expert_weights_scale").unwrap_or(1.5),
-            norm_eps: f("attention.layer_norm_rms_epsilon")?,
+            n_heads: u(&["attention.head_count", "num_attention_heads"])?,
+            head_dim: u(&["attention.key_length", "head_dim"])?,
+            rope_dim: u(&["rope.dimension_count", "qk_rope_head_dim"])?,
+            q_lora_rank: u(&["attention.q_lora_rank", "q_lora_rank"])?,
+            o_groups: u(&["attention.output_group_count", "o_groups"])?,
+            o_lora_rank: u(&["attention.output_lora_rank", "o_lora_rank"])?,
+            window: u(&["attention.sliding_window", "sliding_window"])?,
+            n_experts: u(&["expert_count", "n_routed_experts"])?,
+            n_active: u(&["expert_used_count", "num_experts_per_tok"])?,
+            moe_inter: u(&["expert_feed_forward_length", "moe_intermediate_size"])?,
+            route_scale: f(&["expert_weights_scale", "routed_scaling_factor"]).unwrap_or(1.5),
+            norm_eps: f(&["attention.layer_norm_rms_epsilon", "rms_norm_eps"])?,
             swiglu_limit: swiglu,
-            rope_theta: f("rope.freq_base")?,
-            compress_rope_theta: f("attention.compress_rope_freq_base")?,
-            rope_factor: f("rope.scaling.factor").unwrap_or(1.0),
-            rope_orig_ctx: u("rope.scaling.original_context_length").unwrap_or(0),
-            beta_fast: f("rope.scaling.yarn_beta_fast").unwrap_or(32.0),
-            beta_slow: f("rope.scaling.yarn_beta_slow").unwrap_or(1.0),
-            compress_ratios: arr("attention.compress_ratios")?,
-            kv_source_layers: arr("attention.kv_source_layers")?,
-            index_source_layers: arr("attention.indexer.source_layers")?,
-            index_heads: u("attention.indexer.head_count")?,
-            index_head_dim: u("attention.indexer.key_length")?,
-            index_topk: u("attention.indexer.top_k")?,
-            candidate_source: cand,
-            candidate_topk_blocks: u("attention.indexer.candidate_top_k_blocks").unwrap_or(0),
-            candidate_block: u("attention.indexer.candidate_block_size").unwrap_or(1),
-            hc_mult: u("hyper_connection.count")?,
-            hc_iters: u("hyper_connection.sinkhorn_iterations")?,
-            hc_eps: f("hyper_connection.epsilon")?,
-            engram_layers: arr("ple.layers").unwrap_or_default(),
-            engram_ngram: u("ple.ngram_size").unwrap_or(0),
-            engram_heads: u("ple.heads_per_ngram").unwrap_or(0),
-            engram_head_dim: u("embedding_length_per_layer_input").unwrap_or(0),
-            engram_multipliers: g.arr_i64(&k("ple.layer_multipliers")).unwrap_or_default(),
-            engram_offsets: g.arr_i64(&k("ple.head_offsets")).unwrap_or_default(),
-            engram_primes: g.arr_i64(&k("ple.head_vocab_sizes")).unwrap_or_default(),
-            engram_pad_token: u("engram.pad_token_id").unwrap_or(2) as u32,
-            engram_token_map: g.arr_i64(&k("engram.token_map")).unwrap_or_default(),
+            rope_theta: f(&["rope.freq_base", "rope_theta"])?,
+            compress_rope_theta: f(&["attention.compress_rope_freq_base", "compress_rope_theta"])?,
+            rope_factor: f(&["rope.scaling.factor", "rope_scaling.factor"]).unwrap_or(1.0),
+            rope_orig_ctx: f(&["rope.scaling.original_context_length", "rope_scaling.original_max_position_embeddings"]).unwrap_or(0.0) as usize,
+            beta_fast: f(&["rope.scaling.yarn_beta_fast", "rope_scaling.beta_fast"]).unwrap_or(32.0),
+            beta_slow: f(&["rope.scaling.yarn_beta_slow", "rope_scaling.beta_slow"]).unwrap_or(1.0),
+            compress_ratios: arr(&["attention.compress_ratios", "compress_ratios"])?,
+            kv_source_layers,
+            index_source_layers,
+            index_heads: u(&["attention.indexer.head_count", "index_n_heads"])?,
+            index_head_dim: u(&["attention.indexer.key_length", "index_head_dim"])?,
+            index_topk: u(&["attention.indexer.top_k", "index_topk"])?,
+            candidate_source,
+            candidate_topk_blocks,
+            candidate_block,
+            hc_mult: u(&["hyper_connection.count", "hc_mult"])?,
+            hc_iters: u(&["hyper_connection.sinkhorn_iterations", "hc_sinkhorn_iters"])?,
+            hc_eps: f(&["hyper_connection.epsilon", "hc_eps"])?,
+            engram_layers,
+            engram_ngram: u(&["ple.ngram_size", "engram.max_ngram_size"]).unwrap_or(ngram),
+            engram_heads: u(&["ple.heads_per_ngram", "engram.head_count", "engram.n_heads"]).unwrap_or(heads),
+            engram_head_dim: u(&["embedding_length_per_layer_input", "engram.key_length", "engram.head_dim"]).unwrap_or(if heads > 0 { 256 } else { 0 }),
+            engram_multipliers: int_list(&["ple.layer_multipliers", "engram.multipliers"], "engram_multipliers.weight"),
+            engram_primes,
+            engram_pad_token: u(&["engram.pad_token_id", "engram.pad_id"]).unwrap_or(2) as u32,
+            engram_token_map: int_list(&["engram.token_map"], "engram_token_map.weight"),
         })
     }
 

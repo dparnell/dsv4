@@ -160,7 +160,7 @@ struct GenArgs {
 enum Cmd {
     /// Download GGUF weights (and the tokenizer) from Hugging Face
     Download {
-        /// Quant folder in the repo
+        /// Quant: its folder in the repo, or the (end of the) name of its files
         #[arg(long, default_value = "UD-Q4_K_XL")]
         quant: String,
         /// Destination directory (set DSV4_MODELS_DIR to keep models elsewhere by default)

@@ -274,8 +274,8 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
 }
 "#;
 
-/// Low-bit (IQ1-IQ3, Q2_K, Q3_K) expert matrices, as laid out by `quants::to_slot`: 4-bit codes into
-/// the 16 int8 values of p8..p11, an int8 scale per 16 weights and a float per 256 (p7 != 0: also
+/// Expert matrices that are not MXFP4, as laid out by `quants::to_slot`: 4-bit codes into the 16 int8
+/// values of p8..p11 (`wide` ones: int8 values, see `lut`), an int8 scale per 16 weights and a float per 256 (p7 != 0: also
 /// a uint8 offset per 16 and its float per 256). K is a multiple of 256.
 const LUT_COMMON: &str = r#"
 var<private> KV4: array<f32, 16>;
@@ -295,7 +295,7 @@ fn hi4(w: u32) -> vec4<f32> {
 // scales of the two halves of block b (32 weights) in a row of the matrix at word `m`
 fn scales(m: u32, row: u32, b: u32) -> vec2<f32> {
   let n = P.p0 * P.p1;
-  let sb = m + n / 8u;
+  let sb = m + n / WPW;
   let i = row * (P.p1 / 16u) + b * 2u;
   let v = unpack4xI8(S[sb + (i >> 2u)]);
   let d = fbits(S[sb + n / 64u + row * (P.p1 / 256u) + (b >> 3u)]);
@@ -304,7 +304,7 @@ fn scales(m: u32, row: u32, b: u32) -> vec2<f32> {
 fn mins(m: u32, row: u32, b: u32) -> vec2<f32> {
   if (P.p7 == 0u) { return vec2<f32>(0.0); }
   let n = P.p0 * P.p1;
-  let mb = m + n / 8u + n / 64u + n / 256u;
+  let mb = m + n / WPW + n / 64u + n / 256u;
   let i = row * (P.p1 / 16u) + b * 2u;
   let v = unpack4xU8(S[mb + (i >> 2u)]);
   let d = fbits(S[mb + n / 64u + row * (P.p1 / 256u) + (b >> 3u)]);
@@ -341,10 +341,7 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
       var g: array<vec4<f32>, 8>;
       var u: array<vec4<f32>, 8>;
       for (var i = 0u; i < 4u; i++) {
-        let wg = S[s * 4u + i];
-        let wu = S[up + s * 4u + i];
-        g[i] = lo4(wg); g[i + 4u] = hi4(wg);
-        u[i] = lo4(wu); u[i + 4u] = hi4(wu);
+        FETCH
       }
       for (var t = 0u; t < TM; t++) {
         if (t0 + t < cnt) {
@@ -409,8 +406,7 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
       let mn = mins(base, row, b);
       var w: array<vec4<f32>, 8>;
       for (var i = 0u; i < 4u; i++) {
-        let ww = S[base + s * 4u + i];
-        w[i] = lo4(ww); w[i + 4u] = hi4(ww);
+        FETCH
       }
       for (var t = 0u; t < TM; t++) {
         if (t0 + t < cnt) {
@@ -1129,6 +1125,33 @@ fn k(body: &str) -> String {
     format!("{PRELUDE}\n{body}")
 }
 
+/// A `*_LUT` kernel: how it reads the weights (FETCH) and where the scales follow them (WPW,
+/// weights per word) depends on whether those are 4-bit codes or bytes.
+fn lut(body: &str, tm: &str, wide: bool) -> String {
+    let gate_up = body.contains("let up =");
+    let fetch = match (gate_up, wide) {
+        (true, false) => "let wg = S[s * 4u + i]; let wu = S[up + s * 4u + i];
+        g[i] = lo4(wg); g[i + 4u] = hi4(wg); u[i] = lo4(wu); u[i + 4u] = hi4(wu);",
+        (false, false) => "let ww = S[base + s * 4u + i]; w[i] = lo4(ww); w[i + 4u] = hi4(ww);",
+        (true, true) => "g[i] = vec4<f32>(unpack4xI8(S[s * 8u + i])); g[i + 4u] = vec4<f32>(unpack4xI8(S[s * 8u + i + 4u]));
+        u[i] = vec4<f32>(unpack4xI8(S[up + s * 8u + i])); u[i + 4u] = vec4<f32>(unpack4xI8(S[up + s * 8u + i + 4u]));",
+        (false, true) => "w[i] = vec4<f32>(unpack4xI8(S[base + s * 8u + i])); w[i + 4u] = vec4<f32>(unpack4xI8(S[base + s * 8u + i + 4u]));",
+    };
+    let src = format!("{LUT_COMMON}{body}").replace("FETCH", fetch).replace("WPW", if wide { "4u" } else { "8u" });
+    k(&src.replace("TM", tm))
+}
+
+/// The kernels for expert matrices of a type: gate and up, down; for one token and for up to eight.
+pub fn moe(ty: u32) -> [&'static str; 4] {
+    if ty == crate::gguf::GGML_MXFP4 {
+        ["moe_gate_up_1", "moe_gate_up_8", "moe_down_1", "moe_down_8"]
+    } else if crate::quants::wide(ty) {
+        ["moe_gate_up_wide_1", "moe_gate_up_wide_8", "moe_down_wide_1", "moe_down_wide_8"]
+    } else {
+        ["moe_gate_up_lut_1", "moe_gate_up_lut_8", "moe_down_lut_1", "moe_down_lut_8"]
+    }
+}
+
 pub fn all() -> Vec<(&'static str, String)> {
     let mut v = vec![
         ("mm_q8_1", k(&MM_Q8.replace("TM", "1u"))),
@@ -1139,10 +1162,14 @@ pub fn all() -> Vec<(&'static str, String)> {
         ("moe_gate_up_8", k(&format!("{MXFP4_COMMON}{}", MOE_GATE_UP.replace("TM", "8u")))),
         ("moe_down_1", k(&format!("{MXFP4_COMMON}{}", MOE_DOWN.replace("TM", "1u")))),
         ("moe_down_8", k(&format!("{MXFP4_COMMON}{}", MOE_DOWN.replace("TM", "8u")))),
-        ("moe_gate_up_lut_1", k(&format!("{LUT_COMMON}{}", MOE_GATE_UP_LUT.replace("TM", "1u")))),
-        ("moe_gate_up_lut_8", k(&format!("{LUT_COMMON}{}", MOE_GATE_UP_LUT.replace("TM", "8u")))),
-        ("moe_down_lut_1", k(&format!("{LUT_COMMON}{}", MOE_DOWN_LUT.replace("TM", "1u")))),
-        ("moe_down_lut_8", k(&format!("{LUT_COMMON}{}", MOE_DOWN_LUT.replace("TM", "8u")))),
+        ("moe_gate_up_lut_1", lut(MOE_GATE_UP_LUT, "1u", false)),
+        ("moe_gate_up_lut_8", lut(MOE_GATE_UP_LUT, "8u", false)),
+        ("moe_down_lut_1", lut(MOE_DOWN_LUT, "1u", false)),
+        ("moe_down_lut_8", lut(MOE_DOWN_LUT, "8u", false)),
+        ("moe_gate_up_wide_1", lut(MOE_GATE_UP_LUT, "1u", true)),
+        ("moe_gate_up_wide_8", lut(MOE_GATE_UP_LUT, "8u", true)),
+        ("moe_down_wide_1", lut(MOE_DOWN_LUT, "1u", true)),
+        ("moe_down_wide_8", lut(MOE_DOWN_LUT, "8u", true)),
         ("rmsnorm", k(RMSNORM)),
         ("rope", k(ROPE)),
         ("quant_sim", k(QUANT_SIM)),

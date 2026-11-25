@@ -12,6 +12,9 @@ use memmap2::Mmap;
 pub const GGML_F32: u32 = 0;
 pub const GGML_F16: u32 = 1;
 pub const GGML_Q8_0: u32 = 8;
+pub const GGML_I8: u32 = 24;
+pub const GGML_I32: u32 = 26;
+pub const GGML_I64: u32 = 27;
 pub const GGML_BF16: u32 = 30;
 pub const GGML_MXFP4: u32 = 39;
 pub const GGML_MXFP8: u32 = 43;
@@ -40,7 +43,12 @@ pub fn type_block(t: u32) -> Option<(u64, u64)> {
         20 => (32, 18),  // IQ4_NL
         21 => (256, 110), // IQ3_S
         22 => (256, 82), // IQ2_S
-        23 => (256, 136),
+        23 => (256, 136), // IQ4_XS
+        GGML_I8 => (1, 1),
+        25 => (1, 2), // I16
+        GGML_I32 => (1, 4),
+        GGML_I64 | 28 => (1, 8), // F64
+        29 => (256, 56), // IQ1_M
         _ => return None,
     })
 }
@@ -65,6 +73,11 @@ pub fn type_name(t: u32) -> &'static str {
         20 => "IQ4_NL",
         21 => "IQ3_S",
         22 => "IQ2_S",
+        23 => "IQ4_XS",
+        GGML_I8 => "I8",
+        GGML_I32 => "I32",
+        GGML_I64 => "I64",
+        29 => "IQ1_M",
         _ => "?",
     }
 }
@@ -232,15 +245,54 @@ pub fn shard_paths(first: &Path) -> Result<Vec<PathBuf>> {
                 })
                 .collect());
         }
-        for p in &paths {
-            if !p.exists() {
-                bail!("missing shard {}", p.display());
-            }
-        }
         return Ok(paths);
     }
     Ok(vec![first.to_path_buf()])
 }
+
+pub const ENGRAM_TABLE: &str = "per_layer_token_embd.weight";
+
+/// Converters name some tensors differently; this is the name used here.
+fn canonical(name: String) -> String {
+    const ALIASES: [(&str, &str); 6] = [
+        ("engram_wkv.weight", "engram_kv.weight"),
+        ("engram_embed.weight", "engram_embd.weight"),
+        ("engram_k_norm.weight", "engram_k.weight"),
+        ("engram_q_norm.weight", "engram_q.weight"),
+        ("indexer_compressor_kv.weight", "indexer.attn_k.weight"),
+        ("indexer_compressor_norm.weight", "indexer.k_norm.weight"),
+    ];
+    match ALIASES.iter().find_map(|(from, to)| Some(format!("{}.{to}", name.strip_suffix(from)?.strip_suffix('.')?))) {
+        Some(n) => n,
+        None => name,
+    }
+}
+
+/// Some repos keep the Engram table in a file of its own, often instead of one of the shards:
+/// `*engram*.gguf` next to the model or one level up, or any GGUF in a folder `engram*`.
+fn engram_file(first: &Path) -> Option<PathBuf> {
+    let named = |p: &Path| p.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().contains("engram"));
+    let list = |d: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        v.sort();
+        v
+    };
+    let gguf = |p: &PathBuf| p.is_file() && p.extension().is_some_and(|e| e == "gguf");
+    let dir = first.parent().unwrap_or(Path::new("."));
+    for d in [Some(dir), dir.parent()].into_iter().flatten() {
+        let entries = list(d);
+        if let Some(p) = entries.iter().find(|p| named(p) && gguf(p)) {
+            return Some(p.clone());
+        }
+        if let Some(p) = entries.iter().filter(|p| named(p) && p.is_dir()).flat_map(|p| list(p)).find(|p| gguf(p)) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Single GGUF files smaller than this are companions (vision towers, drafters), not the model.
+const WHOLE_MODEL: u64 = 20_000_000_000;
 
 /// Resolve a model argument: a directory containing a quant folder, a quant folder, or a gguf file.
 pub fn resolve_model_path(p: &Path) -> Result<PathBuf> {
@@ -253,7 +305,12 @@ pub fn resolve_model_path(p: &Path) -> Result<PathBuf> {
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for e in rd.flatten() {
                     let n = e.file_name().to_string_lossy().to_string();
-                    if n.ends_with("-00001-of-00009.gguf") || (n.ends_with(".gguf") && n.contains("00001-of-")) {
+                    if !n.ends_with(".gguf") {
+                        continue;
+                    }
+                    if n.contains("00001-of-") {
+                        found.push(e.path());
+                    } else if !n.contains("-of-") && !n.to_lowercase().contains("engram") && e.metadata().is_ok_and(|m| m.len() > WHOLE_MODEL) {
                         found.push(e.path());
                     }
                 }
@@ -261,8 +318,8 @@ pub fn resolve_model_path(p: &Path) -> Result<PathBuf> {
         }
         found.sort();
         if found.len() > 1 {
-            let names: Vec<_> = found.iter().filter_map(|f| f.parent()?.file_name()).map(|n| n.to_string_lossy()).collect();
-            tracing::warn!("several models in {} ({}): using the first; pass --model with the folder of another", p.display(), names.join(", "));
+            let names: Vec<_> = found.iter().map(|f| f.strip_prefix(p).unwrap_or(f).display().to_string()).collect();
+            tracing::warn!("several models in {} ({}): using the first; pass --model with the folder or first file of another", p.display(), names.join(", "));
         }
         if let Some(f) = found.into_iter().next() {
             return Ok(f);
@@ -273,7 +330,34 @@ pub fn resolve_model_path(p: &Path) -> Result<PathBuf> {
 
 impl Gguf {
     pub fn open(first: &Path) -> Result<Self> {
-        let paths = shard_paths(first)?;
+        let mut paths = shard_paths(first)?;
+        let gone = paths.iter().filter(|p| !p.exists()).count();
+        let mut engram = None;
+        if gone > 0 && !dev_partial() {
+            // one shard may be absent: the Engram table's, if that is a separate file
+            engram = engram_file(first).filter(|_| gone == 1);
+            if engram.is_some() {
+                paths.retain(|p| p.exists());
+            } else if let Some(p) = paths.iter().find(|p| !p.exists()) {
+                bail!("missing shard {}", p.display());
+            }
+        }
+        let mut g = Self::open_files(&paths)?;
+        let own_table = g.has(ENGRAM_TABLE) || g.tensors.keys().any(|n| n.ends_with(".engram_embd.weight"));
+        if own_table && engram.is_some() {
+            bail!("a shard of {} is missing", first.display());
+        }
+        if !own_table {
+            if let Some(p) = engram.or_else(|| engram_file(first)).filter(|p| !paths.contains(p)) {
+                tracing::info!("Engram table from {}", p.display());
+                paths.push(p);
+                g = Self::open_files(&paths)?;
+            }
+        }
+        Ok(g)
+    }
+
+    fn open_files(paths: &[PathBuf]) -> Result<Self> {
         let mut shards = Vec::new();
         let mut kv = HashMap::new();
         let mut tensors = HashMap::new();
@@ -309,7 +393,7 @@ impl Gguf {
                 }
                 let ty = c.u32()?;
                 let off = c.u64()?;
-                infos.push((name, dims, ty, off));
+                infos.push((canonical(name), dims, ty, off));
             }
             let data_start = (c.p as u64).div_ceil(alignment) * alignment;
             for (name, dims, ty, off) in infos {
@@ -367,6 +451,17 @@ impl Gguf {
             .with_context(|| format!("missing GGUF array {key}"))
     }
 
+    /// An integer tensor (some converters store arrays that way).
+    pub fn int_tensor(&self, name: &str) -> Option<Vec<i64>> {
+        let t = self.tensors.get(name)?;
+        let b = self.bytes(t);
+        match t.ty {
+            GGML_I32 => Some(b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64).collect()),
+            GGML_I64 => Some(b.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect()),
+            _ => None,
+        }
+    }
+
     pub fn arr_f64(&self, key: &str) -> Result<Vec<f64>> {
         self.get(key)
             .and_then(|v| v.as_arr())
@@ -380,5 +475,59 @@ impl Gguf {
 
     pub fn total_bytes(&self) -> u64 {
         self.shards.iter().map(|s| s.mmap.len() as u64).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A GGUF file with F32 tensors of two elements.
+    fn write(path: &Path, tensors: &[&str]) {
+        let mut b = Vec::new();
+        b.extend(0x4655_4747u32.to_le_bytes());
+        b.extend(3u32.to_le_bytes());
+        b.extend((tensors.len() as u64).to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        for (i, n) in tensors.iter().enumerate() {
+            b.extend((n.len() as u64).to_le_bytes());
+            b.extend(n.as_bytes());
+            b.extend(1u32.to_le_bytes());
+            b.extend(2u64.to_le_bytes());
+            b.extend(GGML_F32.to_le_bytes());
+            b.extend((i as u64 * 32).to_le_bytes());
+        }
+        b.resize(b.len().next_multiple_of(32) + tensors.len() * 32, 0);
+        std::fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn finds_engram_file_in_place_of_a_shard() {
+        let dir = std::env::temp_dir().join(format!("dsv4-gguf-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("q")).unwrap();
+        let shard = |i: usize| dir.join("q").join(format!("m-0000{i}-of-00003.gguf"));
+        write(&shard(1), &["blk.1.engram_wkv.weight", "a"]);
+        write(&shard(3), &["blk.2.indexer_compressor_norm.weight"]);
+        assert!(Gguf::open(&shard(1)).is_err());
+        write(&dir.join("M-Engram-IQ4_NL.gguf"), &[ENGRAM_TABLE]);
+        let g = Gguf::open(&shard(1)).unwrap();
+        for n in ["blk.1.engram_kv.weight", "a", "blk.2.indexer.k_norm.weight", ENGRAM_TABLE] {
+            assert!(g.has(n), "{n}");
+        }
+        assert_eq!(resolve_model_path(&dir).unwrap(), shard(1));
+        drop(g); // Windows does not overwrite mapped files
+        // it stands in for one shard only, and not if the others have a table
+        write(&shard(1), &["blk.1.engram_embd.weight"]);
+        assert!(Gguf::open(&shard(1)).is_err());
+        write(&shard(1), &["a"]);
+        std::fs::remove_file(shard(3)).unwrap();
+        assert!(Gguf::open(&shard(1)).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn canonical_names() {
+        assert_eq!(canonical("blk.1.engram_k_norm.weight".into()), "blk.1.engram_k.weight");
+        assert_eq!(canonical("blk.1.ffn_norm.weight".into()), "blk.1.ffn_norm.weight");
     }
 }

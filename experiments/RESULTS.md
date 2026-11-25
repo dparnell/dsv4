@@ -155,7 +155,13 @@ Decode, Ryzen 9 9950X + RTX 5080, per token, from temporary timers and GPU times
 # NUMA-local experts
 
 Rows of every expert divided among the nodes' memories by first touch; threads take rows of their
-own node first. Speed on a machine with several nodes: not measured yet.
+own node first.
+
+- Two Xeon E5-2699 v4 (AVX2), `bench-cpu`, 44 threads, ms per expert, without -> with: 1 expert
+  0.89 -> 0.62, 6 experts 0.40 -> 0.28, 6 experts x 4 tokens 0.59 -> 0.47; 22 threads: 0.68 -> 0.44,
+  0.40 -> 0.29, 0.71 -> 0.65. 99% of pages on the intended node (50% without).
+- That run's locked task queues may explain 1 expert on 44 threads (0.49 in an earlier run with
+  rayon's splitting); counters replaced them, no difference here, not measured there.
 
 - One node (9950X), `bench-cpu` before/after: the same within noise. Windows with `DSV4_NUMA=2` and
   `3` (pretended nodes) and Linux (WSL, one real node, 2 pretended): the same within noise.

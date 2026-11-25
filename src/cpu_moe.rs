@@ -5,7 +5,7 @@
 //! MXFP4 matrices use the same repacked layout as the GPU slots ([qs rows*nb*16][e8m0 rows*nb]);
 //! the low-bit formats are kept as they are in the GGUF and decoded row by row.
 
-use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -587,20 +587,20 @@ fn task_rows(rows: usize, threads: usize) -> usize {
 /// take those of their own node first, then help with the others'.
 fn run_tasks<T: Send>(nodes: usize, tasks: Vec<(usize, T)>, f: impl Fn(&mut Row, T) + Sync) {
     let threads = rayon::current_num_threads().min(tasks.len());
-    let mut queues: Vec<VecDeque<T>> = (0..nodes).map(|_| VecDeque::new()).collect();
+    // a counter hands out each queue; the locks around tasks are never contended
+    #[repr(align(128))]
+    struct Next(AtomicUsize);
+    let mut queues: Vec<(Next, Vec<Mutex<Option<T>>>)> = (0..nodes).map(|_| (Next(AtomicUsize::new(0)), Vec::new())).collect();
     for (n, t) in tasks {
-        queues[n].push_back(t);
+        queues[n].1.push(Mutex::new(Some(t)));
     }
-    let queues: Vec<Mutex<VecDeque<T>>> = queues.into_iter().map(Mutex::new).collect();
     (0..threads).into_par_iter().with_max_len(1).for_each(|_| {
         let mut buf = Row::default();
         let me = crate::cpu::node();
         for i in 0..nodes {
-            let take = || {
-                let mut q = queues[(me + i) % nodes].lock();
-                if i == 0 { q.pop_front() } else { q.pop_back() }
-            };
-            while let Some(t) = take() {
+            let (next, q) = &queues[(me + i) % nodes];
+            while let Some(t) = q.get(next.0.fetch_add(1, Ordering::Relaxed)) {
+                let t = t.lock().take().expect("handed out once");
                 f(&mut buf, t);
             }
         }

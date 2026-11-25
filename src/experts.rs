@@ -12,7 +12,8 @@
 //!
 //! An expert is gate|up|down matrices. MXFP4 ones are stored as [qs: rows*nb*16 bytes]
 //! [e8m0 scales: rows*nb bytes] (nb = K/32 blocks per row) in both tiers; low-bit ones keep their
-//! GGUF bytes in RAM and become 4-bit codes plus scales in VRAM (quants.rs).
+//! GGUF bytes in RAM; in VRAM those of 2 or 3 bits have them rearranged, and others become 4-bit
+//! codes plus scales (quants.rs).
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
@@ -288,6 +289,8 @@ pub struct ExpertStore {
     ram: Arc<Mutex<RamCache>>,
     heat: Arc<Mutex<Heat>>,
     pub slabs: Vec<Slab>,
+    /// `quants::grids`
+    pub grids: Buf,
     slots_per_slab: usize,
     vram: Mutex<VramState>,
     /// held while commands that reference expert slots are recorded and submitted, and while a
@@ -342,6 +345,9 @@ impl ExpertStore {
         let mean_host = layers.iter().map(|l| l.host_len() as f64).sum::<f64>() / layers.len() as f64;
         let geom = ExpertGeom { inter: cfg.moe_inter, dim: cfg.dim, layers, slot_bytes, mean_host };
 
+        for t in geom.layers.iter().flat_map(|l| l.types) {
+            crate::kernels::moe(t).into_iter().for_each(|k| gpu.prepare(k));
+        }
         let max_bind = gpu.max_binding().min(1 << 31);
         let slots_per_slab = ((max_bind / geom.slot_bytes) as usize).clamp(1, 64);
         let mut n_slots = (vram_bytes / geom.slot_bytes) as usize;
@@ -403,6 +409,7 @@ impl ExpertStore {
             ram,
             heat,
             slabs,
+            grids: gpu.buffer_init("grids", &quants::grids()),
             slots_per_slab,
             vram: Mutex::new(VramState {
                 pinned: vec![false; n_slots],

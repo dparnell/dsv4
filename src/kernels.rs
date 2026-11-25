@@ -312,6 +312,171 @@ fn mins(m: u32, row: u32, b: u32) -> vec2<f32> {
 }
 "#;
 
+/// What replaces LUT_COMMON for the `compact` formats (quants.rs): `oct` gives 8 weights of the
+/// group of 32 number s in the matrix at word m; WORDS, BYTES and FLOATS are its layout.
+const COMPACT_COMMON: &str = r#"
+fn init_lut() {}
+fn word(m: u32, s: u32, i: u32) -> u32 { return S[m + s * WORDS + i]; }
+fn tail(m: u32, s: u32) -> u32 {
+  let i = s * BYTES;
+  return S[m + P.p0 * P.p1 / 32u * WORDS + (i >> 2u)] >> ((i & 3u) * 8u);
+}
+fn float(m: u32, s: u32, i: u32) -> f32 {
+  let g = P.p0 * P.p1 / 32u;
+  return fbits(S[m + g * WORDS + g * BYTES / 4u + (s >> 3u) * FLOATS + i]);
+}
+fn odd2(a: u32, b: u32) -> vec2<f32> { return vec2<f32>(f32(2u * a + 1u), f32(2u * b + 1u)); }
+fn nib2(v: u32) -> vec2<f32> { return odd2(v & 15u, (v >> 4u) & 15u); }
+// the last of 8 signs makes the parity even
+fn even(v: u32) -> u32 { let b = v & 127u; return b | ((countOneBits(b) & 1u) << 7u); }
+fn int4(w: u32) -> vec4<f32> { return vec4<f32>(unpack4xI8(w)); }
+fn neg4(v: vec4<f32>, bits: u32) -> vec4<f32> {
+  return select(v, -v, (vec4<u32>(bits) & vec4<u32>(1u, 2u, 4u, 8u)) != vec4<u32>(0u));
+}
+fn eight(a: u32, b: u32, bits: u32) -> mat2x4<f32> {
+  return mat2x4<f32>(neg4(int4(G[GRID + a]), bits), neg4(int4(G[GRID + b]), bits >> 4u));
+}
+fn scales(m: u32, row: u32, b: u32) -> vec2<f32> {
+  let s = row * (P.p1 / 32u) + b;
+  return scale2(m, s) * float(m, s, 0u);
+}
+fn mins(m: u32, row: u32, b: u32) -> vec2<f32> {
+  let s = row * (P.p1 / 32u) + b;
+  return MINS;
+}
+"#;
+
+const COMPACT_Q2_K: &str = r#"
+fn scale2(m: u32, s: u32) -> vec2<f32> { let t = tail(m, s); return vec2<f32>(f32(t & 15u), f32((t >> 8u) & 15u)); }
+fn min2(m: u32, s: u32) -> vec2<f32> { let t = tail(m, s); return vec2<f32>(f32((t >> 4u) & 15u), f32((t >> 12u) & 15u)); }
+fn oct(m: u32, s: u32, l: u32) -> mat2x4<f32> {
+  let w = word(m, s, l >> 1u) >> ((l & 1u) * 16u);
+  let sh = vec4<u32>(0u, 2u, 4u, 6u);
+  let a = (vec4<u32>(w) >> sh) & vec4<u32>(3u);
+  let b = (vec4<u32>(w >> 8u) >> sh) & vec4<u32>(3u);
+  return mat2x4<f32>(vec4<f32>(a), vec4<f32>(b));
+}
+"#;
+
+const COMPACT_IQ2_XXS: &str = r#"
+fn scale2(m: u32, s: u32) -> vec2<f32> { let c = word(m, s, 1u) >> 28u; return odd2(c, c); }
+fn oct(m: u32, s: u32, l: u32) -> mat2x4<f32> {
+  let i = ((word(m, s, 0u) >> (l * 8u)) & 255u) * 2u;
+  return eight(i, i + 1u, even(word(m, s, 1u) >> (l * 7u)));
+}
+"#;
+
+const COMPACT_IQ2_XS: &str = r#"
+fn scale2(m: u32, s: u32) -> vec2<f32> { return nib2(tail(m, s)); }
+fn oct(m: u32, s: u32, l: u32) -> mat2x4<f32> {
+  let q = word(m, s, l >> 1u) >> ((l & 1u) * 16u);
+  let i = (q & 511u) * 2u;
+  return eight(i, i + 1u, even(q >> 9u));
+}
+"#;
+
+const COMPACT_IQ2_S: &str = r#"
+fn scale2(m: u32, s: u32) -> vec2<f32> { return nib2(tail(m, s) >> 8u); }
+fn oct(m: u32, s: u32, l: u32) -> mat2x4<f32> {
+  let hi = ((tail(m, s) >> (l * 2u)) & 3u) << 8u;
+  let i = (((word(m, s, 0u) >> (l * 8u)) & 255u) | hi) * 2u;
+  return eight(i, i + 1u, word(m, s, 1u) >> (l * 8u));
+}
+"#;
+
+const COMPACT_IQ3_XXS: &str = r#"
+fn scale2(m: u32, s: u32) -> vec2<f32> { let c = word(m, s, 2u) >> 28u; return odd2(c, c); }
+fn oct(m: u32, s: u32, l: u32) -> mat2x4<f32> {
+  let q = word(m, s, l >> 1u) >> ((l & 1u) * 16u);
+  return eight(q & 255u, (q >> 8u) & 255u, even(word(m, s, 2u) >> (l * 7u)));
+}
+"#;
+
+const COMPACT_IQ3_S: &str = r#"
+fn scale2(m: u32, s: u32) -> vec2<f32> { let c = (tail(m, s) >> 8u) & 15u; return odd2(c, c); }
+fn oct(m: u32, s: u32, l: u32) -> mat2x4<f32> {
+  let q = word(m, s, l >> 1u) >> ((l & 1u) * 16u);
+  let hi = tail(m, s) >> (l * 2u);
+  return eight((q & 255u) | ((hi & 1u) << 8u), ((q >> 8u) & 255u) | ((hi & 2u) << 7u), word(m, s, 2u) >> (l * 8u));
+}
+"#;
+
+const COMPACT_IQ1_S: &str = r#"
+fn scale2(m: u32, s: u32) -> vec2<f32> { let c = (tail(m, s) >> 12u) & 7u; return odd2(c, c); }
+fn oct(m: u32, s: u32, l: u32) -> mat2x4<f32> {
+  let q = tail(m, s);
+  let i = (((word(m, s, 0u) >> (l * 8u)) & 255u) | (((q >> (l * 3u)) & 7u) << 8u)) * 2u + ((q >> 15u) & 1u) * 4096u;
+  return mat2x4<f32>(int4(G[GRID + i]), int4(G[GRID + i + 1u]));
+}
+"#;
+
+const COMPACT_IQ1_M: &str = r#"
+fn scale2(m: u32, s: u32) -> vec2<f32> { let t = word(m, s, 1u) >> 16u; return odd2(t & 7u, (t >> 4u) & 7u); }
+fn oct(m: u32, s: u32, l: u32) -> mat2x4<f32> {
+  let h = word(m, s, 1u) >> (l * 4u);
+  let i = (((word(m, s, 0u) >> (l * 8u)) & 255u) | ((h & 7u) << 8u)) * 2u + ((h >> 3u) & 1u) * 4096u;
+  return mat2x4<f32>(int4(G[GRID + i]), int4(G[GRID + i + 1u]));
+}
+"#;
+
+/// The formats of the COMPACT kernels.
+const COMPACT: [(u32, &str, [&str; 4]); 8] = {
+    use crate::quants::*;
+    macro_rules! names {
+        ($t:literal) => {
+            [concat!("moe_gate_up_", $t, "_1"), concat!("moe_gate_up_", $t, "_8"), concat!("moe_down_", $t, "_1"), concat!("moe_down_", $t, "_8")]
+        };
+    }
+    [
+        (Q2_K, COMPACT_Q2_K, names!("q2_k")),
+        (IQ2_XXS, COMPACT_IQ2_XXS, names!("iq2_xxs")),
+        (IQ2_XS, COMPACT_IQ2_XS, names!("iq2_xs")),
+        (IQ2_S, COMPACT_IQ2_S, names!("iq2_s")),
+        (IQ3_XXS, COMPACT_IQ3_XXS, names!("iq3_xxs")),
+        (IQ3_S, COMPACT_IQ3_S, names!("iq3_s")),
+        (IQ1_S, COMPACT_IQ1_S, names!("iq1_s")),
+        (IQ1_M, COMPACT_IQ1_M, names!("iq1_m")),
+    ]
+};
+
+/// The compact kernels, built when first used: a model has a few of these formats at most.
+pub fn on_demand() -> Vec<(&'static str, String)> {
+    let mut v = Vec::new();
+    for (ty, oct, names) in COMPACT {
+        let c = crate::quants::compact(ty).unwrap();
+        for (i, name) in names.into_iter().enumerate() {
+            let (body, fetch) = if i < 2 {
+                (
+                    MOE_GATE_UP_LUT,
+                    "let og = oct(0u, s, i); let ou = oct(up, s, i);
+        g[2u * i] = og[0]; g[2u * i + 1u] = og[1]; u[2u * i] = ou[0]; u[2u * i + 1u] = ou[1];",
+                )
+            } else {
+                (MOE_DOWN_LUT, "let o = oct(base, s, i); w[2u * i] = o[0]; w[2u * i + 1u] = o[1];")
+            };
+            let bind = if c.grid.is_some() { "@group(0) @binding(4) var<storage, read> G: array<u32>;" } else { "" };
+            let mut common = COMPACT_COMMON.to_string();
+            if c.grid.is_none() {
+                // no grid, no signs
+                let a = common.find("fn eight").unwrap();
+                let b = common.find("fn scales").unwrap();
+                common.replace_range(a..b, "");
+            }
+            let src = format!("{bind}\n{common}{oct}{body}")
+                .replace("FETCH", fetch)
+                .replace("MINS", if crate::quants::has_min(ty) { "min2(m, s) * float(m, s, 1u)" } else { "vec2<f32>(0.0)" })
+                .replace("P.p7 != 0u", if crate::quants::has_min(ty) { "true" } else { "false" })
+                .replace("WORDS", &format!("{}u", c.words))
+                .replace("BYTES", &format!("{}u", c.bytes))
+                .replace("FLOATS", &format!("{}u", c.floats))
+                .replace("GRID", &format!("{}u", c.grid.unwrap_or(0)))
+                .replace("TM", if i % 2 == 0 { "1u" } else { "8u" });
+            v.push((name, k(&src)));
+        }
+    }
+    v
+}
+
 /// MOE_GATE_UP for low-bit matrices. Also p7=offsets p8..p11=values
 const MOE_GATE_UP_LUT: &str = r#"
 @group(0) @binding(0) var<storage, read> S: array<u32>;
@@ -1143,7 +1308,9 @@ fn lut(body: &str, tm: &str, wide: bool) -> String {
 
 /// The kernels for expert matrices of a type: gate and up, down; for one token and for up to eight.
 pub fn moe(ty: u32) -> [&'static str; 4] {
-    if ty == crate::gguf::GGML_MXFP4 {
+    if let Some(c) = COMPACT.iter().find(|c| c.0 == ty) {
+        c.2
+    } else if ty == crate::gguf::GGML_MXFP4 {
         ["moe_gate_up_1", "moe_gate_up_8", "moe_down_1", "moe_down_8"]
     } else if crate::quants::wide(ty) {
         ["moe_gate_up_wide_1", "moe_gate_up_wide_8", "moe_down_wide_1", "moe_down_wide_8"]

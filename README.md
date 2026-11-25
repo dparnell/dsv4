@@ -82,8 +82,9 @@ every quant in Unsloth's repo. Except for UD-Q4_K_XL they have **not been run wi
 in RAM, at a cost in quality (Basalt measured KLD 0.24 against BF16 for UD-IQ2_XXS and 0.28 for UD-IQ1_M).
 `download --quant UD-IQ2_XXS`, then pass that folder as `--model`.
 
-* RAM and packs hold the compact GGUF bytes; the CPU decodes rows as it multiplies them. In VRAM they become
-  4-bit codes plus scales (about 20 MB per expert; Q5_K and Q6_K matrices take a byte per weight), without further
+* RAM and packs hold the compact GGUF bytes; the CPU decodes rows as it multiplies them. In VRAM, IQ1_S to
+  IQ3_S and Q2_K take about what they take in the GGUF (UD-IQ2_XXS: 12.3 MB per slot, MXFP4: 18.8 MB), Q3_K, Q4_K and
+  IQ4_XS become 4-bit codes plus scales (about 20 MB), and Q5_K and Q6_K a byte per weight, all without further
   rounding. VRAM slots have the size of the largest expert.
 * Dense weights that are not Q8_0 are requantized to Q8_0 when loaded, so UD-Q8_K_XL (BF16) gains little over UD-Q4_K_XL.
 
@@ -138,6 +139,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/jso
 | `eval` | teacher-forced perplexity and speed on text files; `--save` / `--base` compare two configurations |
 | `repack` | copies the experts into one file (`experts.pack`, 289 GB for Q4_K_XL) with each expert contiguous, so a miss is one 19 MB read instead of three 6 MB ones; lossless, resumable, found by itself next to the model, `--expert-pack` elsewhere; `--layers N` for part of them |
 | `bench-io` | expert streaming throughput from disk |
+| `bench-gpu` | speed of routed experts on the GPU by type (no model needed) |
 | `bench-cpu` | speed of routed experts on the CPU by thread count (no model needed); `DSV4_CPU_ISA=avx2\|avxvnni\|avx512vnni` picks the kernel |
 
 Common model options: `--ctx` (context, default 32768), `--segment`, `--chunk`, `--expert-vram-gb`,

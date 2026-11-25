@@ -315,6 +315,17 @@ enum Cmd {
         #[arg(long, default_value_t = 0.0)]
         gap_ms: f64,
     },
+    /// Measure how fast routed experts run on the GPU (random weights, no model needed)
+    BenchGpu {
+        #[arg(long, default_value_t = 5120)]
+        dim: usize,
+        /// Hidden size of one expert
+        #[arg(long, default_value_t = 2304)]
+        inter: usize,
+        /// Types of the gate, up and down matrices, e.g. IQ2_XXS,IQ2_XXS,IQ2_S
+        #[arg(long, default_value = "MXFP4,MXFP4,MXFP4")]
+        types: String,
+    },
     /// Copy the experts into one file where each is contiguous, which drives read faster
     /// (lossless; takes as much space as the experts). An interrupted run resumes.
     Repack {
@@ -546,6 +557,18 @@ fn generate_to(engine: &engine::EngineHandle, prompt: Vec<u32>, p: SamplingParam
     out
 }
 
+/// The types of `--types a,b,c`.
+fn expert_types(types: &str) -> anyhow::Result<[u32; 3]> {
+    let mut t = [0u32; 3];
+    for (i, name) in types.split(',').enumerate().take(3) {
+        t[i] = (0..64).find(|&t| gguf::type_name(t).eq_ignore_ascii_case(name.trim())).filter(|&t| t == gguf::GGML_MXFP4 || quants::is_low_bit(t)).with_context(|| format!("{name}: not an expert type"))?;
+    }
+    if t.contains(&0) {
+        anyhow::bail!("--types takes three types");
+    }
+    Ok(t)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     cpu::init(cli.threads)?;
@@ -582,15 +605,10 @@ fn main() -> Result<()> {
             pack::repack(&g, &geoms, parts, layers.unwrap_or(cfg.n_layers), cfg.n_experts, &out.unwrap_or_else(|| pack::default_path(&first)))
         }
         Cmd::BenchCpu { dim, inter, types, gap_ms } => {
-            let mut t = [0u32; 3];
-            for (i, name) in types.split(',').enumerate().take(3) {
-                t[i] = (0..64).find(|&t| gguf::type_name(t).eq_ignore_ascii_case(name.trim())).filter(|&t| t == gguf::GGML_MXFP4 || quants::is_low_bit(t)).with_context(|| format!("{name}: not an expert type"))?;
-            }
-            if t.contains(&0) {
-                anyhow::bail!("--types takes three types");
-            }
+            let t = expert_types(&types)?;
             cpu_moe::bench(dim, inter, t, gap_ms, cli.cpu_spin)
         }
+        Cmd::BenchGpu { dim, inter, types } => selftest::bench_gpu(dim, inter, expert_types(&types)?),
         Cmd::Prompt { model, file, no_think } => {
             let first = gguf::resolve_model_path(&model)?;
             let g = gguf::Gguf::open(&first)?;

@@ -3,8 +3,9 @@
 //! The formats used for routed experts all have the form
 //!     weight = w * s * d  (- m * dm for Q2_K, Q4_K and Q5_K)
 //! with a small integer w, an integer s per 16 weights and a float d per 256. `decode` returns
-//! those parts; w takes at most 16 values in most formats, so on the GPU it is stored as 4-bit codes
-//! into a table (`codes`), except for the `wide` ones, which keep a byte. Nothing is rounded on the way.
+//! those parts. On the GPU, the formats of up to 3 bits that use grids, and Q2_K, keep their bits in
+//! another order (`compact`); in the others w is stored as 4-bit codes into a table (`codes`), or as
+//! a byte (`wide`). Nothing is rounded on the way.
 //!
 //! Formats, tables and bit layouts are ggml's (MIT, see data/NOTICE).
 
@@ -39,6 +40,139 @@ pub const LOW_BIT: [u32; 13] = [Q2_K, Q3_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S
 /// Does w take more values than 4-bit codes can tell apart?
 pub fn wide(ty: u32) -> bool {
     matches!(ty, Q5_K | Q6_K)
+}
+
+/// How a format whose VRAM form takes about as much as its GGUF form is laid out there: per 32
+/// weights `words` and `bytes`, per 256 `floats`; all words, then all bytes, then all floats.
+#[derive(Clone, Copy)]
+pub struct Compact {
+    pub words: usize,
+    pub bytes: usize,
+    pub floats: usize,
+    /// where the format's grid starts in `grids`, in words
+    pub grid: Option<usize>,
+}
+
+impl Compact {
+    fn len(&self, n: usize) -> usize {
+        n / 32 * (self.words * 4 + self.bytes) + n / 64 * self.floats
+    }
+}
+
+pub fn compact(ty: u32) -> Option<Compact> {
+    let c = |words, bytes, grid| Some(Compact { words, bytes, floats: 1, grid: Some(grid) });
+    match ty {
+        // 4 grid indices; signs and scale
+        IQ2_XXS => c(2, 0, 0),
+        // 4 (index, signs); scales
+        IQ2_XS => c(2, 1, 512),
+        // 4 indices; signs; high index bits, scales
+        IQ2_S => c(2, 2, 1536),
+        // 8 indices; signs and scale
+        IQ3_XXS => c(3, 0, 3584),
+        // 8 indices; signs; high index bits, scale
+        IQ3_S => c(3, 2, 3840),
+        // 4 indices; high index bits, scale, shift
+        IQ1_S => c(1, 2, 4352),
+        // 4 indices; high index bits and shifts, scales
+        IQ1_M => c(2, 0, 4352),
+        // 32 values; (scale, offset) per 16
+        Q2_K => Some(Compact { words: 2, bytes: 2, floats: 2, grid: None }),
+        _ => None,
+    }
+}
+
+/// The tables the kernels of the `compact` formats look weights up in, one int8 each.
+pub fn grids() -> Vec<u8> {
+    let t = tables();
+    let mut v: Vec<u8> = Vec::new();
+    for g in [&t.g2xxs, &t.g2xs, &t.g2s] {
+        v.extend_from_slice(bytemuck::cast_slice(g));
+    }
+    for g in [&t.g3xxs, &t.g3s] {
+        v.extend_from_slice(bytemuck::cast_slice(g));
+    }
+    for g in &t.g1 {
+        v.extend_from_slice(bytemuck::cast_slice(g));
+    }
+    v
+}
+
+/// `to_slot` for the `compact` formats.
+fn to_compact(ty: u32, c: Compact, raw: &[u8], out: &mut [u8]) {
+    use rayon::prelude::*;
+    let bb = crate::gguf::type_block(ty).unwrap().1 as usize;
+    let nb = raw.len() / bb;
+    let (wn, bn, fn_) = (c.words * 32, c.bytes * 8, c.floats * 4);
+    let (words, rest) = out.split_at_mut(nb * wn);
+    let (bytes, floats) = rest.split_at_mut(nb * bn);
+    const CHUNK: usize = 256;
+    // formats without a byte section get empty slices
+    let mut byte_parts: Vec<&mut [u8]> = if bn > 0 { bytes.chunks_mut(CHUNK * bn).collect() } else { (0..nb.div_ceil(CHUNK)).map(|_| Default::default()).collect() };
+    raw.par_chunks(CHUNK * bb)
+        .zip(words.par_chunks_mut(CHUNK * wn))
+        .zip(byte_parts.par_iter_mut())
+        .zip(floats.par_chunks_mut(CHUNK * fn_))
+        .for_each(|(((raw, words), bytes), floats)| {
+            for (j, b) in raw.chunks_exact(bb).enumerate() {
+                let w = &mut words[j * wn..][..wn];
+                let y = &mut bytes[j * bn..][..bn];
+                let f = &mut floats[j * fn_..][..fn_];
+                let mut d = half_at(b, 0) / 8.0;
+                match ty {
+                    IQ2_XXS => w.copy_from_slice(&b[2..66]),
+                    IQ2_XS => {
+                        w.copy_from_slice(&b[2..66]);
+                        y.copy_from_slice(&b[66..74]);
+                    }
+                    IQ2_S => {
+                        for i in 0..8 {
+                            w[8 * i..8 * i + 4].copy_from_slice(&b[2 + 4 * i..6 + 4 * i]);
+                            w[8 * i + 4..8 * i + 8].copy_from_slice(&b[34 + 4 * i..38 + 4 * i]);
+                            (y[2 * i], y[2 * i + 1]) = (b[66 + i], b[74 + i]);
+                        }
+                    }
+                    IQ3_XXS | IQ3_S => {
+                        let (signs, by) = if ty == IQ3_S { (74, 8.0) } else { (66, 2.0) };
+                        d *= by;
+                        for i in 0..8 {
+                            w[12 * i..12 * i + 8].copy_from_slice(&b[2 + 8 * i..10 + 8 * i]);
+                            w[12 * i + 8..12 * i + 12].copy_from_slice(&b[signs + 4 * i..signs + 4 + 4 * i]);
+                            if ty == IQ3_S {
+                                (y[2 * i], y[2 * i + 1]) = (b[66 + i], b[106 + i / 2] >> (4 * (i & 1)) & 15);
+                            }
+                        }
+                    }
+                    IQ1_S => {
+                        w.copy_from_slice(&b[2..34]);
+                        y.copy_from_slice(&b[34..50]);
+                    }
+                    IQ1_M => {
+                        let sc: [usize; 4] = std::array::from_fn(|i| u16::from_le_bytes([b[48 + 2 * i], b[49 + 2 * i]]) as usize);
+                        d = f16::from_bits((sc[0] >> 12 | sc[1] >> 8 & 0xf0 | sc[2] >> 4 & 0xf00 | sc[3] & 0xf000) as u16).to_f32() / 8.0;
+                        let s = |i: usize| (sc[i / 4] >> (3 * (i % 4)) & 7) as u8;
+                        for i in 0..8 {
+                            w[8 * i..8 * i + 4].copy_from_slice(&b[4 * i..4 * i + 4]);
+                            let tail = [b[32 + 2 * i], b[33 + 2 * i], s(2 * i) | s(2 * i + 1) << 4, 0];
+                            w[8 * i + 4..8 * i + 8].copy_from_slice(&tail);
+                        }
+                    }
+                    Q2_K => {
+                        d = half_at(b, 80);
+                        f[4..].copy_from_slice(&half_at(b, 82).to_le_bytes());
+                        y.copy_from_slice(&b[..16]);
+                        for i in 0..8 {
+                            let (q, sh) = (&b[16 + i / 4 * 32..][..32], 2 * (i % 4));
+                            for (o, q) in w[8 * i..8 * i + 8].iter_mut().zip(q.chunks_exact(4)) {
+                                *o = (0..4).fold(0, |v, k| v | (q[k] >> sh & 3) << (2 * k));
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                f[..4].copy_from_slice(&d.to_le_bytes());
+            }
+        });
 }
 
 /// Does the format have the `m * dm` offset?
@@ -519,18 +653,14 @@ mod x86 {
     }
 }
 
-/// The values w can take in a format that is not `wide`, as a 16-entry table, and the table entry of each value.
+/// The values w can take in a format that is neither `wide` nor `compact`, as a 16-entry table, and the table entry of each value.
 pub fn codes(ty: u32) -> (&'static [i8; 16], &'static [u8; 256]) {
-    static T: [OnceLock<([i8; 16], [u8; 256])>; 7] = [const { OnceLock::new() }; 7];
+    static T: [OnceLock<([i8; 16], [u8; 256])>; 3] = [const { OnceLock::new() }; 3];
     let (which, vals): (usize, &[i8]) = match ty {
-        IQ1_S | IQ1_M => (0, &[-9, -7, -1, 1, 7, 9]),
-        IQ2_XXS | IQ2_XS | IQ2_S => (1, &[8, 25, 43, -8, -25, -43]),
-        IQ3_S => (4, &[1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15]),
-        IQ3_XXS => (2, &[4, 12, 20, 28, 36, 44, 52, 62, -4, -12, -20, -28, -36, -44, -52, -62]),
-        IQ4_XS => (5, &IQ4_NL_VALUES),
-        Q4_K => (6, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
-        // Q3_K, Q2_K
-        _ => (3, &[-4, -3, -2, -1, 0, 1, 2, 3]),
+        IQ4_XS => (1, &IQ4_NL_VALUES),
+        Q4_K => (2, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+        // Q3_K
+        _ => (0, &[-4, -3, -2, -1, 0, 1, 2, 3]),
     };
     let (lut, inv) = T[which].get_or_init(|| {
         let (mut lut, mut inv) = ([0i8; 16], [0u8; 256]);
@@ -546,19 +676,25 @@ pub fn codes(ty: u32) -> (&'static [i8; 16], &'static [u8; 256]) {
 /// Bytes of a [rows][k] matrix in the form the GPU kernels read.
 pub fn slot_len(ty: u32, rows: usize, k: usize) -> usize {
     let n = rows * k;
+    if let Some(c) = compact(ty) {
+        return c.len(n);
+    }
     if ty == GGML_MXFP4 {
         return n / 2 + n / 32;
     }
     (if wide(ty) { n } else { n / 2 }) + n / 16 + n / 64 + if has_min(ty) { n / 16 + n / 64 } else { 0 }
 }
 
-/// Convert a low-bit matrix to the form of the `*_lut` kernels (`*_wide` ones: an int8 per weight, in order):
+/// Convert a low-bit matrix to the form of its kernels. `compact` ones: see there. Others, for the `*_lut` kernels (`*_wide` ones: an int8 per weight, in order):
 /// [4-bit codes: of 32 weights the first 16 in the low nibbles][s: i8][d: f32] (`has_min`: [m: u8][dm: f32])
 pub fn to_slot(ty: u32, raw: &[u8], rows: usize, k: usize, out: &mut [u8]) {
     use rayon::prelude::*;
     let (be, bb) = crate::gguf::type_block(ty).unwrap();
     let (nb, bb) = (k / be as usize, bb as usize);
     assert!(be == 256 && k % 256 == 0 && raw.len() == rows * nb * bb && out.len() == slot_len(ty, rows, k));
+    if let Some(c) = compact(ty) {
+        return to_compact(ty, c, raw, out);
+    }
     let n = rows * k;
     let (qk, inv) = if wide(ty) { (k, None) } else { (k / 2, Some(codes(ty).1)) };
     let (q, rest) = out.split_at_mut(rows * qk);
@@ -754,7 +890,7 @@ mod tests {
             (z >> 9) as u8
         };
         let (rows, k) = (3usize, 512usize);
-        for ty in LOW_BIT {
+        for ty in LOW_BIT.into_iter().filter(|&t| compact(t).is_none()) {
             let raw = random_blocks(ty, rows * k / 256, &mut byte);
             let mut want = vec![0f32; rows * k];
             dequantize(ty, &raw, &mut want);
@@ -772,6 +908,43 @@ mod tests {
                     g -= slot[o + i / 16] as f32 * f(o + n / 16 + i / 256 * 4);
                 }
                 assert_eq!(g, *w, "type {ty} at {i}");
+            }
+        }
+    }
+
+    /// The kernels' side of `to_compact`; they are checked against `dequantize` by the selftest.
+    #[test]
+    fn compact_sizes() {
+        let g = grids();
+        assert_eq!(g.len(), (4352 + 2 * 4096) * 4);
+        let per_256: Vec<usize> = LOW_BIT.iter().filter_map(|&t| compact(t)).map(|c| c.len(256)).collect();
+        assert_eq!(per_256, [88, 52, 68, 68, 76, 84, 100, 116]);
+        // every weight's bits survive: all blocks that differ stay different
+        let mut z = 3u64;
+        let mut byte = || {
+            z ^= z << 13;
+            z ^= z >> 7;
+            z ^= z << 17;
+            (z >> 9) as u8
+        };
+        for ty in LOW_BIT.into_iter().filter(|&t| compact(t).is_some()) {
+            let raw = random_blocks(ty, 1, &mut byte);
+            let slot = |raw: &[u8]| {
+                let mut o = vec![0u8; slot_len(ty, 1, 256)];
+                to_slot(ty, raw, 1, 256, &mut o);
+                o
+            };
+            let mut a = vec![0f32; 256];
+            dequantize(ty, &raw, &mut a);
+            let base = slot(&raw);
+            for i in 0..raw.len() * 8 {
+                let mut r = raw.clone();
+                r[i / 8] ^= 1 << (i % 8);
+                let mut b = vec![0f32; 256];
+                dequantize(ty, &r, &mut b);
+                if a.iter().zip(&b).any(|(a, b)| a.to_bits() != b.to_bits()) {
+                    assert!(slot(&r) != base, "type {ty}: bit {i} is lost");
+                }
             }
         }
     }

@@ -2,7 +2,7 @@
 //! a bind-group cache and a command batch that records dispatches with immediates.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
@@ -46,12 +46,18 @@ impl<'a> From<&'a Buf> for B<'a> {
     }
 }
 
+struct Kernel {
+    id: u64,
+    src: String,
+    pipe: OnceLock<wgpu::ComputePipeline>,
+}
+
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
     pub limits: wgpu::Limits,
-    pipelines: HashMap<&'static str, (u64, wgpu::ComputePipeline)>,
+    pipelines: HashMap<&'static str, Kernel>,
     bg_cache: Mutex<HashMap<(u64, Vec<(u64, u64, u64)>), wgpu::BindGroup>>,
     next_id: AtomicU64,
     pub gpu_bytes: Arc<AtomicU64>,
@@ -139,23 +145,36 @@ impl Gpu {
     }
 
     fn build_pipelines(&mut self) -> Result<()> {
-        for (name, src) in crate::kernels::all() {
+        for (name, src) in crate::kernels::all().into_iter().chain(crate::kernels::on_demand()) {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            self.pipelines.insert(name, Kernel { id, src, pipe: OnceLock::new() });
+        }
+        crate::kernels::all().iter().for_each(|k| self.prepare(k.0));
+        Ok(())
+    }
+
+    /// Build a kernel now rather than when it is first run.
+    pub fn prepare(&self, kernel: &'static str) {
+        self.pipeline(kernel);
+    }
+
+    fn pipeline(&self, name: &'static str) -> (u64, &wgpu::ComputePipeline) {
+        let k = &self.pipelines[name];
+        let pipe = k.pipe.get_or_init(|| {
             let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(name),
-                source: wgpu::ShaderSource::Wgsl(src.into()),
+                source: wgpu::ShaderSource::Wgsl(k.src.as_str().into()),
             });
-            let p = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(name),
                 layout: None,
                 module: &module,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
-            });
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            self.pipelines.insert(name, (id, p));
-        }
-        Ok(())
+            })
+        });
+        (k.id, pipe)
     }
 
     pub fn buffer(&self, label: &str, size: u64) -> Buf {
@@ -201,8 +220,8 @@ impl Gpu {
     }
 
     pub fn bind_group(&self, kernel: &'static str, entries: &[B<'_>]) -> wgpu::BindGroup {
-        let (pid, pipe) = &self.pipelines[kernel];
-        let key = (*pid, entries.iter().map(|e| (e.buf.id, e.offset, e.size)).collect::<Vec<_>>());
+        let (pid, pipe) = self.pipeline(kernel);
+        let key = (pid, entries.iter().map(|e| (e.buf.id, e.offset, e.size)).collect::<Vec<_>>());
         if let Some(bg) = self.bg_cache.lock().get(&key) {
             return bg.clone();
         }
@@ -314,7 +333,7 @@ impl<'g> Batch<'g> {
         let max = self.gpu.limits.max_compute_workgroups_per_dimension;
         assert!(groups.0 <= max && groups.1 <= max && groups.2 <= max, "{kernel}: dispatch {groups:?} too large");
         let bg = self.gpu.bind_group(kernel, bufs);
-        let pipe = &self.gpu.pipelines[kernel].1;
+        let pipe = self.gpu.pipeline(kernel).1;
         assert!(params.len() <= 16);
         let mut imm = [0u32; 16];
         imm[..params.len()].copy_from_slice(params);

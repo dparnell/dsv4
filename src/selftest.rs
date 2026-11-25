@@ -227,6 +227,10 @@ pub fn run() -> Result<()> {
         use crate::quants as q;
         let (inter, dim) = (256usize, 512usize);
         for (ty, dn, name) in [
+            (q::IQ2_XS, q::IQ2_XXS, "iq2_xs/xxs"),
+            (q::IQ3_XXS, q::IQ2_S, "iq3_xxs/iq2_s"),
+            (q::IQ3_S, q::Q3_K, "iq3_s/q3_k"),
+            (q::IQ1_M, q::IQ1_M, "iq1_m/iq1_m"),
             (q::IQ1_S, q::Q2_K, "iq1_s/q2_k"),
             (q::IQ2_XXS, q::IQ2_XS, "iq2_xxs/xs"),
             (q::IQ2_S, q::IQ3_XXS, "iq2_s/iq3_xxs"),
@@ -270,6 +274,14 @@ pub fn run() -> Result<()> {
                     .collect();
                 want.extend((0..dim).map(|n| (0..inter).map(|i| deq[2][n * inter + i] * h[i]).sum::<f32>()));
             }
+            let grids = gpu.buffer_init("grids", &q::grids());
+            fn binds<'a>(t: u32, b: [&'a crate::gpu::Buf; 4], grids: &'a crate::gpu::Buf) -> Vec<crate::gpu::B<'a>> {
+                let mut v: Vec<_> = b.into_iter().map(|b| b.all()).collect();
+                if crate::quants::compact(t).is_some_and(|c| c.grid.is_some()) {
+                    v.push(grids.all());
+                }
+                v
+            }
             let lutp = |t: u32| -> Vec<u32> {
                 let l: &[u32; 4] = bytemuck::cast_ref(q::codes(t).0);
                 vec![q::has_min(t) as u32, l[0], l[1], l[2], l[3]]
@@ -280,18 +292,18 @@ pub fn run() -> Result<()> {
             let mut b = gpu.begin();
             let mut gp = vec![inter as u32, dim as u32, 3, 0, bits(lim), (sl[0] / 4) as u32, dim as u32];
             gp.extend(lutp(ty));
-            b.run(crate::kernels::moe(ty)[1], &[sb.all(), xb.all(), rb.all(), hb.all()], &gp, ((inter as u32).div_ceil(8), 1, 1));
+            b.run(crate::kernels::moe(ty)[1], &binds(ty, [&sb, &xb, &rb, &hb], &grids), &gp, ((inter as u32).div_ceil(8), 1, 1));
             let mut dp = vec![dim as u32, inter as u32, 3, 0, 0, ((sl[0] + sl[1]) / 4) as u32, 0];
             dp.extend(lutp(dn));
-            b.run(crate::kernels::moe(dn)[3], &[sb.all(), hb.all(), rb.all(), ob.all()], &dp, ((dim as u32).div_ceil(8), 1, 1));
+            b.run(crate::kernels::moe(dn)[3], &binds(dn, [&sb, &hb, &rb, &ob], &grids), &dp, ((dim as u32).div_ceil(8), 1, 1));
             let got = gpu.read_f32(b, &ob, 0, toks * dim);
             let range = want.iter().fold(0f32, |a, v| a.max(v.abs()));
             let worst = |got: &[f32]| got.iter().zip(&want).fold(0f32, |a, (g, w)| a.max((g - w).abs())) / range;
             // and one token through the single-token kernels
             let mut b = gpu.begin();
             (gp[2], dp[2]) = (1, 1);
-            b.run(crate::kernels::moe(ty)[0], &[sb.all(), xb.all(), rb.all(), hb.all()], &gp, ((inter as u32).div_ceil(8), 1, 1));
-            b.run(crate::kernels::moe(dn)[2], &[sb.all(), hb.all(), rb.all(), ob.all()], &dp, ((dim as u32).div_ceil(8), 1, 1));
+            b.run(crate::kernels::moe(ty)[0], &binds(ty, [&sb, &xb, &rb, &hb], &grids), &gp, ((inter as u32).div_ceil(8), 1, 1));
+            b.run(crate::kernels::moe(dn)[2], &binds(dn, [&sb, &hb, &rb, &ob], &grids), &dp, ((dim as u32).div_ceil(8), 1, 1));
             let got1 = gpu.read_f32(b, &ob, 0, toks * dim);
             let (e8, e1) = (worst(&got), worst(&got1));
             let ok = e8 < 1e-4 && e1 < 1e-4 && range > 0.0;
@@ -692,5 +704,70 @@ pub fn run() -> Result<()> {
     if !all {
         anyhow::bail!("selftest failed");
     }
+    Ok(())
+}
+
+/// Time experts of one token on the GPU, from random weights already in VRAM.
+pub fn bench_gpu(dim: usize, inter: usize, types: [u32; 3]) -> Result<()> {
+    use crate::quants as q;
+    let stats: std::sync::Arc<crate::stats::Stats> = Default::default();
+    let gpu = Gpu::new(stats, None)?;
+    let mut z = 0x9E37_79B9u64;
+    let mut byte = || {
+        z ^= z << 13;
+        z ^= z >> 7;
+        z ^= z << 17;
+        (z >> 9) as u8
+    };
+    let mut host = Vec::new();
+    let mut lens = [0usize; 3];
+    for (i, &t) in types.iter().enumerate() {
+        let raw = if t == crate::gguf::GGML_MXFP4 {
+            (0..dim * inter / 32 * 17).map(|k| if k >= dim * inter / 2 { 114 + byte() % 6 } else { byte() }).collect()
+        } else {
+            q::random_blocks(t, dim * inter / 256, &mut byte)
+        };
+        lens[i] = raw.len();
+        host.extend(raw);
+    }
+    let geom = crate::experts::LayerGeom { types, host: lens };
+    let slot = geom.slot_data(inter, dim, &host);
+    let sl = geom.slot_lens(inter, dim);
+    // more than any cache holds
+    let slots: Vec<_> = (0..24).map(|_| gpu.buffer_init("slot", &slot)).collect();
+    let grids = gpu.buffer_init("grids", &q::grids());
+    let x: Vec<f32> = (0..dim).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
+    let xb = gpu.buffer_init("x", bytemuck::cast_slice(&x));
+    let (hb, ob) = (gpu.buffer("h", (inter * 4) as u64), gpu.buffer("o", (dim * 4) as u64));
+    let rb = gpu.buffer_init("route", bytemuck::cast_slice(&[0u32, 0, 1f32.to_bits()]));
+    let extra = |t: u32| -> [u32; 5] {
+        let l: &[u32; 4] = bytemuck::cast_ref(q::codes(t).0);
+        [q::has_min(t) as u32, l[0], l[1], l[2], l[3]]
+    };
+    let mut gp = vec![inter as u32, dim as u32, 1, 0, 10f32.to_bits(), (sl[0] / 4) as u32, dim as u32];
+    gp.extend(extra(types[0]));
+    let mut dp = vec![dim as u32, inter as u32, 1, 0, 0, ((sl[0] + sl[1]) / 4) as u32, 0];
+    dp.extend(extra(types[2]));
+    let (gk, dk) = (crate::kernels::moe(types[0])[0], crate::kernels::moe(types[2])[2]);
+    let pass = || {
+        let mut b = gpu.begin();
+        for s in &slots {
+            let mut gb = vec![s.all(), xb.all(), rb.all(), hb.all()];
+            let mut db = vec![s.all(), hb.all(), rb.all(), ob.all()];
+            for (v, t) in [(&mut gb, types[0]), (&mut db, types[2])] {
+                if q::compact(t).is_some_and(|c| c.grid.is_some()) {
+                    v.push(grids.all());
+                }
+            }
+            b.run(gk, &gb, &gp, ((inter as u32).div_ceil(8), 1, 1));
+            b.run(dk, &db, &dp, ((dim as u32).div_ceil(8), 1, 1));
+        }
+        let t0 = std::time::Instant::now();
+        gpu.read_f32(b, &ob, 0, 1);
+        t0.elapsed().as_secs_f64() * 1e3 / slots.len() as f64
+    };
+    let best = |n: usize| (0..n).map(|_| pass()).fold(f64::MAX, f64::min);
+    best(5);
+    println!("{}: expert {:.1} MB, VRAM slot {:.1} MB, {:.3} ms", gpu.info.name, host.len() as f64 / 1e6, sl.iter().sum::<usize>() as f64 / 1e6, best(60));
     Ok(())
 }

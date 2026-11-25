@@ -229,3 +229,15 @@ UD-IQ2_XXS on the two Xeons above (RTX 4070 Ti SUPER; a user's run, sampled, rep
   IQ1_S+Q2_K 3.9 / 0.50 -> 2.9 / 0.32, IQ1_M+IQ2_XS 5.2 / 0.68 -> 4.4 / 0.54, Q3_K+Q5_K 4.5 / 0.59 ->
   2.9 / 0.56, Q4_K+Q6_K 4.0 / 0.66 -> 2.3 / 0.62. MXFP4 (1.0 / 0.53) does not use them.
 - Not yet run on the Xeons or with a real low-bit model.
+
+# 2-bit experts in VRAM at their own size
+
+IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and Q2_K keep their bits in VRAM slots (before: 4-bit codes).
+
+- Slot (largest expert) of UD-IQ2_XXS, from its headers: 21.4 -> 12.3 MB, so in 6.09 GB 285 -> about 495 slots.
+- `bench-gpu`, RTX 5080, ms per expert of one token: MXFP4 0.17, 4-bit codes (Q3_K, what the 2-bit types used before)
+  0.069, IQ2_XXS 0.055, IQ2_XS 0.058, IQ2_S 0.061, IQ3_S 0.060, IQ1_S 0.062, IQ1_M 0.065, Q2_K 0.055.
+- Selftest: every type as gate/up and as down, one and eight tokens, within 1e-6 of the output range.
+- UD-Q4_K_XL, gpu-only, 64 + 64 tokens, before and after: logits identical byte for byte (ppl 5.3016 on this text).
+- Files of zeros with the real headers of antirez IQ2_XXS/Q2_K and ISTA-DASLab IQ2_XXS load and decode with GPU and
+  CPU experts (10.6 and 10.4 MB slots). Not run with real 2-bit weights.

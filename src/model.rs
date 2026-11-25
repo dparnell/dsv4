@@ -1203,15 +1203,22 @@ impl Model {
                     dp.push(0);
                     dp.extend(extra(types[2]));
                 }
+                let mut gb = vec![sb, a.xnf.all(), a.route.all(), a.hmid.all()];
+                let mut db = vec![sb, a.hmid.all(), a.route.all(), a.o6.all()];
+                for (b, t) in [(&mut gb, types[0]), (&mut db, types[2])] {
+                    if crate::quants::compact(t).is_some_and(|c| c.grid.is_some()) {
+                        b.push(self.experts.grids.all());
+                    }
+                }
                 b.run(
                     gk,
-                    &[sb, a.xnf.all(), a.route.all(), a.hmid.all()],
+                    &gb,
                     &gp,
                     ((geom.inter as u32).div_ceil(8), (cnt as u32).div_ceil(tm), 1),
                 );
                 b.run(
                     dk,
-                    &[sb, a.hmid.all(), a.route.all(), a.o6.all()],
+                    &db,
                     &dp,
                     ((geom.dim as u32).div_ceil(8), (cnt as u32).div_ceil(tm), 1),
                 );

@@ -157,12 +157,17 @@ Decode, Ryzen 9 9950X + RTX 5080, per token, from temporary timers and GPU times
 Rows of every expert divided among the nodes' memories by first touch; threads take rows of their
 own node first.
 
-- Two Xeon E5-2699 v4 (AVX2), `bench-cpu`, 44 threads, ms per expert, without -> with: 1 expert
-  0.89 -> 0.62, 6 experts 0.40 -> 0.28, 6 experts x 4 tokens 0.59 -> 0.47; 22 threads: 0.68 -> 0.44,
-  0.40 -> 0.29, 0.71 -> 0.65. 99% of pages on the intended node (50% without).
-- That run's locked task queues may explain 1 expert on 44 threads (0.49 in an earlier run with
-  rayon's splitting); counters replaced them, no difference here, not measured there.
-
+- Two Xeon E5-2699 v4 (AVX2, Windows 10), `bench-cpu`, both sockets, ms per expert (two runs),
+  unplaced -> NUMA-local; 99% of pages on the intended node (50% unplaced):
+  - 22 threads: 1 expert 0.68 -> 0.44-0.45, 6 experts 0.39 -> 0.28-0.29, 6 x 4 tokens 0.72 -> 0.65-0.69
+  - 44 threads: 1 expert 0.45-0.46 -> 0.33-0.34, 6 experts 0.37-0.38 -> 0.27-0.28,
+    6 x 4 tokens 0.59-0.60 -> 0.48 (bandwidth 6 experts: 50 -> 68 GB/s)
+  - 88 threads: 1 expert 0.53-0.54 -> 0.40-0.41, 6 experts 0.42-0.43 -> 0.31-0.33,
+    6 x 4 tokens 0.56-0.70 -> 0.52-0.54
+- Before any of this, 44 threads there: 1 expert 0.49, 6 experts 0.36.
+- Locked task queues (first version), 44 threads: 1 expert 0.89 unplaced, 0.62 NUMA-local; 88 threads
+  1.51 and 1.19. Counters replaced them; on the 9950X the two are the same.
+- Decode speed of the server there: not measured yet.
 - One node (9950X), `bench-cpu` before/after: the same within noise. Windows with `DSV4_NUMA=2` and
   `3` (pretended nodes) and Linux (WSL, one real node, 2 pretended): the same within noise.
 - Results are identical bit for bit however the rows are divided (unit test).

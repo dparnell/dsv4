@@ -216,6 +216,7 @@ fn run_request(model: &mut Model, tok: &Tokenizer, st: &Stats, req: &Request) ->
     st.push_text("\n\n── new request ──\n");
     let t0 = Instant::now();
     let mut logits = model.forward(&prompt[reuse..])?;
+    crate::prof::reset();
     // a follow-up turn usually diverges right after this prompt (e.g. dropped reasoning)
     model.take_snapshot();
     let prefill_s = t0.elapsed().as_secs_f64();
@@ -302,6 +303,7 @@ fn run_request(model: &mut Model, tok: &Tokenizer, st: &Stats, req: &Request) ->
     }
     let decode_s = t1.elapsed().as_secs_f64();
     st.update_request(req.id, |r| r.state = finish.into());
+    crate::prof::dump();
     st.event(format!(
         "done: {} tokens in {:.1}s ({:.2} tok/s), prefill {:.1} tok/s, finish={finish}",
         generated.len(),

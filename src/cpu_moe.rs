@@ -594,17 +594,36 @@ fn run_tasks<T: Send>(nodes: usize, tasks: Vec<(usize, T)>, f: impl Fn(&mut Row,
     for (n, t) in tasks {
         queues[n].1.push(Mutex::new(Some(t)));
     }
-    (0..threads).into_par_iter().with_max_len(1).for_each(|_| {
+    let prof = crate::prof::on();
+    let t0 = if prof { crate::prof::now() } else { 0 };
+    let parts: Vec<Mutex<crate::prof::Part>> = (0..if prof { threads } else { 0 }).map(|_| Default::default()).collect();
+    (0..threads).into_par_iter().with_max_len(1).for_each(|ix| {
+        let mut part = crate::prof::Part { start: if prof { crate::prof::now() } else { 0 }, ..Default::default() };
         let mut buf = Row::default();
         let me = crate::cpu::node();
         for i in 0..nodes {
             let (next, q) = &queues[(me + i) % nodes];
             while let Some(t) = q.get(next.0.fetch_add(1, Ordering::Relaxed)) {
                 let t = t.lock().take().expect("handed out once");
-                f(&mut buf, t);
+                if prof {
+                    let a = crate::prof::now();
+                    f(&mut buf, t);
+                    part.end = crate::prof::now();
+                    part.busy += part.end - a;
+                    part.tasks += 1;
+                    part.stolen += (i > 0) as u32;
+                } else {
+                    f(&mut buf, t);
+                }
             }
         }
+        if prof {
+            *parts[ix].lock() = part;
+        }
     });
+    if prof {
+        crate::prof::phase(t0, &parts.iter().map(|p| *p.lock()).collect::<Vec<_>>());
+    }
 }
 
 /// Cut `out` (`n` values per row) into tasks of at most `task` rows, none of which spans two nodes.
@@ -622,7 +641,14 @@ fn cut<'a>(shares: &[usize], rows: usize, n: usize, task: usize, mut out: &'a mu
 /// y = W2 (w * silu(min(W1 x, l)) * clamp(W3 x, -l, l)) for several experts at once, each with
 /// several tokens. Returns one dim-vector per token of each job.
 pub fn experts_forward(jobs: &[Job], inter: usize, dim: usize, limit: f32) -> Vec<Vec<Vec<f32>>> {
-    forward_isa(jobs, inter, dim, limit, isa(), crate::cpu::shares())
+    let t0 = if crate::prof::on() { crate::prof::now() } else { 0 };
+    let out = forward_isa(jobs, inter, dim, limit, isa(), crate::cpu::shares());
+    if crate::prof::on() {
+        crate::prof::call(t0, jobs.len(), jobs.iter().all(|j| j.xs.len() == 1), || {
+            jobs.first().map_or((0, 0), |j| crate::cpu::placed(j.blob, &j.geom.homes(inter, dim, crate::cpu::shares())))
+        });
+    }
+    out
 }
 
 fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa, shares: &[usize]) -> Vec<Vec<Vec<f32>>> {
@@ -767,17 +793,24 @@ pub fn bench(dim: usize, inter: usize, types: [u32; 3]) -> anyhow::Result<()> {
             0 => format!("{threads:>3} threads:"),
             n => format!("{threads:>3} threads, {n} group{}:", if n > 1 { "s" } else { " " }),
         };
-        for (name, group, nt) in [("1 expert", 1, 1), ("6 experts", 6, 1), ("6 experts x 4 tokens", 6, 4)] {
+        crate::prof::reset();
+        let gap = std::env::var("DSV4_BENCH_GAP_MS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        for (name, group, nt) in [("1 expert", 1, 1), ("2 experts", 2, 1), ("3 experts", 3, 1), ("4 experts", 4, 1), ("6 experts", 6, 1), ("6 experts x 4 tokens", 6, 4)] {
             let mut best = f64::MAX;
             for _ in 0..3 {
-                let t0 = std::time::Instant::now();
-                pool.install(|| {
+                let mut spent = 0.0;
+                {
                     for g in blobs.chunks(group) {
                         let jobs: Vec<Job> = g.iter().map(|b| Job { geom, blob: b, xs: vec![&x[..]; nt], ws: vec![1.0; nt] }).collect();
-                        std::hint::black_box(forward_isa(&jobs, inter, dim, 10.0, isa(), shares));
+                        if gap > 0.0 {
+                            std::thread::sleep(std::time::Duration::from_secs_f64(gap / 1e3));
+                        }
+                        let t0 = std::time::Instant::now();
+                        pool.install(|| std::hint::black_box(forward_isa(&jobs, inter, dim, 10.0, isa(), shares)));
+                        spent += t0.elapsed().as_secs_f64();
                     }
-                });
-                best = best.min(t0.elapsed().as_secs_f64() * 1e3 / blobs.len() as f64);
+                }
+                best = best.min(spent * 1e3 / blobs.len() as f64);
             }
             line += &format!("  {name} {best:.2} ms ({:.0} GB/s)", 3.0 * mat / best / 1e6);
         }

@@ -626,7 +626,7 @@ impl ExpertStore {
     /// Copy an expert that just ran on the CPU into VRAM, in the background.
     pub fn promote(self: &Arc<Self>, gpu: &Arc<Gpu>, layer: usize, e: usize, data: Arc<Vec<u8>>) {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.promoting.fetch_add(1, Relaxed) >= MAX_PROMOTIONS {
+        if self.promoting.fetch_add(1, Relaxed) >= MAX_PROMOTIONS || std::env::var_os("DSV4_NOPROMO").is_some() {
             self.promoting.fetch_sub(1, Relaxed);
             return;
         }

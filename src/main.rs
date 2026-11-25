@@ -14,6 +14,7 @@ mod kernels;
 mod model;
 mod monitor;
 mod pack;
+mod prof;
 mod quants;
 mod selftest;
 mod server;

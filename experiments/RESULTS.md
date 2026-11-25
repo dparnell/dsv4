@@ -167,7 +167,11 @@ own node first.
 - Before any of this, 44 threads there: 1 expert 0.49, 6 experts 0.36.
 - Locked task queues (first version), 44 threads: 1 expert 0.89 unplaced, 0.62 NUMA-local; 88 threads
   1.51 and 1.19. Counters replaced them; on the 9950X the two are the same.
-- Decode speed of the server there: not measured yet.
+- Server there (RTX 4070 Ti SUPER, 218 GB expert RAM, one prompt repeated, sampled), ms per token
+  over the last 100, `3a9194b` -> `34a1736`: CPU experts 72 -> 61, disk wait 14 -> 14, GPU experts
+  6 -> 6, rest of GPU 52 -> 53, other 11 -> 12. Requests 1 to 4: 3.42, 5.24, 6.13, 6.34 ->
+  3.50, 5.72, 5.84, 6.48 tok/s; fifth, new only: 6.74. About 138 CPU expert runs per token, so
+  0.44 ms each: less gain than `bench-cpu` shows (0.28-0.34); why is not known.
 - One node (9950X), `bench-cpu` before/after: the same within noise. Windows with `DSV4_NUMA=2` and
   `3` (pretended nodes) and Linux (WSL, one real node, 2 pretended): the same within noise.
 - Results are identical bit for bit however the rows are divided (unit test).

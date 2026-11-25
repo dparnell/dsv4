@@ -141,15 +141,15 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
 
 /// MXFP4 expert helpers. A slot holds gate | up | down, each [qs N*nb*4 words][e8m0 N*nb bytes].
 const MXFP4_COMMON: &str = r#"
-var<private> KV4: array<f32, 16> = array<f32, 16>(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                                                 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
-fn e8m0(S: u32) -> f32 { return ldexp(1.0, i32(S) - 127); }
-fn lo4(w: u32) -> vec4<f32> {
-  return vec4<f32>(KV4[w & 15u], KV4[(w >> 8u) & 15u], KV4[(w >> 16u) & 15u], KV4[(w >> 24u) & 15u]);
+fn e8m0(S: u32) -> f32 { return bitcast<f32>(S << 23u); }
+// 0, 0.5, 1, 1.5, 2, 3, 4, 6 from a table of 4-bit fields (an array of 16 floats made the kernels
+// three times slower); bit 3 is the sign
+fn val(w: vec4<u32>) -> vec4<f32> {
+  let m = vec4<f32>((vec4<u32>(0xc8643210u) >> ((w & vec4<u32>(7u)) << vec4<u32>(2u))) & vec4<u32>(15u)) * 0.5;
+  return select(m, -m, (w & vec4<u32>(8u)) != vec4<u32>(0u));
 }
-fn hi4(w: u32) -> vec4<f32> {
-  return vec4<f32>(KV4[(w >> 4u) & 15u], KV4[(w >> 12u) & 15u], KV4[(w >> 20u) & 15u], KV4[(w >> 28u) & 15u]);
-}
+fn lo4(w: u32) -> vec4<f32> { return val(vec4<u32>(w) >> vec4<u32>(0u, 8u, 16u, 24u)); }
+fn hi4(w: u32) -> vec4<f32> { return val(vec4<u32>(w) >> vec4<u32>(4u, 12u, 20u, 28u)); }
 "#;
 
 /// Fused expert gate+up for a list of routed rows.

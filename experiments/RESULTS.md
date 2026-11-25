@@ -240,4 +240,20 @@ IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and Q2_K keep their bits in
 - Selftest: every type as gate/up and as down, one and eight tokens, within 1e-6 of the output range.
 - UD-Q4_K_XL, gpu-only, 64 + 64 tokens, before and after: logits identical byte for byte (ppl 5.3016 on this text).
 - Files of zeros with the real headers of antirez IQ2_XXS/Q2_K and ISTA-DASLab IQ2_XXS load and decode with GPU and
-  CPU experts (10.6 and 10.4 MB slots). Not run with real 2-bit weights.
+  CPU experts (10.6 and 10.4 MB slots). - UD-IQ2_XXS with its real weights, two Xeons + RTX 4070 Ti SUPER (a user's runs, sampled, repeated prompt), `7b964eb`
+  -> `3d2d747`: 5.0-5.2 -> 6.41, 6.65, 6.60, 6.55 tok/s; slots 285 -> 499; VRAM hits 39.7 -> 47.9%; CPU runs per
+  token 143 -> 121, each 0.66 -> 0.48 ms. ms per token: CPU experts 94 -> 58, GPU experts 12 -> 16, rest of GPU
+  69 -> 59, other 13 -> 12. The answers read well.
+- `bench-gpu` there: IQ2_XXS+IQ2_S 0.120 ms, MXFP4 0.288 ms (before the next section).
+
+# MXFP4 kernel
+
+`bench-gpu`, RTX 5080, ms per expert of one token, one change at a time:
+
+- as it was 0.167; exponent by bitcast instead of `ldexp` 0.165; the table of 16 values `const` 0.167, both 0.173;
+  no table: values from bit arithmetic 0.062, with bitcast 0.058, from 4-bit fields of a constant, with bitcast
+  **0.054** (used).
+- UD-Q4_K_XL, gpu-only, 64 + 64 tokens: logits identical byte for byte before and after.
+- Waiting for the GPU in that run with 0.5 GB of slots, 64 + 40 tokens, alternating: 2.5 and 3.3 s against 10.3 and
+  6.4 s (an earlier pair with different slot counts: 10.4 against 6.4). Uploads dominate, so it varies. Decode speed
+  with experts in VRAM was not measured.

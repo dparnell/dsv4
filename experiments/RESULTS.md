@@ -135,3 +135,19 @@ Not run end to end: no low-bit model was downloaded.
 - UD-Q4_K_XL is unaffected (same perplexity on a 24 + 4 token gpu-only check).
 - Simulated from a 300-step routing trace, LRU, 38 GB of RAM, decode: GB read per token
   Q4_K_XL 1.21, IQ3_XXS 0.78, Q2_K_XL 0.58, IQ2_XXS 0.39, IQ1_M 0.27, IQ1_S 0.20.
+
+# Time outside the experts
+
+Decode, Ryzen 9 9950X + RTX 5080, per token, from temporary timers and GPU timestamps:
+
+- Was: read-ahead scoring on the CPU 13-17 ms, engram rows read before the first layer 7-33 ms,
+  `hc_mix` 14 ms (one workgroup per call, so one GPU core), `mm_q8` 14 ms, submits 7-10 ms. A
+  trivial readback is 0.1-0.2 ms, so round trips cost 4-7 ms of 43 ms.
+- Now: read-ahead scored on the GPU, engram rows read in the background, `hc_mix` split into
+  `hc_dot` (many workgroups) and the rest. All experts in memory (`--expert-subset 32`, 120 tokens,
+  3 interleaved runs): decode 5.01 -> 5.70 tok/s, GPU wait (prefill included) 7.6 -> 5.0 s.
+- Full model with 36 GB of RAM: no speedup shown (0.99, 0.88 -> 1.00, 0.77 tok/s; disk dominates).
+  Read-ahead used 1898 and 1880 before, 1884 and 1853 after.
+- `hc_mix` rounds differently. KLD against the old build, GPU-only experts: 0.0079 and 0.033 on two
+  texts; the old build with only its summation order reversed: 0.0028 and 0.029. Routing near-ties
+  amplify any rounding.

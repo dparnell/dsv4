@@ -395,7 +395,10 @@ pub fn run() -> Result<()> {
         sb.extend(r.vec(24, 0.5));
         let (hb, wb, sbb, mb) = (fb(&h), fb(&wf), fb(&sb), gpu.buffer("mix", (t * 24 * 4) as u64));
         let mut b = gpu.begin();
-        b.run("hc_mix", &[hb.all(), wb.all(), sbb.all(), mb.all()], &[hdim as u32, 4, 20, bits(1e-20), bits(1e-6), 0, 0, 0], (t as u32, 1, 1));
+        let parts = (hdim as u32 / 4).div_ceil(crate::kernels::HC_PART);
+        let pb = gpu.buffer("part", t as u64 * parts as u64 * 100);
+        b.run("hc_dot", &[hb.all(), wb.all(), pb.all()], &[hdim as u32, 0], (parts, t as u32, 1));
+        b.run("hc_mix", &[pb.all(), sbb.all(), mb.all()], &[hdim as u32, 4, 20, bits(1e-20), bits(1e-6), 0, 0, parts], (t as u32, 1, 1));
         let got = gpu.read_f32(b, &mb, 0, t * 24);
         let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
         let mut want = Vec::new();

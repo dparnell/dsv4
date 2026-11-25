@@ -523,29 +523,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// Hyper-connection mixes for one token per workgroup.
-/// H [M][hc*D] ; Wf [24][hc*D] ; SB = scale[3] ++ base[24] ; out MIX [M][24] = pre4 post4 comb16
-/// p0=hc*D p1=hc p2=iters p3=norm_eps p4=hc_eps p5=sb_off(floats in SB buffer) p6=mix_off(first token)
-/// p7=token offset into H
-const HC_MIX: &str = r#"
+/// vec4s of H that one workgroup of `hc_dot` reduces.
+pub const HC_PART: u32 = 128;
+
+/// First half of the hyper-connection mixes: the products of H with each row of Wf (and H with
+/// itself), in parts so that many workgroups share the work.
+/// H [M][hc*D] ; Wf [24][hc*D] ; out PART [M][parts][25], parts = hc*D/4/HC_PART rounded up
+/// p0=hc*D p1=token offset into H; dispatch (parts, M, 1)
+const HC_DOT: &str = r#"
 @group(0) @binding(0) var<storage, read> H: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> Wf: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read> SB: array<f32>;
-@group(0) @binding(3) var<storage, read_write> MIX: array<f32>;
+@group(0) @binding(2) var<storage, read_write> PART: array<f32>;
 var<workgroup> red: array<array<f32, 32>, 25>;
-var<workgroup> tot: array<f32, 25>;
 
-@compute @workgroup_size(256)
-fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>,
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>,
         @builtin(subgroup_invocation_id) sl: u32, @builtin(subgroup_size) ss: u32) {
   let L = P.p0 / 4u;
-  let hb = (P.p7 + wid.x) * L;
+  let i = wid.x * 128u + li;
   var acc: array<f32, 25>;
   for (var o = 0u; o < 25u; o++) { acc[o] = 0.0; }
-  for (var i = li; i < L; i += 256u) {
-    let x = H[hb + i];
-    acc[24] += dot(x, x);
-    for (var o = 0u; o < 24u; o++) { acc[o] += dot(x, Wf[o * L + i]); }
+  if (i < L) {
+    let x = H[(P.p1 + wid.y) * L + i];
+    acc[24] = dot(x, x);
+    for (var o = 0u; o < 24u; o++) { acc[o] = dot(x, Wf[o * L + i]); }
   }
   for (var o = 0u; o < 25u; o++) {
     let v = subgroupAdd(acc[o]);
@@ -554,9 +555,27 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
   workgroupBarrier();
   if (li < 25u) {
     var t = 0.0;
-    for (var i = 0u; i < 256u / ss; i++) { t += red[li][i]; }
-    tot[li] = t;
+    for (var s = 0u; s < 128u / ss; s++) { t += red[li][s]; }
+    PART[(wid.y * nw.x + wid.x) * 25u + li] = t;
   }
+}
+"#;
+
+/// Second half: hyper-connection mixes for one token per workgroup.
+/// SB = scale[3] ++ base[24] ; out MIX [M][24] = pre4 post4 comb16
+/// p0=hc*D p1=hc p2=iters p3=norm_eps p4=hc_eps p5=sb_off(floats in SB buffer) p6=mix_off(first token)
+/// p7=parts
+const HC_MIX: &str = r#"
+@group(0) @binding(0) var<storage, read> PART: array<f32>;
+@group(0) @binding(1) var<storage, read> SB: array<f32>;
+@group(0) @binding(2) var<storage, read_write> MIX: array<f32>;
+var<workgroup> tot: array<f32, 25>;
+
+@compute @workgroup_size(25)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+  var t = 0.0;
+  for (var i = 0u; i < P.p7; i++) { t += PART[(wid.x * P.p7 + i) * 25u + li]; }
+  tot[li] = t;
   workgroupBarrier();
   if (li == 0u) {
     let hc = P.p1;
@@ -1127,6 +1146,7 @@ pub fn all() -> Vec<(&'static str, String)> {
         ("rmsnorm", k(RMSNORM)),
         ("rope", k(ROPE)),
         ("quant_sim", k(QUANT_SIM)),
+        ("hc_dot", k(HC_DOT)),
         ("hc_mix", k(HC_MIX)),
         ("hc_pre_norm", k(HC_PRE_NORM)),
         ("hc_post", k(HC_POST)),

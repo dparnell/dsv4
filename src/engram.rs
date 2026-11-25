@@ -24,7 +24,24 @@ pub struct Engram {
     table: TensorInfo,
     row_bytes: usize,
     e4m3: [f32; 256],
+    /// threads that wait for the disk, so that those of the global pool can compute meanwhile
+    io: rayon::ThreadPool,
     stats: Arc<Stats>,
+}
+
+const IO_THREADS: usize = 32;
+
+/// Rows being read; see [`Engram::start`].
+pub struct Rows {
+    rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    data: Option<Vec<f32>>,
+}
+
+impl Rows {
+    /// The values, once they are all there.
+    pub fn get(&mut self) -> &[f32] {
+        self.data.get_or_insert_with(|| self.rx.recv().expect("engram read failed"))
+    }
 }
 
 fn e4m3_lut() -> [f32; 256] {
@@ -78,6 +95,7 @@ impl Engram {
             table,
             row_bytes,
             e4m3: e4m3_lut(),
+            io: rayon::ThreadPoolBuilder::new().num_threads(IO_THREADS).thread_name(|i| format!("engram-io-{i}")).build()?,
             stats,
         }))
     }
@@ -124,17 +142,22 @@ impl Engram {
     }
 
     /// Embeddings for positions `pos0..pos0+m` of `tokens`, for engram layer index `li`.
-    /// Returns [m][cols * head_dim].
-    pub fn lookup(&self, g: &Gguf, li: usize, tokens: &[u32], pos0: usize, m: usize) -> Vec<f32> {
+    /// Start reading embeddings into [m][cols * head_dim].
+    pub fn start(self: &Arc<Self>, g: &Arc<Gguf>, li: usize, tokens: &[u32], pos0: usize, m: usize) -> Rows {
         let width = self.cols() * self.head_dim;
         let mut rows = Vec::with_capacity(m * self.cols());
         for i in 0..m {
             self.rows(li, tokens, pos0 + i, &mut rows);
         }
-        // one task per row: these are random reads into a 200 GB mapping, so keep many in flight
-        let mut out = vec![0f32; m * width];
-        out.par_chunks_mut(self.head_dim).zip(rows.par_iter()).for_each(|(o, &r)| self.row_f32(g, r, o));
-        Stats::add(&self.stats.engram_bytes, (m * self.cols() * self.row_bytes) as u64);
-        out
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (me, g) = (self.clone(), g.clone());
+        self.io.spawn(move || {
+            // one task per row: these are random reads into a 200 GB mapping, so keep many in flight
+            let mut out = vec![0f32; m * width];
+            out.par_chunks_mut(me.head_dim).zip(rows.par_iter()).for_each(|(o, &r)| me.row_f32(&g, r, o));
+            Stats::add(&me.stats.engram_bytes, (m * me.cols() * me.row_bytes) as u64);
+            let _ = tx.send(out);
+        });
+        Rows { rx, data: None }
     }
 }

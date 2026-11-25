@@ -63,6 +63,9 @@ struct Acts {
     mix_f: Buf,
     xnf: Buf,
     rlog: Buf,
+    /// the next layer's router applied to this layer's FFN input, to read ahead
+    rnext: Buf,
+    hc_part: Buf,
     sg: Buf,
     su: Buf,
     sa: Buf,
@@ -111,8 +114,7 @@ pub struct Model {
     embd: TensorInfo,
     pub experts: Arc<ExpertStore>,
     /// router weights on the host, for speculative next-layer prefetch
-    gate_host: Vec<Vec<f32>>,
-    engram: Option<Engram>,
+    engram: Option<Arc<Engram>>,
     rope: Buf,
     rope_yarn_off: u32,
     states: Vec<LayerState>,
@@ -254,6 +256,9 @@ pub fn route_score(x: f32) -> f32 {
     (if x > 20.0 { x } else { x.exp().ln_1p() }).sqrt()
 }
 
+/// Longest input whose next layer's experts are guessed and read ahead.
+const PREFETCH_MAX_TOKENS: usize = 4;
+
 /// Pick the experts of every token from row `from` on; rows before it get none.
 pub fn route(cfg: &Config, logits: &[f32], bias: &[f32], t: usize, from: usize, allowed: Option<&[bool]>, pref: Option<&RoutePref>) -> Routing {
     let ne = cfg.n_experts;
@@ -386,6 +391,8 @@ impl Model {
             mix_a: gpu.buffer("mix_a", fb(seg * 24)),
             mix_f: gpu.buffer("mix_f", fb(seg * 24)),
             xnf: gpu.buffer("xnf", fb(seg * d)),
+            rnext: gpu.buffer("rnext", fb(PREFETCH_MAX_TOKENS * cfg.n_experts)),
+            hc_part: gpu.buffer("hc_part", fb(seg * 25 * (cfg.hc_mult * cfg.dim / 4).div_ceil(crate::kernels::HC_PART as usize))),
             rlog: gpu.buffer("rlog", fb(seg * cfg.n_experts)),
             sg: gpu.buffer("sg", fb(seg * inter)),
             su: gpu.buffer("su", fb(seg * inter)),
@@ -464,10 +471,6 @@ impl Model {
             }
             None => None,
         };
-        let mut gate_host = Vec::new();
-        for l in 0..cfg.n_layers {
-            gate_host.push(crate::weights::read_f32(&g, g.tensor(&format!("blk.{l}.ffn_gate_inp.weight"))?)?);
-        }
         stats.event(format!(
             "expert cache: {} VRAM slots ({:.2} GB), RAM tier {:.1} GB, {:.1} MB/expert",
             experts.n_slots,
@@ -478,7 +481,7 @@ impl Model {
         if let (true, Some(r), None) = (opt.warm_up, ranking, &opt.expert_subset) {
             experts.warm_up(&gpu, r);
         }
-        let engram = Engram::new(&g, &cfg, stats.clone())?;
+        let engram = Engram::new(&g, &cfg, stats.clone())?.map(Arc::new);
         Stats::set(&stats.gpu_total_bytes, gpu.gpu_bytes.load(std::sync::atomic::Ordering::Relaxed));
         Stats::set(&stats.ctx_max, max_ctx as u64);
         Stats::set(&stats.load_progress_milli, 1000);
@@ -492,7 +495,6 @@ impl Model {
             head,
             embd,
             experts,
-            gate_host,
             engram,
             rope,
             rope_yarn_off: yarn_off,
@@ -653,6 +655,20 @@ impl Model {
         b.run("quant_sim", &[x.all()], &[nb as u32, block as u32, mode, 0, row_len as u32, row_len as u32], grid1d(nb));
     }
 
+    /// Hyper-connection mixes of tokens `c0..c0+m` of the residual stream.
+    fn hc_mix(&self, b: &mut Batch, wf: &Buf, sb: &Buf, mix: &Buf, c0: usize, m: usize) {
+        let (cfg, a) = (&self.cfg, &self.acts);
+        let width = (cfg.hc_mult * cfg.dim) as u32;
+        let parts = (width / 4).div_ceil(crate::kernels::HC_PART);
+        b.run("hc_dot", &[a.h.all(), wf.all(), a.hc_part.all()], &[width, c0 as u32], (parts, m as u32, 1));
+        b.run(
+            "hc_mix",
+            &[a.hc_part.all(), sb.all(), mix.all()],
+            &[width, cfg.hc_mult as u32, cfg.hc_iters as u32, f(cfg.norm_eps), f(cfg.hc_eps), 0, (c0 * 24) as u32, parts],
+            (m as u32, 1, 1),
+        );
+    }
+
     fn copy(&self, b: &mut Batch, src: &Buf, so: usize, dst: &Buf, d_o: usize, n: usize) {
         b.run("copy", &[src.all(), dst.all()], &[n as u32, so as u32, d_o as u32], grid1d(n));
     }
@@ -706,9 +722,9 @@ impl Model {
         let w = cfg.window;
         let a = &self.acts;
 
-        // engram rows: start the disk reads now, they only depend on token ids
-        let eng_rows: Vec<Vec<f32>> = match &self.engram {
-            Some(e) => (0..e.layers.len()).map(|li| e.lookup(&self.g, li, &self.tokens, p0, t_all)).collect(),
+        // engram rows: start the disk reads now, they only depend on token ids; each layer waits for its own
+        let mut eng_rows: Vec<crate::engram::Rows> = match &self.engram {
+            Some(e) => (0..e.layers.len()).map(|li| e.start(&self.g, li, &self.tokens, p0, t_all)).collect(),
             None => Vec::new(),
         };
 
@@ -751,18 +767,13 @@ impl Model {
                     let width = self.engram.as_ref().unwrap().cols() * self.engram.as_ref().unwrap().head_dim;
                     // the emb buffer is reused per chunk, so each chunk needs its own submit
                     batch.submit();
-                    gpu.write(&a.emb, 0, bytemuck::cast_slice(&eng_rows[li][c0 * width..(c0 + m) * width]));
+                    gpu.write(&a.emb, 0, bytemuck::cast_slice(&eng_rows[li].get()[c0 * width..(c0 + m) * width]));
                     batch = gpu.begin();
                     e.kv.run(&mut batch, &a.emb, 0, width, &a.ekv, 0, (cfg.hc_mult + 1) * d, m, 0, false);
                     batch.run("engram", &[a.h.all(), a.ekv.all(), e.gate.all()], &[d as u32, f(cfg.norm_eps), c0 as u32], (m as u32, cfg.hc_mult as u32, 1));
                 }
                 // hyper-connection mixes for attention, then collapse with the previous FFN's pre mix
-                batch.run(
-                    "hc_mix",
-                    &[a.h.all(), ly.hc_attn_fn.all(), ly.hc_attn_sb.all(), a.mix_a.all()],
-                    &[(cfg.hc_mult * d) as u32, cfg.hc_mult as u32, cfg.hc_iters as u32, f(cfg.norm_eps), f(cfg.hc_eps), 0, (c0 * 24) as u32, c0 as u32],
-                    (m as u32, 1, 1),
-                );
+                self.hc_mix(&mut batch, &ly.hc_attn_fn, &ly.hc_attn_sb, &a.mix_a, c0, m);
                 batch.run(
                     "hc_pre_norm",
                     &[a.h.all(), a.mix_f.all(), ly.attn_norm.all(), a.xn.all()],
@@ -789,12 +800,7 @@ impl Model {
             let row_from = out_from.saturating_sub(p0);
             Stats::add(&self.stats.prompt_rows_skipped, row_from as u64);
             // ---------------- MoE over the whole segment ----------------
-            batch.run(
-                "hc_mix",
-                &[a.h.all(), ly.hc_ffn_fn.all(), ly.hc_ffn_sb.all(), a.mix_f.all()],
-                &[(cfg.hc_mult * d) as u32, cfg.hc_mult as u32, cfg.hc_iters as u32, f(cfg.norm_eps), f(cfg.hc_eps), 0, 0, 0],
-                (t_all as u32, 1, 1),
-            );
+            self.hc_mix(&mut batch, &ly.hc_ffn_fn, &ly.hc_ffn_sb, &a.mix_f, 0, t_all);
             batch.run(
                 "hc_pre_norm",
                 &[a.h.all(), a.mix_a.all(), ly.ffn_norm.all(), a.xnf.all()],
@@ -802,6 +808,12 @@ impl Model {
                 (t_all as u32, 1, 1),
             );
             ly.gate_inp.run(&mut batch, &a.xnf, 0, d, &a.rlog, 0, cfg.n_experts, t_all);
+            // guess the next layer's experts by applying its router to this layer's FFN input (the
+            // residual stream changes slowly)
+            let guess = self.prefetch && self.cpu_experts && l + 1 < cfg.n_layers && t_all <= PREFETCH_MAX_TOKENS && self.allowed.is_none();
+            if guess {
+                self.layers[l + 1].gate_inp.run(&mut batch, &a.xnf, 0, d, &a.rnext, 0, cfg.n_experts, t_all);
+            }
             // shared expert (overlaps with the routing readback)
             ly.sh_gate.run(&mut batch, &a.xnf, 0, d, &a.sg, 0, cfg.moe_inter, t_all, 0, false);
             ly.sh_up.run(&mut batch, &a.xnf, 0, d, &a.su, 0, cfg.moe_inter, t_all, 0, false);
@@ -813,8 +825,12 @@ impl Model {
             if want_x {
                 ranges.push((&a.xnf, 0, (t_all * d * 4) as u64));
             }
+            if guess {
+                ranges.push((&a.rnext, 0, (t_all * cfg.n_experts * 4) as u64));
+            }
             let mut back = gpu.read_multi(batch, &ranges);
             Stats::add(&self.stats.t_gpu_wait_ns, tw.elapsed().as_nanos() as u64);
+            let next: Option<Vec<f32>> = guess.then(|| bytemuck::cast_slice(&back.pop().unwrap()).to_vec());
             let xnf_host: Option<Vec<f32>> = if want_x { Some(bytemuck::cast_slice(&back.pop().unwrap()).to_vec()) } else { None };
             let rl: Vec<f32> = bytemuck::cast_slice(&back.pop().unwrap()).to_vec();
             let pref = (t_all == 1 && (self.route_prior > 0.0 || self.route_tail_skip > 0))
@@ -828,8 +844,8 @@ impl Model {
                     return Ok(vec![0.0; cfg.vocab]);
                 }
             }
-            if let (Some(x), true) = (xnf_host.as_deref(), self.prefetch && l + 1 < cfg.n_layers && t_all <= 4 && self.allowed.is_none()) {
-                self.prefetch_next(l + 1, x, t_all);
+            if let Some(next) = next {
+                self.prefetch_next(l + 1, &next, t_all);
             }
             self.run_experts(l, &routing, xnf_host.as_deref())?;
             batch = gpu.begin();
@@ -1108,23 +1124,19 @@ impl Model {
         Ok(())
     }
 
-    /// Guess the next layer's experts by applying its router to this layer's FFN input (the
-    /// residual stream changes slowly) and start reading them from disk in the background.
-    fn prefetch_next(&self, next: usize, x: &[f32], t_all: usize) {
+    /// Start reading the experts that `logits`, a guess of the next layer's router output, picks.
+    fn prefetch_next(&self, next: usize, logits: &[f32], t_all: usize) {
         let cfg = &self.cfg;
-        let d = cfg.dim;
-        let w = &self.gate_host[next];
         let bias = &self.layers[next].exp_bias;
         // expect what `route` will pick
         let held = (self.route_prior > 0.0).then(|| self.experts.held(next, cfg.n_experts));
         let keep = if self.route_tail_skip > 0 { self.route_tail_skip.min(cfg.n_active) } else { cfg.n_active };
         let mut want: Vec<(usize, usize)> = Vec::new();
         for t in 0..t_all {
-            let xt = &x[t * d..(t + 1) * d];
-            let scores: Vec<f32> = (0..cfg.n_experts)
-                .into_par_iter()
-                .map(|e| {
-                    let z: f32 = w[e * d..(e + 1) * d].iter().zip(xt).map(|(a, b)| a * b).sum();
+            let scores: Vec<f32> = logits[t * cfg.n_experts..(t + 1) * cfg.n_experts]
+                .iter()
+                .enumerate()
+                .map(|(e, &z)| {
                     route_score(z) + bias[e] + if held.as_ref().is_some_and(|h| h[e]) { self.route_prior } else { 0.0 }
                 })
                 .collect();

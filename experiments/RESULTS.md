@@ -176,3 +176,17 @@ own node first.
   `3` (pretended nodes) and Linux (WSL, one real node, 2 pretended): the same within noise.
 - Results are identical bit for bit however the rows are divided (unit test).
 - macOS: `cpu.rs` type-checks for aarch64-apple-darwin; the whole program was not built there.
+
+# Threads awake between layers
+
+`bench-cpu --gap-ms 3`: a 3 ms pause before every call, ms per expert.
+
+- Two Xeon E5-2699 v4 (Windows 10), 44 threads, NUMA-local, without -> with the pause: 1 expert
+  0.33 -> 0.93, 6 experts 0.27 -> 0.35, about 0.5 ms per call; the High performance power plan
+  changes nothing. With `--cpu-spin`: not measured yet.
+- Linux in WSL2 (9950X), 16 threads, asleep -> awake: 1 expert 1.85 -> 0.53, 3 experts 0.83 -> 0.50,
+  6 experts 0.64 -> 0.52.
+- Windows 11 (9950X), 16 threads: 1 expert 0.63 -> 0.51, 3 experts 0.56 -> 0.52, 6 experts 0.57 -> 0.48.
+  32 threads on its 32 logical processors: 0.70 -> 3.44, hence `auto`.
+- Model there (`--threads 16 --expert-subset 32`, 120 tokens, 3 interleaved runs): no difference
+  shown, 5.80, 6.19, 6.40 -> 6.18, 6.07, 6.13 tok/s.

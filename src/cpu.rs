@@ -409,16 +409,31 @@ fn assign(groups: &[Group], n: usize) -> Vec<usize> {
 /// the OS puts them).
 pub fn pool(use_groups: usize, n: usize) -> rayon::ThreadPoolBuilder {
     let b = rayon::ThreadPoolBuilder::new().num_threads(n);
-    let groups = &groups()[..use_groups];
-    if groups.is_empty() || n == 0 {
+    if use_groups == 0 || n == 0 {
         return b;
     }
-    let place = assign(groups, n);
-    b.start_handler(move |i| {
-        if !enter(place[i]) {
+    let bind = binder(use_groups, n);
+    b.start_handler(move |i| bind(i))
+}
+
+/// Binds the calling thread as the given one of `n` over the first `use_groups` groups.
+pub fn binder(use_groups: usize, n: usize) -> impl Fn(usize) + Clone + Send + Sync + 'static {
+    let groups = &groups()[..use_groups];
+    let place = if groups.is_empty() { Vec::new() } else { assign(groups, n) };
+    move |i| {
+        if place.get(i).is_some_and(|&g| !enter(g)) {
             tracing::warn!("worker {i} could not be bound to its processors");
         }
-    })
+    }
+}
+
+/// Logical processors the threads can use.
+pub fn logical() -> usize {
+    let t = topology();
+    if t.groups.is_empty() || t.pretend {
+        return std::thread::available_parallelism().map_or(1, |n| n.get());
+    }
+    t.groups.iter().map(|g| g.logical()).sum()
 }
 
 /// Set up the global pool. Without `threads`: one per core when there are several groups, else
@@ -441,6 +456,11 @@ pub fn init(threads: Option<usize>) -> Result<()> {
 
 /// One line for the log.
 pub fn describe() -> String {
+    let d = describe_threads();
+    if crate::team::get().is_some() { d + ", awake between layers" } else { d }
+}
+
+fn describe_threads() -> String {
     let n = rayon::current_num_threads();
     let t = topology();
     if t.groups.is_empty() {

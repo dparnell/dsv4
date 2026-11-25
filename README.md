@@ -138,7 +138,10 @@ CPU threads: one per logical processor, except on machines with several NUMA nod
 servers) or Windows processor groups (more than 64 logical processors), where there is one per core over all of them.
 `--threads N` or `DSV4_THREADS` changes the number. With several NUMA nodes threads are bound to their node, and each
 expert's rows are divided among the nodes' memories so that threads mostly read their own; `DSV4_NUMA=off` turns that
-off, and `bench-cpu` compares both. macOS has no NUMA nodes. The status page shows where the time per token goes.
+off, and `bench-cpu` compares both. macOS has no NUMA nodes. `--cpu-spin on|off`
+(`DSV4_CPU_SPIN`) keeps the threads awake between layers while generating, which is faster where they are slow to wake
+(two sockets, virtual machines) and takes more power; the default, `auto`, does so if there are at least two logical
+processors per thread. `bench-cpu --gap-ms 3` shows what it gains. The status page shows where the time per token goes.
 
 ## API notes
 
@@ -165,6 +168,7 @@ src/
   gguf.rs        multi-shard GGUF reader (mmap)
   config.rs      hyper-parameters from GGUF metadata
   cpu.rs         worker threads and expert memory across NUMA nodes and processor groups
+  team.rs        CPU expert threads that stay awake between layers
   gpu.rs         wgpu device, buffers, pipelines, bind-group cache, batches, readback
   kernels.rs     WGSL kernels (Q8_0/MXFP4 matmuls, sparse attention, indexer top-k, RoPE/YaRN,
                  hyper-connection Sinkhorn mixing, Engram gating, quantisation simulation, ...)

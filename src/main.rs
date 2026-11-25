@@ -18,6 +18,7 @@ mod quants;
 mod selftest;
 mod server;
 mod stats;
+mod team;
 mod tui;
 mod weights;
 
@@ -65,6 +66,10 @@ struct Cli {
     /// groups where there are several, else one per logical processor)
     #[arg(long, global = true, env = "DSV4_THREADS")]
     threads: Option<usize>,
+    /// Keep the CPU expert threads awake between layers while generating: faster where threads are
+    /// slow to wake, at the cost of power. auto: if there are two logical processors per thread
+    #[arg(long, global = true, env = "DSV4_CPU_SPIN", value_enum, default_value_t)]
+    cpu_spin: team::Spin,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -306,6 +311,9 @@ enum Cmd {
         /// Types of the gate, up and down matrices, e.g. IQ2_XXS,IQ2_XXS,IQ2_S
         #[arg(long, default_value = "MXFP4,MXFP4,MXFP4")]
         types: String,
+        /// Pause before every call, as the GPU's part of a layer makes
+        #[arg(long, default_value_t = 0.0)]
+        gap_ms: f64,
     },
     /// Copy the experts into one file where each is contiguous, which drives read faster
     /// (lossless; takes as much space as the experts). An interrupted run resumes.
@@ -541,6 +549,9 @@ fn generate_to(engine: &engine::EngineHandle, prompt: Vec<u32>, p: SamplingParam
 fn main() -> Result<()> {
     let cli = Cli::parse();
     cpu::init(cli.threads)?;
+    if !matches!(cli.cmd, Cmd::BenchCpu { .. }) {
+        team::init(cli.cpu_spin)?;
+    }
     match cli.cmd {
         Cmd::Download { quant, dir, repo, connections, list } => {
             init_logging(false);
@@ -570,7 +581,7 @@ fn main() -> Result<()> {
             let (geoms, parts) = experts::layer_geoms(&g, &cfg)?;
             pack::repack(&g, &geoms, parts, layers.unwrap_or(cfg.n_layers), cfg.n_experts, &out.unwrap_or_else(|| pack::default_path(&first)))
         }
-        Cmd::BenchCpu { dim, inter, types } => {
+        Cmd::BenchCpu { dim, inter, types, gap_ms } => {
             let mut t = [0u32; 3];
             for (i, name) in types.split(',').enumerate().take(3) {
                 t[i] = (0..64).find(|&t| gguf::type_name(t).eq_ignore_ascii_case(name.trim())).filter(|&t| t == gguf::GGML_MXFP4 || quants::is_low_bit(t)).with_context(|| format!("{name}: not an expert type"))?;
@@ -578,7 +589,7 @@ fn main() -> Result<()> {
             if t.contains(&0) {
                 anyhow::bail!("--types takes three types");
             }
-            cpu_moe::bench(dim, inter, t)
+            cpu_moe::bench(dim, inter, t, gap_ms, cli.cpu_spin)
         }
         Cmd::Prompt { model, file, no_think } => {
             let first = gguf::resolve_model_path(&model)?;

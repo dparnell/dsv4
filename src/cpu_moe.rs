@@ -121,7 +121,10 @@ impl Isa {
     fn available(self) -> bool {
         #[cfg(target_arch = "x86_64")]
         {
-            let avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+            let avx2 = is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+                && is_x86_feature_detected!("f16c")
+                && is_x86_feature_detected!("popcnt");
             match self {
                 Isa::Scalar => true,
                 Isa::Avx2 => avx2,
@@ -479,22 +482,11 @@ struct Row {
 }
 
 impl Row {
-    fn decode(&mut self, ty: u32, raw: &[u8], k: usize) {
+    fn decode(&mut self, isa: Isa, ty: u32, raw: &[u8], k: usize) {
         self.w.resize(k, 0);
         self.s.resize(k / 16, 0.0);
         self.m.resize(if quants::has_min(ty) { k / 16 } else { 0 }, 0.0);
-        let mut blk = quants::Block::new();
-        let nb = k / 256;
-        for (b, raw) in raw.chunks_exact(raw.len() / nb).enumerate() {
-            quants::decode(ty, raw, &mut blk);
-            self.w[b * 256..][..256].copy_from_slice(&blk.w);
-            for g in 0..16 {
-                self.s[b * 16 + g] = blk.s[g] as f32 * blk.d;
-            }
-            for (g, m) in self.m.iter_mut().skip(b * 16).take(16).enumerate() {
-                *m = blk.m[g] as f32 * blk.dm;
-            }
-        }
+        quants::decode_row(isa != Isa::Scalar, ty, raw, &mut self.w, &mut self.s, &mut self.m);
     }
 
     fn dot(&self, isa: Isa, xs: &[Q8x], out: &mut [f32]) {
@@ -527,7 +519,13 @@ impl Row {
             }
             if !self.m.is_empty() {
                 for (x, o) in xs.iter().zip(out) {
-                    *o -= x.sum.iter().zip(&self.m).map(|(s, m)| s * m).sum::<f32>();
+                    let mut acc = [0f32; 16];
+                    for (s, m) in x.sum.chunks_exact(16).zip(self.m.chunks_exact(16)) {
+                        for ((a, s), m) in acc.iter_mut().zip(s).zip(m) {
+                            *a += s * m;
+                        }
+                    }
+                    *o -= acc.iter().sum::<f32>();
                 }
             }
         }
@@ -562,7 +560,7 @@ impl<'a> Mat<'a> {
             dot_row(isa, &qs[r * nb * 16..(r + 1) * nb * 16], &sc[r * nb..(r + 1) * nb], xs, out)
         } else {
             let n = self.raw.len() / self.rows;
-            buf.decode(self.ty, &self.raw[r * n..(r + 1) * n], self.k);
+            buf.decode(isa, self.ty, &self.raw[r * n..(r + 1) * n], self.k);
             buf.dot(isa, xs, out);
         }
     }
@@ -888,7 +886,7 @@ mod tests {
             quants::dequantize(ty, &raw, &mut w);
             let x: Vec<Vec<f32>> = (0..5).map(|_| (0..k).map(|_| byte() as f32 / 128.0 - 1.0).collect()).collect();
             let mut row = Row::default();
-            row.decode(ty, &raw, k);
+            row.decode(isa(), ty, &raw, k);
             for isa in Isa::ALL.into_iter().filter(|i| i.available()) {
                 let xq: Vec<Q8x> = x.iter().map(|x| quant_x(x, isa)).collect();
                 let mut got = vec![0f32; 5];

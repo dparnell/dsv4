@@ -103,27 +103,27 @@ fn half_at(b: &[u8], o: usize) -> f32 {
 }
 
 /// Negate the bytes of `g` (each nonzero and positive) where `m` is 0xff.
-#[inline]
+#[inline(always)]
 fn apply_signs(g: u64, m: u64) -> u64 {
     // ~x + 1 cannot carry out of a byte: ~x is at most 0xfe
     (g ^ m) + (m & 0x0101_0101_0101_0101)
 }
 
 /// The 8-bit sign pattern from 7 stored bits: the last one makes the parity even.
-#[inline]
+#[inline(always)]
 fn even(bits: u32) -> usize {
     let b = bits & 127;
     (b | (b.count_ones() & 1) << 7) as usize
 }
 
-#[inline]
+#[inline(always)]
 fn put(o: &mut Block, i: usize, v: u64) {
     let c: [u8; 8] = v.to_le_bytes();
     o.w[i * 8..i * 8 + 8].copy_from_slice(bytemuck::cast_slice(&c));
 }
 
 /// Decode one 256-weight block of a low-bit format.
-#[inline]
+#[inline(always)]
 pub fn decode(ty: u32, b: &[u8], o: &mut Block) {
     let t = tables();
     let pair = |lo: u32, hi: u32| lo as u64 | (hi as u64) << 32;
@@ -313,6 +313,209 @@ pub fn decode(ty: u32, b: &[u8], o: &mut Block) {
             }
         }
         _ => unreachable!("not a low-bit format: {ty}"),
+    }
+}
+
+/// `decode` for a whole row: the weights, their scales s * d, and for formats with them the offsets m * dm.
+#[inline(always)]
+fn row_by_block(ty: u32, raw: &[u8], w: &mut [i8], s: &mut [f32], m: &mut [f32]) {
+    let bb = crate::gguf::type_block(ty).unwrap().1 as usize;
+    let mut blk = Block::new();
+    for (b, raw) in raw.chunks_exact(bb).enumerate() {
+        decode(ty, raw, &mut blk);
+        w[b * 256..][..256].copy_from_slice(&blk.w);
+        for (o, &v) in s[b * 16..][..16].iter_mut().zip(&blk.s) {
+            *o = v as f32 * blk.d;
+        }
+        if has_min(ty) {
+            for (o, &v) in m[b * 16..][..16].iter_mut().zip(&blk.m) {
+                *o = v as f32 * blk.dm;
+            }
+        }
+    }
+}
+
+/// `avx2`: the CPU has AVX2, FMA, F16C and POPCNT. The results are the same without.
+pub fn decode_row(avx2: bool, ty: u32, raw: &[u8], w: &mut [i8], s: &mut [f32], m: &mut [f32]) {
+    let bb = crate::gguf::type_block(ty).unwrap().1 as usize;
+    let nb = raw.len() / bb;
+    assert!(raw.len() == nb * bb && w.len() == nb * 256 && s.len() == nb * 16 && m.len() == if has_min(ty) { nb * 16 } else { 0 });
+    #[cfg(target_arch = "x86_64")]
+    if avx2 {
+        return unsafe { x86::decode_row(ty, raw, w, s, m) };
+    }
+    let _ = avx2;
+    row_by_block(ty, raw, w, s, m)
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use std::arch::x86_64::*;
+
+    use super::*;
+
+    /// Negate 32 weights where a bit is set: bits 0-7 of each 64-bit lane are for 8 weights.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn negate(w: *mut i8, bits: __m256i) {
+        unsafe {
+            let spread = _mm256_shuffle_epi8(bits, _mm256_setr_epi64x(0, 0x0808080808080808, 0, 0x0808080808080808));
+            let bit = _mm256_set1_epi64x(0x8040201008040201u64 as i64);
+            let neg = _mm256_cmpeq_epi8(_mm256_and_si256(spread, bit), bit);
+            let v = _mm256_loadu_si256(w as *const __m256i);
+            _mm256_storeu_si256(w as *mut __m256i, _mm256_sub_epi8(_mm256_xor_si256(v, neg), neg));
+        }
+    }
+
+    /// Bit 7 of each lane from the 7 below it (see `even`).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn with_parity(v: __m256i) -> __m256i {
+        let v = _mm256_and_si256(v, _mm256_set1_epi64x(127));
+        let x = _mm256_and_si256(_mm256_xor_si256(v, _mm256_srli_epi64(v, 4)), _mm256_set1_epi64x(15));
+        let h = -128i8;
+        let odd = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, h, h, 0, h, 0, 0, h, h, 0, 0, h, 0, h, h, 0));
+        // the other bytes of a lane look up entry 0
+        _mm256_or_si256(v, _mm256_shuffle_epi8(odd, x))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn signs_28(w: *mut i8, c: u32) {
+        unsafe { negate(w, with_parity(_mm256_srlv_epi64(_mm256_set1_epi64x(c as i64), _mm256_setr_epi64x(0, 7, 14, 21)))) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn signs_32(w: *mut i8, c: u32) {
+        unsafe { negate(w, _mm256_cvtepu8_epi64(_mm_cvtsi32_si128(c as i32))) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,f16c")]
+    unsafe fn scales(s: *mut f32, v: &[i8; 16], d: u16, by: f32) {
+        unsafe {
+            let d = _mm256_set1_ps(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(d as i32))) * by);
+            for i in [0, 8] {
+                let v = _mm256_cvtepi8_epi32(_mm_loadl_epi64(v.as_ptr().add(i) as *const __m128i));
+                _mm256_storeu_ps(s.add(i), _mm256_mul_ps(_mm256_cvtepi32_ps(v), d));
+            }
+        }
+    }
+
+    /// The caller checked the lengths. Grid formats: first the magnitudes of the whole row, then the
+    /// signs, so that those do not load what has only just been stored in smaller pieces.
+    #[target_feature(enable = "avx2,fma,f16c,popcnt")]
+    pub unsafe fn decode_row(ty: u32, raw: &[u8], w: &mut [i8], s: &mut [f32], m: &mut [f32]) {
+        let t = tables();
+        let (wp, sp) = (w.as_mut_ptr(), s.as_mut_ptr());
+        let mut sc = [0i8; 16];
+        let odd = |v: u32| (2 * v + 1) as i8;
+        let nib = |v: u8| (v as u32 & 15, v as u32 >> 4);
+        let le16 = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+        let le32 = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        // sized as their indices, so that looking up needs no check
+        let (g2xxs, g2xs, g2s): (&[u64; 256], &[u64; 512], &[u64; 1024]) =
+            (t.g2xxs[..].try_into().unwrap(), t.g2xs[..].try_into().unwrap(), t.g2s[..].try_into().unwrap());
+        let (g3xxs, g3s): (&[u32; 256], &[u32; 512]) = (t.g3xxs[..].try_into().unwrap(), t.g3s[..].try_into().unwrap());
+        unsafe {
+            let put8 = |at: usize, v: u64| (wp.add(at) as *mut u64).write_unaligned(v);
+            let put4 = |at: usize, v: u32| (wp.add(at) as *mut u32).write_unaligned(v);
+            // for group i of 32 weights, at o
+            macro_rules! grid {
+                ($n:literal, |$b:ident, $o:ident, $i:ident| $body:expr) => {
+                    for (n, b) in raw.chunks_exact($n).enumerate() {
+                        let $b: &[u8; $n] = b.try_into().unwrap();
+                        for $i in 0..8 {
+                            let $o = n * 256 + $i * 32;
+                            $body
+                        }
+                    }
+                };
+            }
+            // the same; the result is the group's two scales
+            macro_rules! finish {
+                ($n:literal, $by:expr, |$b:ident, $o:ident, $i:ident| $body:expr) => {
+                    for (n, b) in raw.chunks_exact($n).enumerate() {
+                        let $b: &[u8; $n] = b.try_into().unwrap();
+                        for $i in 0..8 {
+                            let $o = wp.add(n * 256 + $i * 32);
+                            let (s0, s1) = $body;
+                            (sc[2 * $i], sc[2 * $i + 1]) = (odd(s0), odd(s1));
+                        }
+                        scales(sp.add(n * 16), &sc, le16($b, 0), $by);
+                    }
+                };
+            }
+            match ty {
+                IQ2_XXS => {
+                    grid!(66, |b, o, i| for l in 0..4 {
+                        put8(o + 8 * l, g2xxs[b[2 + 8 * i + l] as usize]);
+                    });
+                    finish!(66, 0.125, |b, o, i| {
+                        let c = le32(b, 6 + 8 * i);
+                        signs_28(o, c);
+                        (c >> 28, c >> 28)
+                    });
+                }
+                IQ2_XS => {
+                    grid!(74, |b, o, i| for l in 0..4 {
+                        put8(o + 8 * l, g2xs[le16(b, 2 + 2 * (4 * i + l)) as usize & 511]);
+                    });
+                    finish!(74, 0.125, |b, o, i| {
+                        let q = _mm256_cvtepu16_epi64(_mm_loadl_epi64(b[2 + 8 * i..][..8].as_ptr() as *const __m128i));
+                        negate(o, with_parity(_mm256_srli_epi64(q, 9)));
+                        nib(b[66 + i])
+                    });
+                }
+                IQ2_S => {
+                    grid!(82, |b, o, i| {
+                        let hi = b[66 + i] as usize;
+                        for l in 0..4 {
+                            put8(o + 8 * l, g2s[b[2 + 4 * i + l] as usize | (hi << (8 - 2 * l) & 0x300)]);
+                        }
+                    });
+                    finish!(82, 0.125, |b, o, i| {
+                        signs_32(o, le32(b, 34 + 4 * i));
+                        nib(b[74 + i])
+                    });
+                }
+                IQ3_XXS => {
+                    grid!(98, |b, o, i| for l in 0..8 {
+                        put4(o + 4 * l, g3xxs[b[2 + 8 * i + l] as usize]);
+                    });
+                    finish!(98, 0.25, |b, o, i| {
+                        let c = le32(b, 66 + 4 * i);
+                        signs_28(o, c);
+                        (c >> 28, c >> 28)
+                    });
+                }
+                IQ3_S => {
+                    grid!(110, |b, o, i| {
+                        let hi = b[66 + i] as usize;
+                        for l in 0..8 {
+                            put4(o + 4 * l, g3s[b[2 + 8 * i + l] as usize | (hi << (8 - l) & 256)]);
+                        }
+                    });
+                    finish!(110, 1.0, |b, o, i| {
+                        signs_32(o, le32(b, 74 + 4 * i));
+                        let v = b[106 + i / 2] as u32 >> (4 * (i & 1)) & 15;
+                        (v, v)
+                    });
+                }
+                IQ1_S => finish!(50, 0.125, |b, o, i| {
+                    let q = le16(b, 34 + 2 * i) as usize;
+                    let g = &t.g1[q >> 15];
+                    for l in 0..4 {
+                        let v = g[b[2 + 4 * i + l] as usize | (q >> (3 * l) & 7) << 8];
+                        (o.add(8 * l) as *mut u64).write_unaligned(v);
+                    }
+                    let v = (q >> 12 & 7) as u32;
+                    (v, v)
+                }),
+                _ => row_by_block(ty, raw, w, s, m),
+            }
+        }
     }
 }
 
@@ -516,6 +719,28 @@ mod tests {
                 // Q2_K and Q5_K subtract: judge those against the size of the terms
                 assert!((g - w).abs() <= 1e-6 * (w.abs() + 0.05), "type {ty} at {i}: {g} vs {w}");
             }
+        }
+    }
+
+    #[test]
+    fn rows_match_blocks() {
+        let mut z = 11u64;
+        let mut byte = || {
+            z ^= z << 13;
+            z ^= z >> 7;
+            z ^= z << 17;
+            (z >> 9) as u8
+        };
+        let k = 256 * 64;
+        for ty in LOW_BIT {
+            let raw = random_blocks(ty, k / 256, &mut byte);
+            let run = |avx2| {
+                let (mut w, mut s) = (vec![0i8; k], vec![0f32; k / 16]);
+                let mut m = vec![0f32; if has_min(ty) { k / 16 } else { 0 }];
+                decode_row(avx2, ty, &raw, &mut w, &mut s, &mut m);
+                (w, s, m)
+            };
+            assert!(run(false) == run(crate::cpu_moe::has_simd()), "type {ty}");
         }
     }
 

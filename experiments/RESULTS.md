@@ -211,3 +211,21 @@ own node first.
   32 threads on its 32 logical processors: 0.70 -> 3.44, hence `auto`.
 - Model there (`--threads 16 --expert-subset 32`, 120 tokens, 3 interleaved runs): no difference
   shown, 5.80, 6.19, 6.40 -> 6.18, 6.07, 6.13 tok/s.
+
+# Low-bit experts on AVX2
+
+UD-IQ2_XXS on the two Xeons above (RTX 4070 Ti SUPER; a user's run, sampled, repeated prompt, `7b964eb`):
+5.0-5.2 tok/s from the first request to the seventh, where UD-Q4_K_XL goes from 3.9 to 8.25.
+
+- All 15,360 experts (157 GB) are in RAM after warm-up and nothing waits for the disk, so only the
+  VRAM share can still improve. The GPU stores 4-bit codes: 21.4 MB per slot for experts of 10.2 MB
+  (MXFP4 18.8 MB), hence 285 slots, 39.7% hits.
+- ms per token, UD-Q4_K_XL -> UD-IQ2_XXS: CPU experts 38 -> 94, disk wait 9 -> 0, GPU experts 4 -> 12,
+  rest of GPU 52 -> 69, other 12 -> 13. About 143 CPU runs per token at 0.66 ms, against 0.28. Why the
+  GPU part is slower was not looked into.
+- Row decoders rewritten with AVX2 (same weights, unit test). `bench-cpu`, 9950X limited to AVX2, ms per
+  expert, 1 thread / 16 threads with 6 experts, `7b964eb` -> now: IQ2_XXS+IQ2_S 4.6 / 0.59 -> 2.8 / 0.31,
+  IQ2_XS 4.9 / 0.62 -> 3.1 / 0.39, IQ2_S+IQ3_XXS 4.7 / 0.61 -> 2.8 / 0.37, IQ3_S 5.4 / 0.68 -> 3.5 / 0.46,
+  IQ1_S+Q2_K 3.9 / 0.50 -> 2.9 / 0.32, IQ1_M+IQ2_XS 5.2 / 0.68 -> 4.4 / 0.54, Q3_K+Q5_K 4.5 / 0.59 ->
+  2.9 / 0.56, Q4_K+Q6_K 4.0 / 0.66 -> 2.3 / 0.62. MXFP4 (1.0 / 0.53) does not use them.
+- Not yet run on the Xeons or with a real low-bit model.

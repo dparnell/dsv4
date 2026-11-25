@@ -240,7 +240,8 @@ IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and Q2_K keep their bits in
 - Selftest: every type as gate/up and as down, one and eight tokens, within 1e-6 of the output range.
 - UD-Q4_K_XL, gpu-only, 64 + 64 tokens, before and after: logits identical byte for byte (ppl 5.3016 on this text).
 - Files of zeros with the real headers of antirez IQ2_XXS/Q2_K and ISTA-DASLab IQ2_XXS load and decode with GPU and
-  CPU experts (10.6 and 10.4 MB slots). - UD-IQ2_XXS with its real weights, two Xeons + RTX 4070 Ti SUPER (a user's runs, sampled, repeated prompt), `7b964eb`
+  CPU experts (10.6 and 10.4 MB slots).
+- UD-IQ2_XXS with its real weights, two Xeons + RTX 4070 Ti SUPER (a user's runs, sampled, repeated prompt), `7b964eb`
   -> `3d2d747`: 5.0-5.2 -> 6.41, 6.65, 6.60, 6.55 tok/s; slots 285 -> 499; VRAM hits 39.7 -> 47.9%; CPU runs per
   token 143 -> 121, each 0.66 -> 0.48 ms. ms per token: CPU experts 94 -> 58, GPU experts 12 -> 16, rest of GPU
   69 -> 59, other 13 -> 12. The answers read well.
@@ -257,3 +258,8 @@ IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and Q2_K keep their bits in
 - Waiting for the GPU in that run with 0.5 GB of slots, 64 + 40 tokens, alternating: 2.5 and 3.3 s against 10.3 and
   6.4 s (an earlier pair with different slot counts: 10.4 against 6.4). Uploads dominate, so it varies. Decode speed
   with experts in VRAM was not measured.
+- UD-Q4_K_XL on the two Xeons + RTX 4070 Ti SUPER (a user's run, sampled, repeated prompt), `bench-gpu` there
+  MXFP4 0.288 -> 0.081 ms. `cbafa28` -> `fb7a5ca`: requests 3.87, 6.67, 7.09, 7.70, 8.25 -> 3.57, 5.89, 6.47, 7.85,
+  7.85, 8.29 tok/s (last token 8.93); ms per token CPU experts 38 -> 40, disk wait 9 -> 7, GPU experts 4 -> 4, rest
+  of GPU 52 -> 49, other 12 -> 11; VRAM hits 41.4%. About the same: GPU experts run while the CPU runs its own, and
+  the CPU takes longer, so the faster kernel is mostly hidden. At most the 3 ms off "rest of GPU" is from it.

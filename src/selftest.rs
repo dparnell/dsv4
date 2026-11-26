@@ -769,5 +769,42 @@ pub fn bench_gpu(dim: usize, inter: usize, types: [u32; 3]) -> Result<()> {
     let best = |n: usize| (0..n).map(|_| pass()).fold(f64::MAX, f64::min);
     best(5);
     println!("{}: expert {:.1} MB, VRAM slot {:.1} MB, {:.3} ms", gpu.info.name, host.len() as f64 / 1e6, sl.iter().sum::<usize>() as f64 / 1e6, best(60));
+    bench_dense(&gpu);
     Ok(())
+}
+
+/// Time one-token Q8 matmuls of the dense layers' shapes.
+fn bench_dense(gpu: &Gpu) {
+    let kernel = "mm_q8_1";
+    let mut z = 0x9E37_79B9u64;
+    for (n, k) in [(5120usize, 5120usize), (2304, 5120), (5120, 2304), (1280, 5120), (32768, 1280)] {
+        let raw: Vec<u8> = (0..n * k / 32)
+            .flat_map(|_| {
+                z ^= z << 13;
+                z ^= z >> 7;
+                z ^= z << 17;
+                let mut b = half::f16::from_f32(0.01).to_le_bytes().to_vec();
+                b.extend((0..32).map(|i| (z >> (i % 56)) as u8));
+                b
+            })
+            .collect();
+        let packed = crate::weights::repack_q8(&raw, n, k);
+        let copies = (1usize << 30) / packed.len() + 1;
+        let ws: Vec<_> = (0..copies.min(32)).map(|_| gpu.buffer_init("w", &packed)).collect();
+        let x: Vec<f32> = (0..k).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
+        let xb = gpu.buffer_init("x", bytemuck::cast_slice(&x));
+        let yb = gpu.buffer("y", (n * 4) as u64);
+        let params = [n as u32, k as u32, 1, k as u32, n as u32, 0, 0, (n * k / 4) as u32, 0, 0, 0];
+        let pass = || {
+            let mut b = gpu.begin();
+            for w in &ws {
+                b.run(kernel, &[w.all(), xb.all(), yb.all()], &params, ((n as u32).div_ceil(8), 1, 1));
+            }
+            let t0 = std::time::Instant::now();
+            gpu.read_f32(b, &yb, 0, 1);
+            t0.elapsed().as_secs_f64() / ws.len() as f64
+        };
+        let best = (0..30).map(|_| pass()).fold(f64::MAX, f64::min);
+        println!("dense Q8 {n} x {k}: {:.1} us, {:.0} GB/s", best * 1e6, packed.len() as f64 / best / 1e9);
+    }
 }

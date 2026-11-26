@@ -858,6 +858,16 @@ fn eval(mut model: Model, tok: &Tokenizer, stats: &Stats, texts: &[PathBuf], pre
 
 fn print_breakdown(st: &Stats) {
     let g = |c: &std::sync::atomic::AtomicU64| Stats::get(c);
+    let k = st.kernel_ns.lock();
+    if !k.is_empty() {
+        let n = g(&st.gen_tokens).max(1) as f64;
+        let mut v: Vec<_> = k.iter().collect();
+        v.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        eprintln!("GPU time per decoded token: {:.2} ms", v.iter().map(|x| x.1.0).sum::<f64>() / n / 1e6);
+        for (name, (ns, c)) in v.iter().take(25) {
+            eprintln!("  {name:<24} {:>7.3} ms  {:>6.1} calls  {:>6.1} us each", ns / n / 1e6, *c as f64 / n, ns / *c as f64 / 1e3);
+        }
+    }
     let s = |c: &std::sync::atomic::AtomicU64| Stats::get(c) as f64 / 1e9;
     eprintln!(
         "breakdown: gpu-wait {:.2}s  experts {:.2}s (gpu path {:.2}s, cpu path {:.2}s, computing {:.2}s)  disk {:.2} GB in {} loads  ram hits {}  vram hits {}  cpu runs {}  uploads {} ({:.2} GB)  prefetches {} ({} used, {} cancelled)",

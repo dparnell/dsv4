@@ -63,7 +63,19 @@ pub struct Gpu {
     pub gpu_bytes: Arc<AtomicU64>,
     pub stats: Arc<Stats>,
     readback: Mutex<Option<wgpu::Buffer>>,
+    pub prof: Option<Prof>,
 }
+
+/// With DSV4_PROFILE set: GPU time per kernel while decoding, from timestamps around each dispatch
+/// (which then runs in a pass of its own, and each submit waits for the GPU).
+pub struct Prof {
+    qs: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    read: wgpu::Buffer,
+    period: f32,
+    pub on: std::sync::atomic::AtomicBool,
+}
+const PROF_N: u32 = 2048;
 
 impl Gpu {
     pub fn new(stats: Arc<Stats>, backend: Option<&str>) -> Result<Self> {
@@ -116,9 +128,12 @@ impl Gpu {
         if limits.max_immediate_size < 64 {
             bail!("adapter immediate size too small ({})", al.max_immediate_size);
         }
+        let profile = std::env::var_os("DSV4_PROFILE").is_some() && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("dsv4"),
-            required_features: wgpu::Features::IMMEDIATES | wgpu::Features::SUBGROUP,
+            required_features: wgpu::Features::IMMEDIATES
+                | wgpu::Features::SUBGROUP
+                | if profile { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
             required_limits: limits.clone(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -128,7 +143,25 @@ impl Gpu {
             eprintln!("wgpu error: {e}");
             std::process::abort();
         }));
+        let prof = profile.then(|| Prof {
+            qs: device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: PROF_N * 2 }),
+            resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: PROF_N as u64 * 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            read: device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: PROF_N as u64 * 16,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            period: queue.get_timestamp_period(),
+            on: std::sync::atomic::AtomicBool::new(false),
+        });
         let mut g = Self {
+            prof,
             device,
             queue,
             info,
@@ -248,7 +281,7 @@ impl Gpu {
     }
 
     pub fn begin(&self) -> Batch<'_> {
-        Batch { gpu: self, enc: Some(self.device.create_command_encoder(&Default::default())), pass: None, n_dispatch: 0 }
+        Batch { gpu: self, enc: Some(self.device.create_command_encoder(&Default::default())), pass: None, n_dispatch: 0, names: Vec::new() }
     }
 
     /// Push pending buffer writes to the GPU and release their staging memory.
@@ -314,6 +347,7 @@ pub struct Batch<'g> {
     enc: Option<wgpu::CommandEncoder>,
     pass: Option<wgpu::ComputePass<'static>>,
     pub n_dispatch: u32,
+    names: Vec<&'static str>,
 }
 
 impl<'g> Batch<'g> {
@@ -337,12 +371,30 @@ impl<'g> Batch<'g> {
         assert!(params.len() <= 16);
         let mut imm = [0u32; 16];
         imm[..params.len()].copy_from_slice(params);
+        let timed = self.gpu.prof.as_ref().filter(|p| p.on.load(Ordering::Relaxed) && self.names.len() < PROF_N as usize);
+        if let Some(pr) = timed {
+            let i = self.names.len() as u32;
+            self.pass = None;
+            let p = self.enc.as_mut().unwrap().begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: &pr.qs,
+                    beginning_of_pass_write_index: Some(2 * i),
+                    end_of_pass_write_index: Some(2 * i + 1),
+                }),
+            });
+            self.pass = Some(p.forget_lifetime());
+            self.names.push(kernel);
+        }
         let p = self.pass();
         p.set_pipeline(pipe);
         p.set_bind_group(0, &bg, &[]);
         p.set_immediates(0, bytemuck::cast_slice(&imm[..16]));
         p.dispatch_workgroups(groups.0, groups.1, groups.2);
         self.n_dispatch += 1;
+        if timed.is_some() {
+            self.pass = None;
+        }
     }
 
     pub fn copy(&mut self, src: &Buf, so: u64, dst: &wgpu::Buffer, d_o: u64, size: u64) {
@@ -351,17 +403,40 @@ impl<'g> Batch<'g> {
     }
 
     pub fn submit(mut self) {
+        self.finish();
+    }
+
+    fn finish(&mut self) {
         self.pass = None;
-        let enc = self.enc.take().unwrap();
+        let Some(mut enc) = self.enc.take() else { return };
+        let n = self.names.len() as u64;
+        let pr = self.gpu.prof.as_ref().filter(|_| n > 0);
+        if let Some(pr) = pr {
+            enc.resolve_query_set(&pr.qs, 0..2 * n as u32, &pr.resolve, 0);
+            enc.copy_buffer_to_buffer(&pr.resolve, 0, &pr.read, 0, n * 16);
+        }
         self.gpu.queue.submit([enc.finish()]);
+        if let Some(pr) = pr {
+            let slice = pr.read.slice(..n * 16);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            self.gpu.wait();
+            {
+                let v = slice.get_mapped_range().expect("mapped");
+                let t: &[u64] = bytemuck::cast_slice(&v);
+                let mut tot = self.gpu.stats.kernel_ns.lock();
+                for (i, name) in self.names.iter().enumerate() {
+                    let e = tot.entry(name).or_default();
+                    e.0 += t[2 * i + 1].saturating_sub(t[2 * i]) as f64 * pr.period as f64;
+                    e.1 += 1;
+                }
+            }
+            pr.read.unmap();
+        }
     }
 }
 
 impl Drop for Batch<'_> {
     fn drop(&mut self) {
-        self.pass = None;
-        if let Some(enc) = self.enc.take() {
-            self.gpu.queue.submit([enc.finish()]);
-        }
+        self.finish();
     }
 }

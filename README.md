@@ -139,11 +139,12 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/jso
 | `eval` | teacher-forced perplexity and speed on text files; `--save` / `--base` compare two configurations |
 | `repack` | copies the experts into one file (`experts.pack`, 289 GB for Q4_K_XL) with each expert contiguous, so a miss is one 19 MB read instead of three 6 MB ones; lossless, resumable, found by itself next to the model, `--expert-pack` elsewhere; `--layers N` for part of them |
 | `bench-io` | expert streaming throughput from disk |
-| `bench-gpu` | speed of routed experts on the GPU by type (no model needed) |
+| `bench-gpu` | speed of routed experts on the GPU by type, and of the dense Q8 matrices (no model needed) |
 | `bench-cpu` | speed of routed experts on the CPU by thread count (no model needed); `DSV4_CPU_ISA=avx2\|avxvnni\|avx512vnni` picks the kernel |
 
 Common model options: `--ctx` (context, default 32768), `--segment`, `--chunk`, `--expert-vram-gb`,
 `--ram-cache-gb`, `--backend vulkan|dx12|metal`, `--gpu-only-experts`, `--no-prefetch`, `--no-warm-up`, `--tokenizer`.
+`DSV4_PROFILE=1` with `run` or `eval` prints the GPU time of each kernel per decoded token (slower while it is on).
 
 CPU threads: one per logical processor, except on machines with several NUMA nodes (Windows, Linux; typically dual-socket
 servers) or Windows processor groups (more than 64 logical processors), where there is one per core over all of them.

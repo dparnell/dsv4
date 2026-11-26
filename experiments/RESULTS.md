@@ -263,3 +263,19 @@ IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and Q2_K keep their bits in
   7.85, 8.29 tok/s (last token 8.93); ms per token CPU experts 38 -> 40, disk wait 9 -> 7, GPU experts 4 -> 4, rest
   of GPU 52 -> 49, other 12 -> 11; VRAM hits 41.4%. About the same: GPU experts run while the CPU runs its own, and
   the CPU takes longer, so the faster kernel is mostly hidden. At most the 3 ms off "rest of GPU" is from it.
+
+# Rest of GPU
+
+What "rest of GPU" (waiting for the GPU between layers) is made of, RTX 5080, UD-Q4_K_XL, 60 tokens decoded:
+
+- Per layer: 0.83 ms of waiting, 0.16 ms of it the round trip of an empty submit and read; the GPU work itself
+  (timestamps around each dispatch, `DSV4_PROFILE`) 0.69 ms, of which the Q8 dense matrices (`mm_q8_1`, 8.7 per
+  layer) 0.39 ms and some 20 small kernels of 3-130 us the rest.
+- `mm_q8_1` had each lane read a 32-byte block, so 32 lanes read 4 bytes in every 32. Reading 16 bytes per lane in a
+  row: `bench-gpu`, us (GB/s) 5120x5120 60.5 (460) -> 38.3 (727), 2304x5120 26.2 -> 20.3, 5120x2304 29.3 -> 18.9,
+  1280x5120 18.9 -> 13.4, 32768x1280 83.3 -> 58.0. Two loads in flight per lane: no different.
+- On the model: `mm_q8_1` 15.6 -> 11.6 ms per token, all GPU kernels 27.4 -> 24.1 ms.
+- `eval --gpu-only-experts`, 64 + 64 tokens, against the old kernel: KLD 0.0014 (worst 0.012), top-1 100%; well
+  below the 0.012-0.025 that rounding order has moved it before.
+- Left per token: the router in f32 (`mm_f32_1`, 1.8 ms, about 340 GB/s), `hc_mix` 1.7, `attn_scores` 1.3,
+  `hc_pre_norm` 1.1, `quant_sim` 1.0, `idx_scores` 0.9 and many dispatches of a few us; 40 round trips (6 ms).

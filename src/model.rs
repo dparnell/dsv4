@@ -711,6 +711,9 @@ impl Model {
     fn forward_segment(&mut self, toks: &[u32], resume: Option<usize>) -> Result<Vec<f32>> {
         let cfg = self.cfg.clone();
         let t_all = toks.len();
+        if let Some(p) = &self.gpu.prof {
+            p.on.store(t_all == 1, std::sync::atomic::Ordering::Relaxed);
+        }
         let p0 = self.tokens.len();
         if p0 + t_all > self.max_ctx {
             bail!("context overflow: {} + {} > {}", p0, t_all, self.max_ctx);

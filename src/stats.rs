@@ -94,6 +94,8 @@ pub struct Stats {
     pub tps_history: Mutex<VecDeque<u64>>,
     /// tail of the text being generated (for the dashboard)
     pub transcript: Mutex<String>,
+    /// GPU ns and calls per kernel while decoding (DSV4_PROFILE)
+    pub kernel_ns: Mutex<std::collections::HashMap<&'static str, (f64, u64)>>,
 }
 
 /// Nanoseconds of one decoded token, or the running totals they are differences of.

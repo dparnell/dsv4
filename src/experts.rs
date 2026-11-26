@@ -330,6 +330,39 @@ pub fn open_direct(path: &std::path::Path) -> std::io::Result<File> {
     OpenOptions::new().read(true).open(path)
 }
 
+/// "UD-Q4_K_XL, experts MXFP4": the quant's name from the file (or folder) name when it has one, and the
+/// expert types in the file, most used first.
+pub fn quant_label(path: &std::path::Path, layers: &[LayerGeom]) -> String {
+    let name = |s: &str| -> Option<String> {
+        let parts: Vec<&str> = s.split(['-', '.', ' ']).collect();
+        let i = parts.iter().position(|p| {
+            let u = p.to_ascii_uppercase();
+            let rest = u.strip_prefix("IQ").or_else(|| u.strip_prefix('Q'));
+            rest.is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit())) || u.starts_with("MXFP") || u == "BF16" || u == "F16"
+        })?;
+        let mut q = parts[i].to_string();
+        if i > 0 && parts[i - 1].eq_ignore_ascii_case("UD") {
+            q = format!("UD-{q}");
+        }
+        Some(q)
+    };
+    let file = path.file_name().and_then(|s| s.to_str()).and_then(name);
+    let dir = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()).and_then(name);
+    let mut counts: Vec<(u32, usize)> = Vec::new();
+    for t in layers.iter().flat_map(|l| l.types) {
+        match counts.iter_mut().find(|c| c.0 == t) {
+            Some(c) => c.1 += 1,
+            None => counts.push((t, 1)),
+        }
+    }
+    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
+    let types = counts.iter().map(|c| crate::gguf::type_name(c.0)).collect::<Vec<_>>().join("/");
+    match file.or(dir) {
+        Some(q) => format!("{q}, experts {types}"),
+        None => format!("experts {types}"),
+    }
+}
+
 impl ExpertStore {
     pub fn new(g: &Gguf, gpu: &Gpu, cfg: &Config, vram_bytes: u64, ram_bytes: u64, ranking: Option<&[Key]>, pack: Option<&std::path::Path>, stats: Arc<Stats>) -> Result<Self> {
         let (layers, mut locs) = layer_geoms(g, cfg)?;
@@ -341,6 +374,7 @@ impl ExpertStore {
                 *l = p;
             }
         }
+        *stats.quant.lock() = quant_label(&g.shards[0].path, &layers);
         let slot_bytes = layers.iter().map(|l| l.slot_lens(cfg.moe_inter, cfg.dim).iter().sum::<usize>() as u64).max().unwrap();
         let mean_host = layers.iter().map(|l| l.host_len() as f64).sum::<f64>() / layers.len() as f64;
         let geom = ExpertGeom { inter: cfg.moe_inter, dim: cfg.dim, layers, slot_bytes, mean_host };
@@ -856,6 +890,16 @@ pub fn builtin_ranking(cfg: &Config) -> Option<Vec<Key>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quant_labels() {
+        use std::path::Path;
+        let mx = [LayerGeom { types: [GGML_MXFP4; 3], host: [0; 3] }];
+        let mix = [LayerGeom { types: [quants::IQ2_XXS, quants::IQ2_XXS, quants::Q2_K], host: [0; 3] }];
+        assert_eq!(quant_label(Path::new("m/DeepSeek-V4.1-Flash-UD-Q4_K_XL-00001-of-00009.gguf"), &mx), "UD-Q4_K_XL, experts MXFP4");
+        assert_eq!(quant_label(Path::new("UD-IQ2_XXS/model-00001-of-00005.gguf"), &mix), "UD-IQ2_XXS, experts IQ2_XXS/Q2_K");
+        assert_eq!(quant_label(Path::new("x/model.gguf"), &mx), "experts MXFP4");
+    }
+
     use super::*;
 
     #[test]

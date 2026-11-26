@@ -573,7 +573,7 @@ function drawStatus(s) {
   const m = s.metrics, failed = s.phase === "failed";
   dot.className = "dot " + (failed ? "bad" : !s.ready || s.active ? "busy" : "good");
   $("#stPhase").textContent = failed ? "failed to load (see the log)" : s.ready ? s.phase : "loading: " + (s.phase || "starting");
-  $("#stModel").textContent = s.model || s.model_id;
+  $("#stModel").textContent = (s.model || s.model_id) + (s.quant ? ` · ${s.quant}` : "") + (s.profiling ? " · PROFILING" : "");
   $("#stGpu").textContent = s.adapter + (s.gpu ? ` · ${s.gpu.temp} °C · ${s.gpu.power.toFixed(0)} W` : "");
   $("#stUp").textContent = "up " + secs(s.uptime);
   $("#loadBar").classList.toggle("hidden", s.ready || failed);

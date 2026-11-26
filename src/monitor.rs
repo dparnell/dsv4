@@ -141,6 +141,8 @@ impl Monitor {
             "loading": g(&s.load_progress_milli) as f64 / 1000.0,
             "model": *s.model_name.lock(),
             "adapter": *s.adapter.lock(),
+            "quant": *s.quant.lock(),
+            "profiling": s.profiling.load(std::sync::atomic::Ordering::Relaxed),
             "metrics": s.snapshot_json(),
             "ctx_max": g(&s.ctx_max),
             "active": g(&s.requests_active),

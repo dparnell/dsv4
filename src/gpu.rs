@@ -143,6 +143,12 @@ impl Gpu {
             eprintln!("wgpu error: {e}");
             std::process::abort();
         }));
+        if profile {
+            stats.profiling.store(true, Ordering::Relaxed);
+            tracing::warn!("DSV4_PROFILE is set: timing every GPU kernel, decoding will be much slower");
+        } else if std::env::var_os("DSV4_PROFILE").is_some() {
+            tracing::warn!("DSV4_PROFILE is set but this GPU has no timestamp queries; not profiling");
+        }
         let prof = profile.then(|| Prof {
             qs: device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: PROF_N * 2 }),
             resolve: device.create_buffer(&wgpu::BufferDescriptor {

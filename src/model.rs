@@ -332,6 +332,9 @@ impl Model {
             gpu.info.backend,
             gpu.max_binding() as f64 / 1e9
         ));
+        if gpu.prof.is_some() {
+            stats.event("PROFILING (DSV4_PROFILE is set): every GPU kernel is timed, decoding is much slower");
+        }
 
         stats.set_phase("uploading dense weights");
         let mut layers = Vec::new();

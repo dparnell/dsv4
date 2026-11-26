@@ -177,8 +177,14 @@ fn draw(f: &mut Frame, st: &Stats, s: &Snap, cpu_hist: &[u64], disk_hist: &[u64]
     let up = start.elapsed().as_secs();
     let header = Paragraph::new(vec![Line::from(vec![
         Span::styled(format!(" {} ", st.model_name.lock()), title),
+        Span::styled(format!("{} ", st.quant.lock()), Style::default().fg(Color::Magenta)),
         Span::raw(format!("│ {} │ ", st.adapter.lock())),
         Span::styled(format!("{} ", st.phase.lock()), Style::default().fg(Color::Yellow)),
+        if st.profiling.load(std::sync::atomic::Ordering::Relaxed) {
+            Span::styled("PROFILING (DSV4_PROFILE) ", Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("")
+        },
         Span::raw(format!("│ http://{listen} │ up {:02}:{:02}:{:02} │ q to quit", up / 3600, up / 60 % 60, up % 60)),
     ])])
     .block(Block::default().borders(Borders::ALL).title(" dsv4 "));

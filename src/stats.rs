@@ -85,6 +85,10 @@ pub struct Stats {
     pub phase: Mutex<String>,
     pub model_name: Mutex<String>,
     pub adapter: Mutex<String>,
+    /// quant of the model: its name from the file name, and the experts' types
+    pub quant: Mutex<String>,
+    /// DSV4_PROFILE is on: kernel timestamps and a wait after every submit, so decoding is much slower
+    pub profiling: std::sync::atomic::AtomicBool,
     pub events: Mutex<VecDeque<(Instant, String)>>,
     /// per-layer expert hit counters: (vram hits, misses)
     pub layer_hits: Mutex<Vec<(u64, u64)>>,

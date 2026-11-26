@@ -773,9 +773,9 @@ pub fn bench_gpu(dim: usize, inter: usize, types: [u32; 3]) -> Result<()> {
     Ok(())
 }
 
-/// Time one-token Q8 matmuls of the dense layers' shapes.
+/// Time one-token Q8 matmuls of the dense layers' shapes, with each lane reading 16 bytes of a row
+/// (`mm_q8_1`, used) and a 32-byte block (`mm_q8_1_blocks`, DSV4_MM_Q8_BLOCKS=1).
 fn bench_dense(gpu: &Gpu) {
-    let kernel = "mm_q8_1";
     let mut z = 0x9E37_79B9u64;
     for (n, k) in [(5120usize, 5120usize), (2304, 5120), (5120, 2304), (1280, 5120), (32768, 1280)] {
         let raw: Vec<u8> = (0..n * k / 32)
@@ -795,7 +795,7 @@ fn bench_dense(gpu: &Gpu) {
         let xb = gpu.buffer_init("x", bytemuck::cast_slice(&x));
         let yb = gpu.buffer("y", (n * 4) as u64);
         let params = [n as u32, k as u32, 1, k as u32, n as u32, 0, 0, (n * k / 4) as u32, 0, 0, 0];
-        let pass = || {
+        let pass = |kernel: &'static str| {
             let mut b = gpu.begin();
             for w in &ws {
                 b.run(kernel, &[w.all(), xb.all(), yb.all()], &params, ((n as u32).div_ceil(8), 1, 1));
@@ -804,7 +804,12 @@ fn bench_dense(gpu: &Gpu) {
             gpu.read_f32(b, &yb, 0, 1);
             t0.elapsed().as_secs_f64() / ws.len() as f64
         };
-        let best = (0..30).map(|_| pass()).fold(f64::MAX, f64::min);
-        println!("dense Q8 {n} x {k}: {:.1} us, {:.0} GB/s", best * 1e6, packed.len() as f64 / best / 1e9);
+        let mut line = format!("dense Q8 {n} x {k}:");
+        for kernel in ["mm_q8_1", "mm_q8_1_blocks"] {
+            pass(kernel);
+            let best = (0..30).map(|_| pass(kernel)).fold(f64::MAX, f64::min);
+            line += &format!("  {kernel} {:.1} us ({:.0} GB/s)", best * 1e6, packed.len() as f64 / best / 1e9);
+        }
+        println!("{line}");
     }
 }

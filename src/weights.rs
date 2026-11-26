@@ -24,6 +24,15 @@ pub struct Q8Part {
     pub scale_off_words: u32,
 }
 
+/// The one-token Q8 kernel: rows read 16 bytes per lane, or with DSV4_MM_Q8_BLOCKS=1 a 32-byte block per
+/// lane (the kernel before `0bfb068`), to compare the two on a given GPU.
+pub fn q8_1_kernel() -> &'static str {
+    static K: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        if std::env::var("DSV4_MM_Q8_BLOCKS").is_ok_and(|v| v != "0") { "mm_q8_1_blocks" } else { "mm_q8_1" }
+    })
+}
+
 pub fn repack_q8(raw: &[u8], rows: usize, k: usize) -> Vec<u8> {
     let nb = k / 32;
     let nblocks = rows * nb;
@@ -83,7 +92,7 @@ impl Q8W {
     #[allow(clippy::too_many_arguments)]
     pub fn run(&self, b: &mut Batch, x: &Buf, x_off: usize, x_stride: usize, y: &Buf, y_off: usize, y_stride: usize, m: usize, group_rows: usize, accumulate: bool) {
         let tm = if m == 1 { 1 } else { 8 };
-        let kern = if tm == 1 { "mm_q8_1" } else { "mm_q8_8" };
+        let kern = if tm == 1 { q8_1_kernel() } else { "mm_q8_8" };
         for p in &self.parts {
             let params = [
                 p.rows as u32,

@@ -1369,6 +1369,7 @@ pub fn all() -> Vec<(&'static str, String)> {
     let mut v = vec![
         ("mm_q8_8", k(&MM_Q8.replace("TM", "8u"))),
         ("mm_q8_1", k(MM_Q8_1)),
+        ("mm_q8_1_blocks", k(&MM_Q8.replace("TM", "1u"))),
         ("mm_f32_1", k(&MM_F32.replace("TM", "1u"))),
         ("mm_f32_8", k(&MM_F32.replace("TM", "8u"))),
         ("moe_gate_up_1", k(&format!("{MXFP4_COMMON}{}", MOE_GATE_UP.replace("TM", "1u")))),

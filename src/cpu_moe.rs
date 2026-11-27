@@ -34,13 +34,53 @@ pub struct Q8x {
     sum: Vec<f32>,
 }
 
-fn quant_x(x: &[f32], isa: Isa) -> Q8x {
+fn uses_corr(isa: Isa) -> bool {
+    matches!(isa, Isa::AvxVnni | Isa::Avx512Vnni)
+}
+
+impl Q8x {
+    /// Zeros for `n` values (a multiple of 32), to be filled by [`quant_part`].
+    fn zeroed(n: usize, isa: Isa) -> Q8x {
+        let nb = n / 32;
+        let padded = nb.next_multiple_of(2) * 32;
+        Q8x { q: vec![0; padded], d: vec![0.0; nb], corr: if uses_corr(isa) { vec![0; padded / 4] } else { Vec::new() }, sum: vec![0.0; nb * 2] }
+    }
+
+    /// The parts of the blocks from `from` (a multiple of 32) to the end of the values.
+    fn tail_mut(&mut self, from: usize) -> QPart<'_> {
+        let nb = self.d.len();
+        let corr = if self.corr.is_empty() { &mut self.corr[..] } else { &mut self.corr[from / 4..nb * 8] };
+        QPart { q: &mut self.q[from..nb * 32], d: &mut self.d[from / 32..], corr, sum: &mut self.sum[from / 16..] }
+    }
+}
+
+/// Some whole blocks of a [`Q8x`].
+struct QPart<'a> {
+    q: &'a mut [i8],
+    d: &'a mut [f32],
+    corr: &'a mut [i32],
+    sum: &'a mut [f32],
+}
+
+impl<'a> QPart<'a> {
+    /// The first `n` values (a multiple of 32), and the rest.
+    fn split(self, n: usize) -> (QPart<'a>, QPart<'a>) {
+        let (q0, q1) = self.q.split_at_mut(n);
+        let (d0, d1) = self.d.split_at_mut(n / 32);
+        let (c0, c1) = if self.corr.is_empty() { (&mut [][..], self.corr) } else { self.corr.split_at_mut(n / 4) };
+        let (s0, s1) = self.sum.split_at_mut(n / 16);
+        (QPart { q: q0, d: d0, corr: c0, sum: s0 }, QPart { q: q1, d: d1, corr: c1, sum: s1 })
+    }
+}
+
+/// Quantize `x`, whole blocks, into `p`.
+fn quant_part(x: &[f32], isa: Isa, p: QPart) {
     let nb = x.len() / 32;
-    let mut q = vec![0i8; nb.next_multiple_of(2) * 32];
-    let mut d = vec![0f32; nb];
+    assert!(x.len() == nb * 32 && p.d.len() == nb && p.q.len() == nb * 32);
+    let (q, d) = (p.q, p.d);
     #[cfg(target_arch = "x86_64")]
     if isa != Isa::Scalar {
-        unsafe { quant_blocks_avx2(x, &mut q, &mut d) };
+        unsafe { quant_blocks_avx2(x, q, d) };
     }
     if isa == Isa::Scalar {
         for b in 0..nb {
@@ -53,12 +93,18 @@ fn quant_x(x: &[f32], isa: Isa) -> Q8x {
             }
         }
     }
-    let corr = match isa {
-        Isa::AvxVnni | Isa::Avx512Vnni => q.chunks_exact(4).map(|c| -64 * c.iter().map(|&v| v as i32).sum::<i32>()).collect(),
-        _ => Vec::new(),
-    };
-    let sum = q.chunks_exact(16).take(nb * 2).enumerate().map(|(g, c)| c.iter().map(|&v| v as i32).sum::<i32>() as f32 * d[g / 2]).collect();
-    Q8x { q, d, corr, sum }
+    for (c, q) in p.corr.iter_mut().zip(q.chunks_exact(4)) {
+        *c = -64 * q.iter().map(|&v| v as i32).sum::<i32>();
+    }
+    for (g, (s, q)) in p.sum.iter_mut().zip(q.chunks_exact(16)).enumerate() {
+        *s = q.iter().map(|&v| v as i32).sum::<i32>() as f32 * d[g / 2];
+    }
+}
+
+fn quant_x(x: &[f32], isa: Isa) -> Q8x {
+    let mut out = Q8x::zeroed(x.len(), isa);
+    quant_part(x, isa, out.tail_mut(0));
+    out
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -334,7 +380,7 @@ const MAX_N: usize = 4;
 
 /// One row times several inputs, `out[t] = row . xs[t]`.
 #[inline]
-fn dot_row(isa: Isa, qs: &[u8], sc: &[u8], xs: &[Q8x], out: &mut [f32]) {
+fn dot_row(isa: Isa, qs: &[u8], sc: &[u8], xs: &[&Q8x], out: &mut [f32]) {
     assert!(qs.len() == sc.len() * 16 && xs.len() == out.len());
     for (xs, out) in xs.chunks(MAX_N).zip(out.chunks_mut(MAX_N)) {
         assert!(xs.iter().all(|x| x.d.len() == sc.len()));
@@ -343,10 +389,10 @@ fn dot_row(isa: Isa, qs: &[u8], sc: &[u8], xs: &[Q8x], out: &mut [f32]) {
             ($f:ident) => {
                 unsafe {
                     match xs {
-                        [a] => out.copy_from_slice(&$f::<1, 4>(qs, sc, [a])),
-                        [a, b] => out.copy_from_slice(&$f::<2, 2>(qs, sc, [a, b])),
-                        [a, b, c] => out.copy_from_slice(&$f::<3, 2>(qs, sc, [a, b, c])),
-                        [a, b, c, d] => out.copy_from_slice(&$f::<4, 1>(qs, sc, [a, b, c, d])),
+                        [a] => out.copy_from_slice(&$f::<1, 4>(qs, sc, [*a])),
+                        [a, b] => out.copy_from_slice(&$f::<2, 2>(qs, sc, [*a, *b])),
+                        [a, b, c] => out.copy_from_slice(&$f::<3, 2>(qs, sc, [*a, *b, *c])),
+                        [a, b, c, d] => out.copy_from_slice(&$f::<4, 1>(qs, sc, [*a, *b, *c, *d])),
                         _ => unreachable!(),
                     }
                 }
@@ -489,7 +535,7 @@ impl Row {
         quants::decode_row(isa != Isa::Scalar, ty, raw, &mut self.w, &mut self.s, &mut self.m);
     }
 
-    fn dot(&self, isa: Isa, xs: &[Q8x], out: &mut [f32]) {
+    fn dot(&self, isa: Isa, xs: &[&Q8x], out: &mut [f32]) {
         let (w, s) = (&self.w[..], &self.s[..]);
         assert!(w.len() % 256 == 0 && s.len() * 16 == w.len() && xs.len() == out.len());
         for (xs, out) in xs.chunks(MAX_N).zip(out.chunks_mut(MAX_N)) {
@@ -499,10 +545,10 @@ impl Row {
                 ($f:ident) => {
                     unsafe {
                         match xs {
-                            [a] => out.copy_from_slice(&$f::<1, 4>(w, s, [a])),
-                            [a, b] => out.copy_from_slice(&$f::<2, 2>(w, s, [a, b])),
-                            [a, b, c] => out.copy_from_slice(&$f::<3, 2>(w, s, [a, b, c])),
-                            [a, b, c, d] => out.copy_from_slice(&$f::<4, 1>(w, s, [a, b, c, d])),
+                            [a] => out.copy_from_slice(&$f::<1, 4>(w, s, [*a])),
+                            [a, b] => out.copy_from_slice(&$f::<2, 2>(w, s, [*a, *b])),
+                            [a, b, c] => out.copy_from_slice(&$f::<3, 2>(w, s, [*a, *b, *c])),
+                            [a, b, c, d] => out.copy_from_slice(&$f::<4, 1>(w, s, [*a, *b, *c, *d])),
                             _ => unreachable!(),
                         }
                     }
@@ -553,7 +599,7 @@ impl<'a> Mat<'a> {
         Mat { ty, raw, rows, k }
     }
     #[inline]
-    fn row(&self, isa: Isa, r: usize, xs: &[Q8x], buf: &mut Row, out: &mut [f32]) {
+    fn row(&self, isa: Isa, r: usize, xs: &[&Q8x], buf: &mut Row, out: &mut [f32]) {
         if self.ty == GGML_MXFP4 {
             let nb = self.k / 32;
             let (qs, sc) = self.raw.split_at(self.rows * nb * 16);
@@ -812,11 +858,14 @@ fn run_tasks<T: Send>(team: Option<&Team>, nodes: usize, tasks: Vec<(usize, T)>,
     }
 }
 
-/// Cut `out` (`n` values per row) into tasks of at most `task` rows, none of which spans two nodes.
+/// Cut `out` (`n` values per row) into tasks of at most `task` rows, none of which spans two nodes,
+/// all starting at multiples of `align` (which divides `rows` and `task`).
 /// Returns (node, first row, its part of `out`).
-fn cut<'a>(shares: &[usize], rows: usize, n: usize, task: usize, mut out: &'a mut [f32]) -> Vec<(usize, usize, &'a mut [f32])> {
+fn cut<'a>(shares: &[usize], rows: usize, n: usize, task: usize, align: usize, mut out: &'a mut [f32]) -> Vec<(usize, usize, &'a mut [f32])> {
+    debug_assert!(rows % align == 0 && task % align == 0);
     let mut v = Vec::new();
-    for (node, r) in crate::cpu::split(shares, rows).into_iter().enumerate() {
+    for (node, r) in crate::cpu::split(shares, rows / align).into_iter().enumerate() {
+        let r = r.start * align..r.end * align;
         let (a, b) = out.split_at_mut(r.len() * n);
         out = b;
         v.extend(a.chunks_mut((task * n).max(1)).enumerate().map(|(c, o)| (node, r.start + c * task, o)));
@@ -838,19 +887,55 @@ fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa, sha
     }
     let t_call = std::time::Instant::now();
     let us = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e6;
-    // every expert's rows go into one list of tasks, so the threads meet twice however many experts
-    let xq: Vec<Vec<Q8x>> = jobs.iter().map(|j| j.xs.iter().map(|x| quant_x(x, isa)).collect()).collect();
-    // row-major: hidden[i][t]
+    // each input once: in decode every expert of a call has the same one
+    let mut seen: Vec<(*const f32, usize)> = Vec::new();
+    let idx: Vec<Vec<usize>> = jobs
+        .iter()
+        .map(|j| {
+            j.xs.iter()
+                .map(|x| {
+                    let k = (x.as_ptr(), x.len());
+                    seen.iter().position(|&s| s == k).unwrap_or_else(|| {
+                        seen.push(k);
+                        seen.len() - 1
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    let mut uniq: Vec<Option<Q8x>> = (0..seen.len()).map(|_| None).collect();
+    for (j, ix) in jobs.iter().zip(&idx) {
+        for (x, &i) in j.xs.iter().zip(ix) {
+            uniq[i].get_or_insert_with(|| quant_x(x, isa));
+        }
+    }
+    let uniq: Vec<Q8x> = uniq.into_iter().map(Option::unwrap).collect();
+    let xq: Vec<Vec<&Q8x>> = idx.iter().map(|ix| ix.iter().map(|&i| &uniq[i]).collect()).collect();    // row-major: hidden[i][t]
     let mut hidden: Vec<Vec<f32>> = jobs.iter().map(|j| vec![0f32; j.xs.len() * inter]).collect();
+    // the hidden vectors quantized for the down matrix, filled block by block by the tasks
+    let mut hq: Vec<Vec<Q8x>> = jobs.iter().map(|j| j.xs.iter().map(|_| Q8x::zeroed(inter, isa)).collect()).collect();
     let threads = rayon::current_num_threads();
-    let task = task_rows(jobs.len() * inter, threads);
+    // whole blocks of 32, so that every task quantizes its own rows
+    let task = task_rows(jobs.len() * inter, threads).next_multiple_of(32);
     let mut tasks = Vec::new();
-    for ((j, xq), h) in jobs.iter().zip(&xq).zip(&mut hidden) {
+    for (((j, xq), h), hq) in jobs.iter().zip(&xq).zip(&mut hidden).zip(&mut hq) {
         let (gate, up) = (j.mat(0, inter, dim), j.mat(1, inter, dim));
-        tasks.extend(cut(shares, inter, j.xs.len(), task, h).into_iter().map(|(n, first, out)| (n, (first, out, j, xq, gate, up))));
+        let mut rest: Vec<Option<QPart>> = hq.iter_mut().map(|q| Some(q.tail_mut(0))).collect();
+        for (n, first, out) in cut(shares, inter, j.xs.len(), task, 32, h) {
+            let rows = out.len() / j.xs.len();
+            let mine: Vec<QPart> = rest
+                .iter_mut()
+                .map(|r| {
+                    let (a, b) = r.take().unwrap().split(rows);
+                    *r = Some(b);
+                    a
+                })
+                .collect();
+            tasks.push((n, (first, out, mine, j, &xq[..], gate, up)));
+        }
     }
     let prep = us(t_call);
-    run_tasks(team, shares.len(), tasks, 0, |buf, (first, out, j, xq, gate, up)| {
+    run_tasks(team, shares.len(), tasks, 0, |buf, (first, out, mine, j, xq, gate, up)| {
         let n = j.xs.len();
         let (mut g, mut u) = (vec![0f32; n], vec![0f32; n]);
         for (o, row) in out.chunks_mut(n).enumerate() {
@@ -862,20 +947,23 @@ fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa, sha
                 row[t] = gv / (1.0 + (-gv).exp()) * u[t].clamp(-limit, limit) * j.ws[t];
             }
         }
+        for (t, p) in mine.into_iter().enumerate() {
+            if n == 1 {
+                quant_part(out, isa, p);
+            } else {
+                let col: Vec<f32> = out.iter().skip(t).step_by(n).copied().collect();
+                quant_part(&col, isa, p);
+            }
+        }
     });
     let t_mid = std::time::Instant::now();
-    let column = |m: &[f32], n: usize, t: usize| -> Vec<f32> { m.iter().skip(t).step_by(n).copied().collect() };
-    let hq: Vec<Vec<Q8x>> = jobs
-        .iter()
-        .zip(&hidden)
-        .map(|(j, h)| (0..j.xs.len()).map(|t| quant_x(&column(h, j.xs.len(), t), isa)).collect())
-        .collect();
+    let hq: Vec<Vec<&Q8x>> = hq.iter().map(|h| h.iter().collect()).collect();
     let mut out: Vec<Vec<f32>> = jobs.iter().map(|j| vec![0f32; j.xs.len() * dim]).collect();
     let task = 2 * task_rows(jobs.len() * dim / 2, threads);
     let mut tasks = Vec::new();
     for ((j, hq), o) in jobs.iter().zip(&hq).zip(&mut out) {
         let down = j.mat(2, dim, inter);
-        tasks.extend(cut(shares, dim, hq.len(), task, o).into_iter().map(|(n, first, out)| (n, (first, out, hq, down))));
+        tasks.extend(cut(shares, dim, hq.len(), task, 1, o).into_iter().map(|(n, first, out)| (n, (first, out, &hq[..], down))));
     }
     let mid = us(t_mid);
     run_tasks(team, shares.len(), tasks, 1, |buf, (first, out, hq, down)| {
@@ -884,7 +972,15 @@ fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa, sha
         }
     });
     let t_tail = std::time::Instant::now();
-    let res = jobs.iter().zip(&out).map(|(j, o)| (0..j.xs.len()).map(|t| column(o, j.xs.len(), t)).collect()).collect();
+    let column = |m: &[f32], n: usize, t: usize| -> Vec<f32> { m.iter().skip(t).step_by(n).copied().collect() };
+    let res = jobs
+        .iter()
+        .zip(out)
+        .map(|(j, o)| match j.xs.len() {
+            1 => vec![o],
+            n => (0..n).map(|t| column(&o, n, t)).collect(),
+        })
+        .collect();
     if trace::on() {
         trace::call(jobs.len(), us(t_call), prep, mid, us(t_tail));
     }
@@ -1073,7 +1169,7 @@ mod tests {
                 for n in 1..=9 {
                     let xq: Vec<Q8x> = x[..n].iter().map(|x| quant_x(x, isa)).collect();
                     let mut got = vec![0f32; n];
-                    dot_row(isa, &qs, &sc, &xq, &mut got);
+                    dot_row(isa, &qs, &sc, &xq.iter().collect::<Vec<_>>(), &mut got);
                     for (t, g) in got.iter().enumerate() {
                         let xs = quant_x(&x[t], Isa::Scalar);
                         assert_eq!(xq[t].q, xs.q, "{isa:?} quantization");
@@ -1109,7 +1205,7 @@ mod tests {
             for isa in Isa::ALL.into_iter().filter(|i| i.available()) {
                 let xq: Vec<Q8x> = x.iter().map(|x| quant_x(x, isa)).collect();
                 let mut got = vec![0f32; 5];
-                row.dot(isa, &xq, &mut got);
+                row.dot(isa, &xq.iter().collect::<Vec<_>>(), &mut got);
                 for (g, xq) in got.iter().zip(&xq) {
                     let want: f64 = (0..k).map(|i| w[i] as f64 * xq.q[i] as f64 * xq.d[i / 32] as f64).sum();
                     let mag: f64 = (0..k).map(|i| (w[i] as f64 * xq.q[i] as f64 * xq.d[i / 32] as f64).abs()).sum();

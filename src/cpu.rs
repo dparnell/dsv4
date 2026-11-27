@@ -427,6 +427,44 @@ pub fn binder(use_groups: usize, n: usize) -> impl Fn(usize) + Clone + Send + Sy
     }
 }
 
+/// Like [`binder`], but each thread on a core of its own (both its logical processors), the
+/// `n` threads of a group on its cores in turn. Without groups, or with DSV4_PIN_CORES=0, the same
+/// as [`binder`].
+pub fn core_binder(use_groups: usize, n: usize) -> impl Fn(usize) + Clone + Send + Sync + 'static {
+    let t = topology();
+    let groups = &groups()[..use_groups];
+    let off = std::env::var("DSV4_PIN_CORES").is_ok_and(|v| v == "0");
+    let place: Vec<Option<Group>> = if groups.is_empty() || t.pretend || off {
+        Vec::new()
+    } else {
+        let mut seen = vec![0usize; groups.len()];
+        assign(groups, n)
+            .into_iter()
+            .map(|gi| {
+                let g = &groups[gi];
+                let k = seen[gi];
+                seen[gi] += 1;
+                // logical processors of a core are listed together
+                let per = g.logical() / g.cores.max(1);
+                (per > 0 && g.logical() == per * g.cores).then(|| {
+                    let c = k % g.cores;
+                    Group { cores: 1, cpus: g.cpus[c * per..(c + 1) * per].to_vec(), ..g.clone() }
+                })
+            })
+            .collect()
+    };
+    let plain = binder(use_groups, n);
+    move |i| match place.get(i) {
+        Some(Some(core)) => {
+            NODE.set(t.node_of[t.groups.iter().position(|g| g.id == core.id && g.node == core.node).unwrap()]);
+            if !sys::enter(core) {
+                tracing::warn!("worker {i} could not be bound to its core");
+            }
+        }
+        _ => plain(i),
+    }
+}
+
 /// Logical processors the threads can use.
 pub fn logical() -> usize {
     let t = topology();

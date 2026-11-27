@@ -306,3 +306,15 @@ prompt five times, greedy, 300 tokens each. `DSV4_CPU_TRACE=1` logs where the ti
   - Work on the caller alone: inputs quantized 66 us, between the phases 49, outputs gathered 26: **141 us of 1049**,
     twice what `bench-cpu` spends (31 / 33 / 20 for 3 experts). In decode every expert of a call has the same input,
     quantized again for each.
+- Each input quantized once (all experts of a decode call share it); the hidden vectors quantized by the gate/up tasks
+  themselves (tasks start at multiples of 32 rows); one-token outputs returned without a copy; the team's threads each
+  on a core of their own (`DSV4_PIN_CORES=0`: the whole node, as before). Results identical bit for bit (the same
+  arithmetic per 32-block; unit tests). `bench-cpu`, 44 threads awake, ms per expert, before -> after: 1 expert
+  0.31-0.33 -> 0.29-0.31, 3 experts 0.23-0.25 -> 0.22-0.25, 6 experts 0.21-0.24 -> 0.21, 6 x 4 tokens 0.36-0.43 -> 0.35-0.37;
+  pinned against not pinned in one sitting: 0.29 / 0.33, 0.22 / 0.25, 0.21 / 0.22, 0.37 / 0.39.
+- Server, as above, traced, before -> after: 1049 -> 1001 us per call, **317 -> 299 us per expert**; inputs 66 -> 76 us,
+  between 49 -> 27, after 26 -> 3; gate/up 588 -> 583, down 287 -> 283. CPU experts per token in requests 3 to 5:
+  40.0, 39.2, 43.6 -> 38.5, 36.8, 37.5 ms. tok/s 6.77, 8.39, 7.30 -> 7.21, 7.82, 7.72 (the disk wait varies more).
+- What is left on the caller is slow because everything it touches is cold after a phase has streamed 20-100 MB
+  through the caches: quantizing one 5120-vector takes 3.3 us on an idle thread, 7-8 us there; setting up the tasks
+  ~20 us.

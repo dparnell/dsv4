@@ -83,7 +83,7 @@ impl Team {
             spin,
         });
         let mut team = Team { sh: sh.clone(), turn: Mutex::new(()), handles: Vec::new() };
-        let place = crate::cpu::binder(use_groups, n + 1);
+        let place = crate::cpu::core_binder(use_groups, n + 1);
         for i in 0..n {
             let (s, place) = (sh.clone(), place.clone());
             team.handles.push(std::thread::Builder::new().name(format!("expert-cpu-{i}")).spawn(move || {

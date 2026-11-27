@@ -388,3 +388,9 @@ Same machine and server as above (UD-Q4_K_XL, `--ram-cache-gb 206`, 5 greedy req
   GPU experts 5.5 -> 6.7-7.0; GPU busy 23.4-24.7 either way; tok/s 7.50, 7.03, 6.89 and 7.22, 7.62, 8.15 -> 7.23, 7.98,
   8.61 (disk wait 47-92 ms -> 40-79). Promotions copied all at once before the next layer instead (`DSV4_UPLOAD_PIECE_MB=0`),
   same build: 41.6, 40.9, 41.7 ms; the pieces gain 1.5-2 ms.
+- Fence polled: the routing read waited for by `device.poll(Poll)` in a loop instead of `PollType::Wait` (sleeping in
+  the driver). `bench-gpu` round trip 177 -> 123 us median. Live, requests 2 to 5, rest of GPU minus GPU busy (the time
+  not covered by GPU work, steadier than either since disk waits move the clocks) 15.4, 15.4, 15.6, 15.3 -> 10.7, 12.4,
+  10.4, 11.3 ms: ~4 ms a token, more than the round trips alone. Rest of GPU 38.8, 41.5, 33.6, 37.4; other 11.4-12.2 ->
+  10.3-11.9; tok/s 7.02, 7.11, 9.13, 7.97 (disk wait 39-111 ms; at a similar disk wait, 38.6 vs 40.0 ms, 9.13 vs 8.61).
+  Now the default (`DSV4_GPU_POLL=0`: sleep).

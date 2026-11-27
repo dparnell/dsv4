@@ -784,7 +784,9 @@ pub fn bench_gpu(dim: usize, inter: usize, types: [u32; 3]) -> Result<()> {
         println!("keep_busy {iters} iterations: {t:.0} us with the round trip");
     }
     // a tiny kernel and a 4-byte read, as each layer waits for its routing
-    {
+    let was = gpu.poll_spin.load(std::sync::atomic::Ordering::Relaxed);
+    for poll in [false, true] {
+        gpu.poll_spin.store(poll, std::sync::atomic::Ordering::Relaxed);
         let mut t: Vec<f64> = (0..400)
             .map(|_| {
                 let mut b = gpu.begin();
@@ -795,8 +797,10 @@ pub fn bench_gpu(dim: usize, inter: usize, types: [u32; 3]) -> Result<()> {
             })
             .collect();
         t.sort_by(f64::total_cmp);
-        println!("round trip (tiny kernel, 4-byte read): min {:.0}  median {:.0}  90% {:.0} us", t[0], t[200], t[360]);
+        let how = if poll { "fence polled" } else { "driver wait" };
+        println!("round trip (tiny kernel, 4-byte read, {how}): min {:.0}  median {:.0}  90% {:.0} us", t[0], t[200], t[360]);
     }
+    gpu.poll_spin.store(was, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 

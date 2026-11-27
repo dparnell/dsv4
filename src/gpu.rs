@@ -65,6 +65,8 @@ pub struct Gpu {
     readback: Mutex<Option<wgpu::Buffer>>,
     pub prof: Option<Prof>,
     span: Option<Span>,
+    /// Wait for reads by polling the fence in a loop instead of sleeping in the driver (DSV4_GPU_POLL=0: sleep).
+    pub poll_spin: std::sync::atomic::AtomicBool,
 }
 
 /// With DSV4_GPU_SPAN set: GPU time of every batch that is read back, from a timestamp at its start and
@@ -191,6 +193,7 @@ impl Gpu {
         let mut g = Self {
             prof,
             span,
+            poll_spin: std::env::var("DSV4_GPU_POLL").map_or(true, |v| v != "0").into(),
             device,
             queue,
             info,
@@ -394,8 +397,20 @@ impl Gpu {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.wait();
-        rx.recv().expect("map callback").expect("map failed");
+        if self.poll_spin.load(Ordering::Relaxed) {
+            loop {
+                let _ = self.device.poll(wgpu::PollType::Poll);
+                match rx.try_recv() {
+                    Ok(r) => break r,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => std::hint::spin_loop(),
+                    Err(e) => panic!("map callback: {e}"),
+                }
+            }
+        } else {
+            self.wait();
+            rx.recv().expect("map callback")
+        }
+        .expect("map failed");
         let out = {
             let view = slice.get_mapped_range().expect("mapped");
             if let Some(s) = &self.span {

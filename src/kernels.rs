@@ -1102,6 +1102,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// One small workgroup doing arithmetic for p0 iterations and nothing else: run while the GPU would
+/// otherwise wait for the CPU, so that the driver keeps the memory at full clock.
+const KEEP_BUSY: &str = r#"
+@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@compute @workgroup_size(32)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+  var a = 1.0 + f32(lid.x) * 1e-3;
+  for (var i = 0u; i < P.p0; i++) { a = fma(a, 0.9999999, 1e-7); }
+  // never true, but the compiler cannot know: keeps the loop
+  if (a == -1.0) { X[lid.x] = a; }
+}
+"#;
+
 /// Exact top-k per row by 4-pass radix select. Writes indices in ascending order, -1 padded;
 /// ties at the threshold go to the lowest index, so the result never depends on scheduling.
 /// S [M][n_cols]. p0=n_cols p1=k p2=pos0 p3=ratio (n_vis = (pos0+m+1)/ratio, capped at n_cols)
@@ -1400,6 +1413,7 @@ pub fn all() -> Vec<(&'static str, String)> {
         ("block_max", k(BLOCK_MAX)),
         ("cand_mark", k(CAND_MARK)),
         ("zero", k(ZERO)),
+        ("keep_busy", k(KEEP_BUSY)),
         ("topk", k(TOPK)),
         ("attn_scores", k(ATTN_SCORES)),
         ("attn_softmax", k(ATTN_SOFTMAX)),

@@ -770,6 +770,19 @@ pub fn bench_gpu(dim: usize, inter: usize, types: [u32; 3]) -> Result<()> {
     best(5);
     println!("{}: expert {:.1} MB, VRAM slot {:.1} MB, {:.3} ms", gpu.info.name, host.len() as f64 / 1e6, sl.iter().sum::<usize>() as f64 / 1e6, best(60));
     bench_dense(&gpu);
+    let busy = gpu.buffer("busy", 256);
+    for iters in [10_000u32, 100_000, 400_000] {
+        let t = (0..20)
+            .map(|_| {
+                let mut b = gpu.begin();
+                b.run("keep_busy", &[busy.all()], &[iters], (1, 1, 1));
+                let t0 = std::time::Instant::now();
+                gpu.read_f32(b, &busy, 0, 1);
+                t0.elapsed().as_secs_f64() * 1e6
+            })
+            .fold(f64::MAX, f64::min);
+        println!("keep_busy {iters} iterations: {t:.0} us with the round trip");
+    }
     Ok(())
 }
 

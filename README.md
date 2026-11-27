@@ -144,7 +144,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/jso
 
 Common model options: `--ctx` (context, default 32768), `--segment`, `--chunk`, `--expert-vram-gb`,
 `--ram-cache-gb`, `--backend vulkan|dx12|metal`, `--gpu-only-experts`, `--no-prefetch`, `--no-warm-up`, `--tokenizer`.
-`DSV4_PROFILE=1` with `run` or `eval` prints the GPU time of each kernel per decoded token (slower while it is on). `DSV4_CPU_TRACE=1` logs where the time of CPU expert calls goes (phases, thread joins, page placement).
+`DSV4_PROFILE=1` with `run` or `eval` prints the GPU time of each kernel per decoded token (slower while it is on). `DSV4_CPU_TRACE=1` logs where the time of CPU expert calls goes (phases, thread joins, page placement). While the CPU computes experts the GPU runs a tiny kernel for about 0.5 ms (`DSV4_GPU_BUSY_US`, 0: off), so the driver keeps its memory at full clock.
 
 CPU threads: one per logical processor, except on machines with several NUMA nodes (Windows, Linux; typically dual-socket
 servers) or Windows processor groups (more than 64 logical processors), where there is one per core over all of them. The threads that compute experts while generating each get a core of their own (`DSV4_PIN_CORES=0`: any core of their node).

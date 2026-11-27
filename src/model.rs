@@ -102,6 +102,8 @@ struct Acts {
     tmp: Buf,
     logits: Buf,
     dummy: Buf,
+    /// written by `keep_busy` only
+    busy: Buf,
 }
 
 pub struct Model {
@@ -113,6 +115,8 @@ pub struct Model {
     head: Q8W,
     embd: TensorInfo,
     pub experts: Arc<ExpertStore>,
+    /// iterations of `keep_busy` while the CPU computes a layer's experts (0: none)
+    busy_iters: u32,
     /// router weights on the host, for speculative next-layer prefetch
     engram: Option<Arc<Engram>>,
     rope: Buf,
@@ -432,6 +436,7 @@ impl Model {
             tmp: gpu.buffer("tmp", fb(d)),
             logits: gpu.buffer("logits", fb(cfg.vocab)),
             dummy: gpu.buffer("dummy", 256),
+            busy: gpu.buffer("busy", 256),
         };
         let act_bytes = gpu.gpu_bytes.load(std::sync::atomic::Ordering::Relaxed) - dense;
         stats.event(format!("activations + KV state: {:.2} GB (ctx {max_ctx}, segment {seg}, chunk {chunk})", act_bytes as f64 / 1e9));
@@ -488,6 +493,11 @@ impl Model {
         Stats::set(&stats.gpu_total_bytes, gpu.gpu_bytes.load(std::sync::atomic::Ordering::Relaxed));
         Stats::set(&stats.ctx_max, max_ctx as u64);
         Stats::set(&stats.load_progress_milli, 1000);
+        let cpu_experts = opt.cpu_experts && crate::cpu_moe::has_simd();
+        let busy_iters = if cpu_experts { calibrate_busy(&gpu, &a.busy) } else { 0 };
+        if busy_iters > 0 {
+            stats.event(format!("GPU kept busy while the CPU computes experts: {busy_iters} iterations per layer (DSV4_GPU_BUSY_US=0 turns it off)"));
+        }
         stats.set_phase("ready");
         Ok(Self {
             cfg,
@@ -498,6 +508,7 @@ impl Model {
             head,
             embd,
             experts,
+            busy_iters,
             engram,
             rope,
             rope_yarn_off: yarn_off,
@@ -515,7 +526,7 @@ impl Model {
             route_tail_skip: opt.route_tail_skip,
             prompt_skip: opt.prompt_skip,
             gaps: Vec::new(),
-            cpu_experts: opt.cpu_experts && crate::cpu_moe::has_simd(),
+            cpu_experts,
             step: std::sync::atomic::AtomicU64::new(0),
             snapshot: None,
             allowed,
@@ -1069,13 +1080,15 @@ impl Model {
             Vec::new()
         };
         self.experts.end_prefetch(l);
+        // the GPU would wait for the CPU's experts
+        let busy = xnf.is_some() && !cpu_list.is_empty();
         let t_join = std::time::Instant::now();
         // DSV4_CPU_TRACE: when the GPU branch ended (ns after t_join) and on which thread
         let gpu_done = parking_lot::Mutex::new(None::<(u64, std::thread::ThreadId)>);
         let cpu_start = parking_lot::Mutex::new(None::<(u64, std::thread::ThreadId)>);
         let (gpu_res, cpu_res) = rayon::join(
             || {
-                let r = self.run_experts_gpu(l, routing, &gpu_list);
+                let r = self.run_experts_gpu(l, routing, &gpu_list, busy);
                 *gpu_done.lock() = Some((t_join.elapsed().as_nanos() as u64, std::thread::current().id()));
                 r
             },
@@ -1174,7 +1187,7 @@ impl Model {
         self.experts.prefetch(next, &want);
     }
 
-    fn run_experts_gpu(&self, l: usize, routing: &Routing, list: &[usize]) -> Result<()> {
+    fn run_experts_gpu(&self, l: usize, routing: &Routing, list: &[usize], busy: bool) -> Result<()> {
         let cfg = &self.cfg;
         let a = &self.acts;
         let gpu = &self.gpu;
@@ -1244,11 +1257,52 @@ impl Model {
                     ((geom.dim as u32).div_ceil(8), (cnt as u32).div_ceil(tm), 1),
                 );
             }
+            if waves.peek().is_none() {
+                self.keep_busy(&mut b, busy);
+            }
             b.submit();
             drop(gate);
         }
+        if list.is_empty() && busy {
+            let mut b = gpu.begin();
+            self.keep_busy(&mut b, true);
+            b.submit();
+        }
         Ok(())
     }
+
+    /// While the CPU computes experts the GPU would idle, and the driver then lowers the memory
+    /// clock (P3 on an RTX 4070 Ti SUPER: half), which slows the next layer's memory-bound kernels.
+    /// One workgroup kept busy for that time holds it at full clock.
+    fn keep_busy(&self, b: &mut crate::gpu::Batch<'_>, on: bool) {
+        if on && self.busy_iters > 0 {
+            b.run("keep_busy", &[self.acts.busy.all()], &[self.busy_iters], (1, 1, 1));
+        }
+    }
+}
+
+/// Iterations of `keep_busy` that take about `DSV4_GPU_BUSY_US` (default 500) microseconds; 0: off.
+fn calibrate_busy(gpu: &Gpu, buf: &Buf) -> u32 {
+    let want_us: f64 = std::env::var("DSV4_GPU_BUSY_US").ok().and_then(|v| v.parse().ok()).unwrap_or(500.0);
+    if want_us <= 0.0 {
+        return 0;
+    }
+    let time = |iters: u32| {
+        (0..5)
+            .map(|_| {
+                let mut b = gpu.begin();
+                b.run("keep_busy", &[buf.all()], &[iters], (1, 1, 1));
+                let t0 = Instant::now();
+                gpu.read(b, buf, 0, 4);
+                t0.elapsed().as_secs_f64() * 1e6
+            })
+            .fold(f64::MAX, f64::min)
+    };
+    // the clocks go up while this runs; slower clocks only make the result shorter
+    time(200_000);
+    let (a, b) = (time(20_000), time(120_000));
+    let per = ((b - a) / 100_000.0).max(1e-3);
+    (want_us / per).clamp(0.0, 1e7) as u32
 }
 
 /// Results of one layer's CPU experts: (output row, values), and the weights they ran from.

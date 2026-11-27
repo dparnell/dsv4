@@ -338,3 +338,25 @@ prompt five times, greedy, 300 tokens each. `DSV4_CPU_TRACE=1` logs where the ti
 - Server, before -> after: 1020 -> 958 us per call, **303 -> 284 us per expert** (317 when this began); inputs 75 -> 26,
   between 28 -> 6; gate/up 595 -> 610, down 285 -> 310 (fresh output vectors are first touched there now); disk-fresh
   calls 601 -> 539. CPU experts per token in requests 3 to 5: 42.5, 39.1, 35.5 ms (disk wait 113, 47, 35).
+
+# Rest of GPU on the RTX 4070 Ti SUPER: memory clock
+
+Two Xeons + RTX 4070 Ti SUPER, UD-Q4_K_XL, server set up as in "CPU experts inside a real decode", `nvidia-smi`
+sampled every 100 ms during requests 4 and 5.
+
+- `DSV4_PROFILE` is no help here: with every dispatch waited for, the GPU idles and clocks down (`mm_q8_1` 965 us a
+  call, against 53 us in `bench-gpu`). `bench-gpu` itself varies the same way: the first 5120x5120 `mm_q8_1` above
+  (114 us) was taken while the clocks were still rising; repeated, 53-55 us against 66-69 for `mm_q8_1_blocks`, and
+  the new kernel is faster at every shape here too (32768x1280 81-160 us, by clock).
+- While decoding, the GPU is busy ~31% of the time, in short bursts between the CPU's experts, and the driver keeps it
+  in P3 (memory 5001 MHz of 10501) for 44% of the samples, P0 for the rest; its kernels are memory-bound.
+- Promotions (about 6 uploads of 18.8 MB a token) were the suspect: with them off (a temporary switch), no uploads,
+  but rest of GPU 53-56 -> 65 ms, CPU experts 35 -> 47 (211 CPU runs a token instead of ~140), disk wait ~0, 7.7 tok/s
+  either way; and P3 all the time. The uploads were keeping the memory clock up, not slowing the layers down.
+- `keep_busy`: one workgroup of 32 doing arithmetic, about 0.5 ms (iterations calibrated when the model loads,
+  `DSV4_GPU_BUSY_US`, 0: off), recorded with each layer's GPU experts while the CPU computes its own. P0 in 97-99% of
+  the samples, 94 W against 69 W while decoding. Requests 3 to 5, before -> after: rest of GPU 57.7, 55.8, 52.8 ->
+  45.5, 45.7, 47.7 ms; GPU experts 4.5 -> 4.6-4.8; CPU experts 36.1, 34.3, 35.5 -> 32.6, 32.7, 34.4; tok/s 6.85, 7.46,
+  8.30 -> 7.60, 8.36, 7.85 (disk wait varies most: 55, 57, 36 -> 62, 46, 80).
+- A first version with a submit of its own before the experts made GPU experts 4.5 -> 10.5 ms: a submit costs
+  ~150 us, on the path to the CPU branch at every layer.

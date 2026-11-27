@@ -584,9 +584,191 @@ fn task_rows(rows: usize, threads: usize) -> usize {
     if threads <= 32 { TASK } else { (rows / (threads * 3)).clamp(16, TASK) }
 }
 
+/// DSV4_CPU_TRACE=1: where the time of CPU expert calls goes, summed and logged every few thousand
+/// calls (and once at exit). Off, it costs one load per call.
+pub mod trace {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    use parking_lot::Mutex;
+
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("DSV4_CPU_TRACE").is_ok_and(|v| v != "0"))
+    }
+
+    /// One thread's part in one parallel phase: µs from the phase's start.
+    #[derive(Clone, Copy)]
+    pub struct Part {
+        pub start: f64,
+        pub end: f64,
+        pub local: u32,
+        pub remote: u32,
+        pub caller: bool,
+    }
+
+    #[derive(Default)]
+    struct Phase {
+        n: u64,
+        threads: f64,
+        /// mean over threads of when they started, and the latest start
+        start_mean: f64,
+        start_max: f64,
+        /// when the caller came out and when the last thread was done
+        end_caller: f64,
+        end_max: f64,
+        wall: f64,
+        local: u64,
+        remote: u64,
+    }
+
+    impl Phase {
+        fn add(&mut self, wall: f64, parts: &[Part]) {
+            let k = parts.len().max(1) as f64;
+            self.n += 1;
+            self.threads += parts.len() as f64;
+            self.start_mean += parts.iter().map(|p| p.start).sum::<f64>() / k;
+            self.start_max += parts.iter().map(|p| p.start).fold(0.0, f64::max);
+            self.end_caller += parts.iter().find(|p| p.caller).map_or(0.0, |p| p.end);
+            self.end_max += parts.iter().map(|p| p.end).fold(0.0, f64::max);
+            self.wall += wall;
+            self.local += parts.iter().map(|p| p.local as u64).sum::<u64>();
+            self.remote += parts.iter().map(|p| p.remote as u64).sum::<u64>();
+        }
+        fn line(&self, name: &str) -> String {
+            let n = self.n.max(1) as f64;
+            format!(
+                "{name}: {:.0} us, {:.1} threads, started {:.0} us on average (last {:.0}), caller done {:.0}, last done {:.0}, tasks of another node {:.1}%",
+                self.wall / n,
+                self.threads / n,
+                self.start_mean / n,
+                self.start_max / n,
+                self.end_caller / n,
+                self.end_max / n,
+                100.0 * self.remote as f64 / (self.local + self.remote).max(1) as f64
+            )
+        }
+    }
+
+    #[derive(Default)]
+    struct Agg {
+        calls: u64,
+        experts: u64,
+        /// calls by number of experts: 1, 2, 3, 4-6, more
+        by_size: [(u64, f64); 5],
+        total: f64,
+        prep: f64,
+        mid: f64,
+        tail: f64,
+        phases: [Phase; 2],
+        caller_node: [u64; 4],
+        caller_team: u64,
+        pages_right: u64,
+        pages_wrong: u64,
+        seen: std::collections::HashSet<usize>,
+        branches: u64,
+        branch_wait: f64,
+        branch_gpu: f64,
+        branch_after_gpu: u64,
+    }
+
+    static AGG: Mutex<Option<Agg>> = Mutex::new(None);
+
+    /// A layer's CPU branch started `us` after the layer's experts did; the GPU branch took `gpu`.
+    pub fn branch(us: f64, gpu: f64, same_thread: bool) {
+        let mut g = AGG.lock();
+        let a = g.get_or_insert_default();
+        a.branches += 1;
+        a.branch_wait += us;
+        a.branch_gpu += gpu;
+        a.branch_after_gpu += same_thread as u64;
+    }
+
+    pub fn phase(i: usize, t0: Instant, parts: &[Part]) {
+        let wall = t0.elapsed().as_secs_f64() * 1e6;
+        AGG.lock().get_or_insert_default().phases[i].add(wall, parts);
+    }
+
+    /// Placement of an expert buffer, once per buffer.
+    pub fn blob(b: &[u8], homes: impl FnOnce() -> crate::expert_io::Homes) {
+        let mut g = AGG.lock();
+        let a = g.get_or_insert_default();
+        if !a.seen.insert(b.as_ptr() as usize) {
+            return;
+        }
+        drop(g);
+        let (r, w) = crate::cpu::placed(b, &homes());
+        let mut g = AGG.lock();
+        let a = g.get_or_insert_default();
+        a.pages_right += r as u64;
+        a.pages_wrong += w as u64;
+    }
+
+    /// µs of: the whole call, quantizing inputs, between the phases, after them.
+    pub fn call(experts: usize, total: f64, prep: f64, mid: f64, tail: f64) {
+        let mut g = AGG.lock();
+        let a = g.get_or_insert_default();
+        a.calls += 1;
+        a.experts += experts as u64;
+        let b = &mut a.by_size[match experts {
+            1..=3 => experts - 1,
+            4..=6 => 3,
+            _ => 4,
+        }];
+        b.0 += 1;
+        b.1 += total;
+        a.total += total;
+        a.prep += prep;
+        a.mid += mid;
+        a.tail += tail;
+        a.caller_node[crate::cpu::node().min(3)] += 1;
+        a.caller_team += std::thread::current().name().is_some_and(|n| n.starts_with("expert-cpu")) as u64;
+        if a.calls % 4000 == 0 {
+            let s = report(a);
+            drop(g);
+            tracing::info!("{s}");
+        }
+    }
+
+    fn report(a: &Agg) -> String {
+        let n = a.calls.max(1) as f64;
+        let sizes: Vec<String> = ["1", "2", "3", "4-6", "7+"]
+            .iter()
+            .zip(&a.by_size)
+            .filter(|(_, b)| b.0 > 0)
+            .map(|(s, b)| format!("{s}: {} calls {:.0} us", b.0, b.1 / b.0 as f64))
+            .collect();
+        format!(
+            "CPU experts: {} calls, {:.2} experts each, {:.0} us per call = {:.0} us per expert (inputs {:.0}, between {:.0}, after {:.0}); by experts {}; caller on node {:?}, a team thread {}; pages on their node {:.1}% of {}\n  layers: CPU branch began {:.0} us after the GPU branch (which took {:.0} us), on the same thread in {:.0}%\n  {}\n  {}",
+            a.calls,
+            a.experts as f64 / n,
+            a.total / n,
+            a.total / a.experts.max(1) as f64,
+            a.prep / n,
+            a.mid / n,
+            a.tail / n,
+            sizes.join(", "),
+            a.caller_node,
+            a.caller_team,
+            100.0 * a.pages_right as f64 / (a.pages_right + a.pages_wrong).max(1) as f64,
+            a.pages_right + a.pages_wrong,
+            a.branch_wait / a.branches.max(1) as f64,
+            a.branch_gpu / a.branches.max(1) as f64,
+            100.0 * a.branch_after_gpu as f64 / a.branches.max(1) as f64,
+            a.phases[0].line("gate/up"),
+            a.phases[1].line("down"),
+        )
+    }
+
+    /// What there is so far, starting over.
+    pub fn take() -> Option<String> {
+        AGG.lock().take().filter(|a| a.calls > 0).map(|a| report(&a))
+    }
+}
+
 /// Run `tasks`, given with the NUMA node whose memory each works on, on `team` or else over the
 /// thread pool: threads take those of their own node first, then help with the others'.
-fn run_tasks<T: Send>(team: Option<&Team>, nodes: usize, tasks: Vec<(usize, T)>, f: impl Fn(&mut Row, T) + Sync) {
+fn run_tasks<T: Send>(team: Option<&Team>, nodes: usize, tasks: Vec<(usize, T)>, phase: usize, f: impl Fn(&mut Row, T) + Sync) {
     let threads = rayon::current_num_threads().min(tasks.len());
     // a counter hands out each queue; the locks around tasks are never contended
     #[repr(align(128))]
@@ -595,7 +777,15 @@ fn run_tasks<T: Send>(team: Option<&Team>, nodes: usize, tasks: Vec<(usize, T)>,
     for (n, t) in tasks {
         queues[n].1.push(Mutex::new(Some(t)));
     }
+    let tracing = trace::on();
+    let t0 = std::time::Instant::now();
+    let caller = std::thread::current().id();
+    // a slot per thread: a lock here would itself hold the threads up
+    let parts: Vec<std::sync::OnceLock<trace::Part>> = if tracing { (0..256).map(|_| std::sync::OnceLock::new()).collect() } else { Vec::new() };
+    let n_parts = AtomicUsize::new(0);
     let work = || {
+        let start = t0.elapsed().as_secs_f64() * 1e6;
+        let (mut local, mut remote) = (0u32, 0u32);
         let mut buf = Row::default();
         let me = crate::cpu::node();
         for i in 0..nodes {
@@ -603,11 +793,22 @@ fn run_tasks<T: Send>(team: Option<&Team>, nodes: usize, tasks: Vec<(usize, T)>,
             while let Some(t) = q.get(next.0.fetch_add(1, Ordering::Relaxed)) {
                 let t = t.lock().take().expect("handed out once");
                 f(&mut buf, t);
+                *(if i == 0 { &mut local } else { &mut remote }) += 1;
+            }
+        }
+        if tracing && local + remote > 0 {
+            let end = t0.elapsed().as_secs_f64() * 1e6;
+            if let Some(s) = parts.get(n_parts.fetch_add(1, Ordering::Relaxed)) {
+                let _ = s.set(trace::Part { start, end, local, remote, caller: std::thread::current().id() == caller });
             }
         }
     };
     if !team.is_some_and(|t| t.run(&work)) {
         (0..threads).into_par_iter().with_max_len(1).for_each(|_| work());
+    }
+    if tracing {
+        let parts: Vec<trace::Part> = parts.iter().filter_map(|p| p.get().copied()).collect();
+        trace::phase(phase, t0, &parts);
     }
 }
 
@@ -630,6 +831,13 @@ pub fn experts_forward(jobs: &[Job], inter: usize, dim: usize, limit: f32) -> Ve
 }
 
 fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa, shares: &[usize], team: Option<&Team>) -> Vec<Vec<Vec<f32>>> {
+    if trace::on() {
+        for j in jobs {
+            trace::blob(j.blob, || j.geom.homes(inter, dim, shares));
+        }
+    }
+    let t_call = std::time::Instant::now();
+    let us = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e6;
     // every expert's rows go into one list of tasks, so the threads meet twice however many experts
     let xq: Vec<Vec<Q8x>> = jobs.iter().map(|j| j.xs.iter().map(|x| quant_x(x, isa)).collect()).collect();
     // row-major: hidden[i][t]
@@ -641,7 +849,8 @@ fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa, sha
         let (gate, up) = (j.mat(0, inter, dim), j.mat(1, inter, dim));
         tasks.extend(cut(shares, inter, j.xs.len(), task, h).into_iter().map(|(n, first, out)| (n, (first, out, j, xq, gate, up))));
     }
-    run_tasks(team, shares.len(), tasks, |buf, (first, out, j, xq, gate, up)| {
+    let prep = us(t_call);
+    run_tasks(team, shares.len(), tasks, 0, |buf, (first, out, j, xq, gate, up)| {
         let n = j.xs.len();
         let (mut g, mut u) = (vec![0f32; n], vec![0f32; n]);
         for (o, row) in out.chunks_mut(n).enumerate() {
@@ -654,6 +863,7 @@ fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa, sha
             }
         }
     });
+    let t_mid = std::time::Instant::now();
     let column = |m: &[f32], n: usize, t: usize| -> Vec<f32> { m.iter().skip(t).step_by(n).copied().collect() };
     let hq: Vec<Vec<Q8x>> = jobs
         .iter()
@@ -667,12 +877,18 @@ fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa, sha
         let down = j.mat(2, dim, inter);
         tasks.extend(cut(shares, dim, hq.len(), task, o).into_iter().map(|(n, first, out)| (n, (first, out, hq, down))));
     }
-    run_tasks(team, shares.len(), tasks, |buf, (first, out, hq, down)| {
+    let mid = us(t_mid);
+    run_tasks(team, shares.len(), tasks, 1, |buf, (first, out, hq, down)| {
         for (o, row) in out.chunks_mut(hq.len()).enumerate() {
             down.row(isa, first + o, hq, buf, row);
         }
     });
-    jobs.iter().zip(&out).map(|(j, o)| (0..j.xs.len()).map(|t| column(o, j.xs.len(), t)).collect()).collect()
+    let t_tail = std::time::Instant::now();
+    let res = jobs.iter().zip(&out).map(|(j, o)| (0..j.xs.len()).map(|t| column(o, j.xs.len(), t)).collect()).collect();
+    if trace::on() {
+        trace::call(jobs.len(), us(t_call), prep, mid, us(t_tail));
+    }
+    res
 }
 
 /// [`experts_forward`] for one MXFP4 expert.
@@ -798,6 +1014,9 @@ pub fn bench(dim: usize, inter: usize, types: [u32; 3], gap_ms: f64, spin: Spin)
                 best = best.min(spent * 1e3 / blobs.len() as f64);
             }
             line += &format!("  {name} {best:.2} ms ({:.0} GB/s)", 3.0 * mat / best / 1e6);
+            if let Some(t) = trace::take() {
+                println!("  [{name}] {t}");
+            }
         }
         println!("{line}");
     }

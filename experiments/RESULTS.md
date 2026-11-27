@@ -279,3 +279,30 @@ What "rest of GPU" (waiting for the GPU between layers) is made of, RTX 5080, UD
   below the 0.012-0.025 that rounding order has moved it before.
 - Left per token: the router in f32 (`mm_f32_1`, 1.8 ms, about 340 GB/s), `hc_mix` 1.7, `attn_scores` 1.3,
   `hc_pre_norm` 1.1, `quant_sim` 1.0, `idx_scores` 0.9 and many dispatches of a few us; 40 round trips (6 ms).
+
+# CPU experts inside a real decode
+
+Two Xeon E5-2699 v4 + RTX 4070 Ti SUPER (Windows 10), UD-Q4_K_XL, `serve` with a 206 GB RAM tier warmed up, the same
+prompt five times, greedy, 300 tokens each. `DSV4_CPU_TRACE=1` logs where the time of CPU expert calls goes.
+
+- `bench-cpu` there now, 44 threads, NUMA-local, ms per expert, asleep / awake: 1 expert 0.34 / 0.31-0.32,
+  3 experts 0.33 / 0.23-0.25, 6 experts 0.28 / 0.21-0.24, 6 x 4 tokens 0.47 / 0.36-0.43. `bench-gpu`: MXFP4 0.082 ms;
+  `mm_q8_1` against `mm_q8_1_blocks` 5120x5120 114 / 71 us (the new kernel slower here, unlike the RTX 5080),
+  2304x5120 32 / 41, 5120x2304 31 / 43, 1280x5120 22 / 29, 32768x1280 163 / 240.
+- Server, `1b3b188`, ms per token over the last 100, requests 1 to 5: 3.00, 5.73, 5.25, 7.11, 8.21 tok/s; CPU experts
+  41-44, about 142 CPU runs per token, so **0.30 ms each**, not 0.44: the 0.44 above was before threads were kept
+  awake between layers. Disk wait 29-149 (the tier holds 206 of 289 GB), GPU experts 4.2-4.5, rest of GPU 52-75,
+  other 13-15.
+- Traced (tracing costs `bench-cpu` 1 expert 0.32 -> 0.34 ms), 60,000 calls: 3.31 experts per call, 1049 us per call,
+  317 us per expert. By experts per call: 1: 507 us, 2: 667, 3: 934, 4-6: 1323 (`bench-cpu` 1: 353, 3: 825, 6: 1488).
+  - Expert pages loaded at run time: 99.1% on the node that computes their rows (45.7 M pages checked); 2.1-2.6% of
+    tasks taken from the other node's queue. Placement is not what is lost.
+  - Threads join a phase 15-25 us after it starts (bench 13-15), the last 22-38 us after; the caller (73% of calls on
+    node 1) waits ~50 us at the end of gate/up for the last threads. Waking is not what is lost either.
+  - The CPU branch of `rayon::join` starts 50 us after the layer's experts do (the same thread as the GPU branch, after
+    it, in 6% of layers).
+  - Gate/up 588 us, down 287 us per call: about 10% more than `bench-cpu` for the same experts (other threads and the
+    GPU's uploads share the memory).
+  - Work on the caller alone: inputs quantized 66 us, between the phases 49, outputs gathered 26: **141 us of 1049**,
+    twice what `bench-cpu` spends (31 / 33 / 20 for 3 experts). In decode every expert of a call has the same input,
+    quantized again for each.

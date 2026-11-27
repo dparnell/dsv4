@@ -868,6 +868,9 @@ fn print_breakdown(st: &Stats) {
             eprintln!("  {name:<24} {:>7.3} ms  {:>6.1} calls  {:>6.1} us each", ns / n / 1e6, *c as f64 / n, ns / *c as f64 / 1e3);
         }
     }
+    if let Some(t) = cpu_moe::trace::take() {
+        eprintln!("{t}");
+    }
     let s = |c: &std::sync::atomic::AtomicU64| Stats::get(c) as f64 / 1e9;
     eprintln!(
         "breakdown: gpu-wait {:.2}s  experts {:.2}s (gpu path {:.2}s, cpu path {:.2}s, computing {:.2}s)  disk {:.2} GB in {} loads  ram hits {}  vram hits {}  cpu runs {}  uploads {} ({:.2} GB)  prefetches {} ({} used, {} cancelled)",

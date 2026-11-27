@@ -1069,10 +1069,19 @@ impl Model {
             Vec::new()
         };
         self.experts.end_prefetch(l);
+        let t_join = std::time::Instant::now();
+        // DSV4_CPU_TRACE: when the GPU branch ended (ns after t_join) and on which thread
+        let gpu_done = parking_lot::Mutex::new(None::<(u64, std::thread::ThreadId)>);
+        let cpu_start = parking_lot::Mutex::new(None::<(u64, std::thread::ThreadId)>);
         let (gpu_res, cpu_res) = rayon::join(
-            || self.run_experts_gpu(l, routing, &gpu_list),
+            || {
+                let r = self.run_experts_gpu(l, routing, &gpu_list);
+                *gpu_done.lock() = Some((t_join.elapsed().as_nanos() as u64, std::thread::current().id()));
+                r
+            },
             || -> Result<CpuOut> {
                 let Some(x) = xnf else { return Ok(Default::default()) };
+                *cpu_start.lock() = Some((t_join.elapsed().as_nanos() as u64, std::thread::current().id()));
                 let t_cpu = std::time::Instant::now();
                 let _timer = scopeguard(|| Stats::add(&self.stats.t_cpu_moe_ns, t_cpu.elapsed().as_nanos() as u64));
                 let d = cfg.dim;
@@ -1116,6 +1125,9 @@ impl Model {
             },
         );
         Stats::add(&self.stats.t_moe_ns, t_moe.elapsed().as_nanos() as u64);
+        if let (true, Some(g), Some(c)) = (crate::cpu_moe::trace::on() && !cpu_list.is_empty(), *gpu_done.lock(), *cpu_start.lock()) {
+            crate::cpu_moe::trace::branch(c.0 as f64 / 1e3, g.0 as f64 / 1e3, g.1 == c.1);
+        }
         gpu_res?;
         let out = cpu_res?;
         Stats::add(&self.stats.expert_cpu_runs, cpu_list.len() as u64);

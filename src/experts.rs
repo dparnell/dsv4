@@ -281,6 +281,23 @@ struct VramState {
 /// Promotions (CPU-run experts copied to VRAM in the background) outstanding at once.
 const MAX_PROMOTIONS: usize = 2;
 
+/// A promotion's copy to VRAM: its data in a staging buffer, sent a piece at a time
+/// (`send_uploads`).
+struct Upload {
+    k: Key,
+    slot: usize,
+    staging: wgpu::Buffer,
+    len: u64,
+    done: u64,
+}
+
+/// What one `send_uploads` recorded: bytes, and the promotions it finished.
+#[derive(Default)]
+pub struct Sent {
+    pub bytes: u64,
+    done: Vec<(Key, usize)>,
+}
+
 pub struct ExpertStore {
     pub geom: ExpertGeom,
     /// layers with missing (dev-partial) experts are not worth reading
@@ -297,6 +314,8 @@ pub struct ExpertStore {
     /// promotion takes a slot away
     pub slot_gate: Mutex<()>,
     promoting: std::sync::atomic::AtomicUsize,
+    /// promotions whose slot is taken, not yet (fully) written
+    uploads: Mutex<std::collections::VecDeque<Upload>>,
     stats: Arc<Stats>,
     pub n_slots: usize,
     /// experts kept in host memory for the whole run (never evicted)
@@ -455,6 +474,7 @@ impl ExpertStore {
             }),
             slot_gate: Mutex::new(()),
             promoting: Default::default(),
+            uploads: Default::default(),
             stats,
             n_slots,
             pinned_ram: Mutex::new(HashMap::new()),
@@ -626,7 +646,15 @@ impl ExpertStore {
                 let Some(s) = me.upgrade() else { return };
                 n += 1;
                 if s.has_free_slot() {
-                    s.promote_now(&gpu, k, &v);
+                    s.promoting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if s.promote_now(&gpu, k, &v) {
+                        let mut b = gpu.begin();
+                        let sent = s.send_uploads(&mut b, None);
+                        b.submit();
+                        s.uploads_done(sent);
+                    } else {
+                        s.promoting.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         });
@@ -674,8 +702,9 @@ impl ExpertStore {
         let (me, gpu) = (self.clone(), gpu.clone());
         // a plain thread: it may wait for the slot gate, which must not hold up the rayon pool
         std::thread::spawn(move || {
-            me.promote_now(&gpu, key(layer, e), &data);
-            me.promoting.fetch_sub(1, Relaxed);
+            if !me.promote_now(&gpu, key(layer, e), &data) {
+                me.promoting.fetch_sub(1, Relaxed);
+            }
         });
     }
 
@@ -683,8 +712,14 @@ impl ExpertStore {
         self.geom.layers[layer].slot_data(self.geom.inter, self.geom.dim, host)
     }
 
-    fn promote_now(&self, gpu: &Gpu, k: Key, data: &[u8]) {
-        let data = self.slot_data((k >> 16) as usize, data);
+    /// Take a slot for `k` and queue its copy; false if it needs none.
+    fn promote_now(&self, gpu: &Gpu, k: Key, host: &[u8]) -> bool {
+        if self.vram.lock().map.contains_key(&k) {
+            return false;
+        }
+        let data = self.slot_data((k >> 16) as usize, host);
+        let staging = gpu.staging(&data);
+        let len = data.len() as u64;
         let slot = {
             // once the gate is ours, every command using the victim's old contents is submitted;
             // the queue orders the write below after them
@@ -692,27 +727,62 @@ impl ExpertStore {
             let heat = self.heat.lock();
             let mut v = self.vram.lock();
             if v.map.contains_key(&k) {
-                return;
+                return false;
             }
-            let Some(s) = self.victim(&v, &heat, u64::MAX) else { return };
+            let Some(s) = self.victim(&v, &heat, u64::MAX) else { return false };
             if let Some(old) = v.slot_key[s].take() {
                 v.map.remove(&old);
             }
             v.busy[s] = true;
             s
         };
-        let r = self.slot_ref(slot);
-        gpu.write(&self.slabs[r.slab].buf, r.offset, &data);
-        Stats::add(&self.stats.expert_uploads, 1);
-        let mut v = self.vram.lock();
-        v.busy[slot] = false;
-        // a prefill wave may have brought the same expert in meanwhile
-        if !v.map.contains_key(&k) {
-            v.slot_key[slot] = Some(k);
-            v.map.insert(k, slot);
+        self.uploads.lock().push_back(Upload { k, slot, staging, len, done: 0 });
+        true
+    }
+
+    /// Record copies of queued promotions to VRAM into `b`: at most about `budget` bytes, or all of
+    /// them. A caller about to submit work that runs while the CPU computes experts gets them done
+    /// while the GPU would otherwise idle, instead of ahead of the next layer. Pass what it returns to
+    /// `uploads_done` once `b` is submitted.
+    pub fn send_uploads(&self, b: &mut crate::gpu::Batch<'_>, budget: Option<u64>) -> Sent {
+        let mut q = self.uploads.lock();
+        let mut s = Sent::default();
+        while let Some(u) = q.front_mut() {
+            let left = budget.map_or(u64::MAX, |b| b.saturating_sub(s.bytes));
+            if left == 0 {
+                break;
+            }
+            let n = (u.len - u.done).min(left);
+            let r = self.slot_ref(u.slot);
+            b.copy_raw(&u.staging, u.done, &self.slabs[r.slab].buf.buf, r.offset + u.done, n);
+            u.done += n;
+            s.bytes += n;
+            if u.done < u.len {
+                break;
+            }
+            s.done.push((u.k, u.slot));
+            q.pop_front();
         }
-        let used = v.slot_key.iter().filter(|s| s.is_some()).count();
-        Stats::set(&self.stats.vram_slots_used, used as u64);
+        s
+    }
+
+    /// The promotions `send_uploads` finished, now that their copies are submitted: their slots
+    /// can be used.
+    pub fn uploads_done(&self, s: Sent) {
+        use std::sync::atomic::Ordering::Relaxed;
+        for (k, slot) in s.done {
+            Stats::add(&self.stats.expert_uploads, 1);
+            let mut v = self.vram.lock();
+            v.busy[slot] = false;
+            // a prefill wave may have brought the same expert in meanwhile
+            if !v.map.contains_key(&k) {
+                v.slot_key[slot] = Some(k);
+                v.map.insert(k, slot);
+            }
+            let used = v.slot_key.iter().filter(|s| s.is_some()).count();
+            Stats::set(&self.stats.vram_slots_used, used as u64);
+            self.promoting.fetch_sub(1, Relaxed);
+        }
     }
 
     /// Make the given experts of `layer` resident; returns their slots in the same order.

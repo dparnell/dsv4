@@ -64,6 +64,15 @@ pub struct Gpu {
     pub stats: Arc<Stats>,
     readback: Mutex<Option<wgpu::Buffer>>,
     pub prof: Option<Prof>,
+    span: Option<Span>,
+}
+
+/// With DSV4_GPU_SPAN set: GPU time of every batch that is read back, from a timestamp at its start and
+/// one before the copies (nothing else changes, so the clocks stay as they are).
+struct Span {
+    qs: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    period: f32,
 }
 
 /// With DSV4_PROFILE set: GPU time per kernel while decoding, from timestamps around each dispatch
@@ -129,11 +138,14 @@ impl Gpu {
             bail!("adapter immediate size too small ({})", al.max_immediate_size);
         }
         let profile = std::env::var_os("DSV4_PROFILE").is_some() && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let span_f = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let span = std::env::var_os("DSV4_GPU_SPAN").is_some() && adapter.features().contains(span_f);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("dsv4"),
             required_features: wgpu::Features::IMMEDIATES
                 | wgpu::Features::SUBGROUP
-                | if profile { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
+                | if profile { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() }
+                | if span { span_f } else { wgpu::Features::empty() },
             required_limits: limits.clone(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -166,8 +178,19 @@ impl Gpu {
             period: queue.get_timestamp_period(),
             on: std::sync::atomic::AtomicBool::new(false),
         });
+        let span = span.then(|| Span {
+            qs: device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: 2 }),
+            resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            period: queue.get_timestamp_period(),
+        });
         let mut g = Self {
             prof,
+            span,
             device,
             queue,
             info,
@@ -286,8 +309,26 @@ impl Gpu {
         bg
     }
 
+    /// A host-visible buffer holding `data` for commands to copy from; filled on the calling thread,
+    /// so nothing of it waits for the next submit.
+    pub fn staging(&self, data: &[u8]) -> wgpu::Buffer {
+        let b = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("upload"),
+            size: (data.len() as u64).div_ceil(4) * 4,
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        b.slice(..).get_mapped_range_mut().expect("mapped").slice(..data.len()).copy_from_slice(data);
+        b.unmap();
+        b
+    }
+
     pub fn begin(&self) -> Batch<'_> {
-        Batch { gpu: self, enc: Some(self.device.create_command_encoder(&Default::default())), pass: None, n_dispatch: 0, names: Vec::new() }
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        if let Some(s) = &self.span {
+            enc.write_timestamp(&s.qs, 0);
+        }
+        Batch { gpu: self, enc: Some(enc), pass: None, n_dispatch: 0, names: Vec::new() }
     }
 
     /// Push pending buffer writes to the GPU and release their staging memory.
@@ -307,21 +348,47 @@ impl Gpu {
     }
 
     /// Copy several ranges to the host with one submit + one wait.
-    pub fn read_multi(&self, mut batch: Batch<'_>, ranges: &[(&Buf, u64, u64)]) -> Vec<Vec<u8>> {
-        let total: u64 = ranges.iter().map(|r| r.2.div_ceil(256) * 256).sum();
-        let mut cache = self.readback.lock();
-        if cache.as_ref().is_none_or(|b| b.size() < total) {
-            *cache = Some(self.readback_buffer(total.next_power_of_two().max(1 << 20)));
+    pub fn read_multi(&self, batch: Batch<'_>, ranges: &[(&Buf, u64, u64)]) -> Vec<Vec<u8>> {
+        let p = self.prepare_read(batch, ranges);
+        self.finish_read(p)
+    }
+
+    /// `read_multi` in two steps: record the copies and finish the command buffer now (encoding
+    /// the commands is most of a submit's CPU time), submit and wait in `finish_read`. Only one
+    /// read may be prepared at a time.
+    pub fn prepare_read(&self, mut batch: Batch<'_>, ranges: &[(&Buf, u64, u64)]) -> PreparedRead {
+        let span_at: u64 = ranges.iter().map(|r| r.2.div_ceil(256) * 256).sum();
+        let total = span_at + if self.span.is_some() { 256 } else { 0 };
+        if let Some(s) = &self.span {
+            batch.pass = None;
+            let enc = batch.enc.as_mut().unwrap();
+            enc.write_timestamp(&s.qs, 1);
+            enc.resolve_query_set(&s.qs, 0..2, &s.resolve, 0);
         }
-        let rb = cache.as_ref().unwrap().clone();
+        let rb = {
+            let mut cache = self.readback.lock();
+            if cache.as_ref().is_none_or(|b| b.size() < total) {
+                *cache = Some(self.readback_buffer(total.next_power_of_two().max(1 << 20)));
+            }
+            cache.as_ref().unwrap().clone()
+        };
         let mut off = 0;
-        let mut offs = Vec::new();
+        let mut parts = Vec::new();
         for &(src, so, size) in ranges {
             batch.copy(src, so, &rb, off, size.div_ceil(4) * 4);
-            offs.push(off);
+            parts.push((off, size));
             off += size.div_ceil(256) * 256;
         }
-        batch.submit();
+        if let Some(s) = &self.span {
+            batch.enc.as_mut().unwrap().copy_buffer_to_buffer(&s.resolve, 0, &rb, span_at, 16);
+        }
+        let cb = batch.command_buffer();
+        PreparedRead { cb, rb, parts, total, span_at }
+    }
+
+    pub fn finish_read(&self, p: PreparedRead) -> Vec<Vec<u8>> {
+        let PreparedRead { cb, rb, parts, total, span_at } = p;
+        self.queue.submit([cb]);
         let slice = rb.slice(..total);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -331,13 +398,17 @@ impl Gpu {
         rx.recv().expect("map callback").expect("map failed");
         let out = {
             let view = slice.get_mapped_range().expect("mapped");
-            ranges.iter().zip(&offs).map(|(r, &o)| view[o as usize..(o + r.2) as usize].to_vec()).collect()
+            if let Some(s) = &self.span {
+                let t: &[u64] = bytemuck::cast_slice(&view[span_at as usize..span_at as usize + 16]);
+                let ns = t[1].saturating_sub(t[0]) as f64 * s.period as f64;
+                self.stats.t_gpu_span_ns.fetch_add(ns as u64, Ordering::Relaxed);
+            }
+            parts.iter().map(|&(o, n)| view[o as usize..(o + n) as usize].to_vec()).collect()
         };
         rb.unmap();
         self.stats.download_bytes.fetch_add(total, Ordering::Relaxed);
         out
     }
-
     pub fn read_f32(&self, batch: Batch<'_>, src: &Buf, offset_elems: u64, n: usize) -> Vec<f32> {
         let b = self.read(batch, src, offset_elems * 4, n as u64 * 4);
         bytemuck::cast_slice(&b).to_vec()
@@ -346,6 +417,15 @@ impl Gpu {
     pub fn max_binding(&self) -> u64 {
         self.limits.max_storage_buffer_binding_size.min(self.limits.max_buffer_size)
     }
+}
+
+/// A read whose commands are recorded and encoded, waiting to be submitted (Gpu::prepare_read).
+pub struct PreparedRead {
+    cb: wgpu::CommandBuffer,
+    rb: wgpu::Buffer,
+    parts: Vec<(u64, u64)>,
+    total: u64,
+    span_at: u64,
 }
 
 pub struct Batch<'g> {
@@ -404,12 +484,27 @@ impl<'g> Batch<'g> {
     }
 
     pub fn copy(&mut self, src: &Buf, so: u64, dst: &wgpu::Buffer, d_o: u64, size: u64) {
+        self.copy_raw(&src.buf, so, dst, d_o, size);
+    }
+
+    pub fn copy_raw(&mut self, src: &wgpu::Buffer, so: u64, dst: &wgpu::Buffer, d_o: u64, size: u64) {
         self.pass = None;
-        self.enc.as_mut().unwrap().copy_buffer_to_buffer(&src.buf, so, dst, d_o, size);
+        self.enc.as_mut().unwrap().copy_buffer_to_buffer(src, so, dst, d_o, size);
     }
 
     pub fn submit(mut self) {
         self.finish();
+    }
+
+    /// The commands, encoded, to submit later. Under DSV4_PROFILE a batch with timed kernels is
+    /// submitted now (it must be waited for), and an empty command buffer is returned.
+    pub fn command_buffer(mut self) -> wgpu::CommandBuffer {
+        if !self.names.is_empty() {
+            self.finish();
+            return self.gpu.device.create_command_encoder(&Default::default()).finish();
+        }
+        self.pass = None;
+        self.enc.take().unwrap().finish()
     }
 
     fn finish(&mut self) {

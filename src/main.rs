@@ -873,8 +873,9 @@ fn print_breakdown(st: &Stats) {
     }
     let s = |c: &std::sync::atomic::AtomicU64| Stats::get(c) as f64 / 1e9;
     eprintln!(
-        "breakdown: gpu-wait {:.2}s  experts {:.2}s (gpu path {:.2}s, cpu path {:.2}s, computing {:.2}s)  disk {:.2} GB in {} loads  ram hits {}  vram hits {}  cpu runs {}  uploads {} ({:.2} GB)  prefetches {} ({} used, {} cancelled)",
+        "breakdown: gpu-wait {:.2}s (GPU busy {:.2}s)  experts {:.2}s (gpu path {:.2}s, cpu path {:.2}s, computing {:.2}s)  disk {:.2} GB in {} loads  ram hits {}  vram hits {}  cpu runs {}  uploads {} ({:.2} GB)  prefetches {} ({} used, {} cancelled)",
         s(&st.t_gpu_wait_ns),
+        s(&st.t_gpu_span_ns),
         s(&st.t_moe_ns),
         s(&st.t_expert_ns),
         s(&st.t_cpu_moe_ns),

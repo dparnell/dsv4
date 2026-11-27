@@ -360,3 +360,31 @@ sampled every 100 ms during requests 4 and 5.
   8.30 -> 7.60, 8.36, 7.85 (disk wait varies most: 55, 57, 36 -> 62, 46, 80).
 - A first version with a submit of its own before the experts made GPU experts 4.5 -> 10.5 ms: a submit costs
   ~150 us, on the path to the CPU branch at every layer.
+
+# Rest of GPU on the RTX 4070 Ti SUPER: encoding the commands
+
+Same machine and server as above (UD-Q4_K_XL, `--ram-cache-gb 206`, 5 greedy requests of 300 tokens). `DSV4_GPU_SPAN`
+(new) puts a GPU timestamp at the start of each layer's batch and one before its readback copies.
+
+- Rest of GPU 48-53 ms a token, of which the batch waited for keeps the GPU busy 23-28 ms (more after long disk waits,
+  when the clocks have dropped; 43 ms for the first request). About 24 ms a token was not GPU work.
+- Not work queued ahead: with the GPU branch waiting for its own commands (a temporary switch), GPU experts 5.5 -> 16-19
+  ms (the `keep_busy` tail, copies and experts that outlast the CPU's), rest of GPU unchanged (47-52).
+- Not the wake-up: `bench-gpu`, a tiny kernel and a 4-byte read, 147-188 us median; polling the fence in a loop
+  instead, 120-127 us (~2 ms a token; not pursued).
+- It was encoding: timed inside the wait, finishing and submitting the command buffer took 42-44% of it, ~21 ms a token,
+  0.5 ms a layer. `queue.submit` itself is cheap; `CommandEncoder::finish` turns the ~50 recorded dispatches into Vulkan
+  commands (0.3 ms a layer with the experts in VRAM, 0.5 with the CPU's expert threads spinning).
+- Prepared ahead: nothing in a layer's commands up to its routing readback depends on the layer before's results, so
+  while the CPU computes a layer's experts, the GPU branch (which only waits for it) records and encodes the next
+  layer's batch (the FFN output added to the stream, attention, router, shared expert, copies); once the CPU's outputs
+  are written, it is submitted. Only for layers with CPU experts: with the experts in VRAM there is nothing to hide it
+  behind (15.7 -> 14.4 tok/s), and nothing is gained. Same text, greedy, with and without.
+- Promotions are no longer written ahead of the next layer: the expert is put in a staging buffer on the promoting
+  thread and copied to its slot in pieces of 6 MB with the commands that run beside the CPU's experts (`keep_busy`
+  still runs; a copy alone does not keep the clocks up: P3 in 40% of samples). Writing the pieces with
+  `queue.write_buffer` on the GPU branch made GPU experts 5.5 -> 16 ms (the copy into wgpu's staging is on the caller).
+- Requests 3 to 5, rest of GPU before -> after: 48.8, 53.1, 51.0 and 48.0, 48.9, 49.0 (two runs) -> 40.1, 39.7, 38.7 ms;
+  GPU experts 5.5 -> 6.7-7.0; GPU busy 23.4-24.7 either way; tok/s 7.50, 7.03, 6.89 and 7.22, 7.62, 8.15 -> 7.23, 7.98,
+  8.61 (disk wait 47-92 ms -> 40-79). Promotions copied all at once before the next layer instead (`DSV4_UPLOAD_PIECE_MB=0`),
+  same build: 41.6, 40.9, 41.7 ms; the pieces gain 1.5-2 ms.

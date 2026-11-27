@@ -67,6 +67,8 @@ pub struct Stats {
     pub ram_cache_entries: AtomicU64,
     // timing breakdown of the last token (ns)
     pub t_gpu_wait_ns: AtomicU64,
+    /// GPU time of the batches waited for (DSV4_GPU_SPAN)
+    pub t_gpu_span_ns: AtomicU64,
     pub t_expert_ns: AtomicU64,
     pub t_sample_ns: AtomicU64,
     pub t_moe_ns: AtomicU64,
@@ -107,6 +109,7 @@ pub struct Stats {
 pub struct DecodeTime {
     pub total: u64,
     gpu_wait: u64,
+    gpu_span: u64,
     moe: u64,
     cpu_moe: u64,
     cpu_compute: u64,
@@ -116,7 +119,7 @@ impl DecodeTime {
     /// The counters now; `total` is left to the caller.
     pub fn read(s: &Stats) -> Self {
         let g = Stats::get;
-        DecodeTime { total: 0, gpu_wait: g(&s.t_gpu_wait_ns), moe: g(&s.t_moe_ns), cpu_moe: g(&s.t_cpu_moe_ns), cpu_compute: g(&s.t_cpu_compute_ns) }
+        DecodeTime { total: 0, gpu_wait: g(&s.t_gpu_wait_ns), gpu_span: g(&s.t_gpu_span_ns), moe: g(&s.t_moe_ns), cpu_moe: g(&s.t_cpu_moe_ns), cpu_compute: g(&s.t_cpu_compute_ns) }
     }
 
     /// From `before` to now, taking `total` ns.
@@ -125,6 +128,7 @@ impl DecodeTime {
         DecodeTime {
             total,
             gpu_wait: n.gpu_wait - before.gpu_wait,
+            gpu_span: n.gpu_span - before.gpu_span,
             moe: n.moe - before.moe,
             cpu_moe: n.cpu_moe - before.cpu_moe,
             cpu_compute: n.cpu_compute - before.cpu_compute,
@@ -159,6 +163,13 @@ impl Stats {
             ("rest of the model (GPU)", ms(&|t| t.gpu_wait)),
             ("other", ms(&|t| t.total.saturating_sub(t.moe + t.gpu_wait))),
         ])
+    }
+
+    /// Mean GPU milliseconds per recent token of the batches waited for (DSV4_GPU_SPAN), else None.
+    pub fn decode_gpu_span(&self) -> Option<f64> {
+        let d = self.decode_times.lock();
+        let sum: u64 = d.iter().map(|t| t.gpu_span).sum();
+        (sum > 0).then(|| sum as f64 / 1e6 / d.len() as f64)
     }
 
     pub fn add(c: &AtomicU64, v: u64) {

@@ -783,6 +783,20 @@ pub fn bench_gpu(dim: usize, inter: usize, types: [u32; 3]) -> Result<()> {
             .fold(f64::MAX, f64::min);
         println!("keep_busy {iters} iterations: {t:.0} us with the round trip");
     }
+    // a tiny kernel and a 4-byte read, as each layer waits for its routing
+    {
+        let mut t: Vec<f64> = (0..400)
+            .map(|_| {
+                let mut b = gpu.begin();
+                b.run("keep_busy", &[busy.all()], &[1], (1, 1, 1));
+                let t0 = std::time::Instant::now();
+                gpu.read_f32(b, &busy, 0, 1);
+                t0.elapsed().as_secs_f64() * 1e6
+            })
+            .collect();
+        t.sort_by(f64::total_cmp);
+        println!("round trip (tiny kernel, 4-byte read): min {:.0}  median {:.0}  90% {:.0} us", t[0], t[200], t[360]);
+    }
     Ok(())
 }
 

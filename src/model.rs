@@ -117,6 +117,10 @@ pub struct Model {
     pub experts: Arc<ExpertStore>,
     /// iterations of `keep_busy` while the CPU computes a layer's experts (0: none)
     busy_iters: u32,
+    /// bytes of queued promotions written with each layer's commands that run beside the CPU's experts
+    upload_piece: usize,
+    /// record and encode the next layer's commands while this one computes its experts (DSV4_PREPARE_AHEAD=0: off)
+    prepare_ahead: bool,
     /// router weights on the host, for speculative next-layer prefetch
     engram: Option<Arc<Engram>>,
     rope: Buf,
@@ -232,6 +236,16 @@ impl<F: FnMut()> Drop for Guard<F> {
 fn scopeguard<F: FnMut()>(f: F) -> Guard<F> {
     Guard(f)
 }
+
+/// What `record_front` recorded for a layer.
+struct Front {
+    row_from: usize,
+    guess: bool,
+    want_x: bool,
+}
+
+/// A layer's commands up to its routing readback, encoded ahead of time.
+type Prepared = (crate::gpu::PreparedRead, Front);
 
 pub struct Routing {
     /// per expert: list of (token, k-slot, weight)
@@ -509,6 +523,8 @@ impl Model {
             embd,
             experts,
             busy_iters,
+            prepare_ahead: std::env::var("DSV4_PREPARE_AHEAD").map_or(true, |v| v != "0"),
+            upload_piece: std::env::var("DSV4_UPLOAD_PIECE_MB").ok().and_then(|v| v.parse::<f64>().ok()).map_or(6 << 20, |mb| (mb * (1u64 << 20) as f64) as usize),
             engram,
             rope,
             rope_yarn_off: yarn_off,
@@ -763,96 +779,41 @@ impl Model {
 
         let n_chunks = t_all.div_ceil(self.chunk);
         let mut cand_active = vec![false; n_chunks];
-        let mut batch = gpu.begin();
+        // Each layer's commands up to its routing readback are recorded and encoded while the
+        // layer before computes its experts (on the GPU branch, which waits for the CPU's anyway),
+        // so they are ready to submit once its outputs are written.
+        let mut batch = Some(gpu.begin());
+        let mut prepared: Option<Prepared> = None;
         for l in 0..cfg.n_layers {
             let ly = &self.layers[l];
-            let ratio = cfg.ratio(l);
-            let yarn = ratio > 0;
-            let (keys_from, out_from) = self.needed_from(l, resume);
-            let last = p0 + t_all - 1;
-            // ---------------- attention, chunk by chunk ----------------
-            for c in 0..n_chunks {
-                let c0 = c * self.chunk;
-                let m = (t_all - c0).min(self.chunk);
-                let pc = p0 + c0;
-                let keys_only = pc + m - 1 < out_from;
-                if pc + m - 1 < keys_from && self.cfg.skip_layer() != Some(l) {
-                    continue;
+            let (tw, p, fr) = match prepared.take() {
+                Some((p, fr)) => (Instant::now(), p, fr),
+                None => {
+                    let mut b = batch.take().unwrap_or_else(|| gpu.begin());
+                    let Some(fr) = self.record_front(&mut b, l, p0, t_all, resume, &mut cand_active, &mut eng_rows)? else {
+                        b.submit();
+                        return Ok(Vec::new());
+                    };
+                    let tw = Instant::now();
+                    let p = gpu.prepare_read(b, &self.read_ranges(l, t_all, &fr));
+                    (tw, p, fr)
                 }
-                if let (Some(e), true) = (&ly.engram, self.engram.is_some()) {
-                    let li = cfg.engram_layers.iter().position(|&x| x == l).unwrap();
-                    let width = self.engram.as_ref().unwrap().cols() * self.engram.as_ref().unwrap().head_dim;
-                    // the emb buffer is reused per chunk, so each chunk needs its own submit
-                    batch.submit();
-                    gpu.write(&a.emb, 0, bytemuck::cast_slice(&eng_rows[li].get()[c0 * width..(c0 + m) * width]));
-                    batch = gpu.begin();
-                    e.kv.run(&mut batch, &a.emb, 0, width, &a.ekv, 0, (cfg.hc_mult + 1) * d, m, 0, false);
-                    batch.run("engram", &[a.h.all(), a.ekv.all(), e.gate.all()], &[d as u32, f(cfg.norm_eps), c0 as u32], (m as u32, cfg.hc_mult as u32, 1));
-                }
-                // hyper-connection mixes for attention, then collapse with the previous FFN's pre mix
-                self.hc_mix(&mut batch, &ly.hc_attn_fn, &ly.hc_attn_sb, &a.mix_a, c0, m);
-                batch.run(
-                    "hc_pre_norm",
-                    &[a.h.all(), a.mix_f.all(), ly.attn_norm.all(), a.xn.all()],
-                    &[d as u32, (l == 0) as u32, f(cfg.norm_eps), c0 as u32, 0, 0],
-                    (m as u32, 1, 1),
-                );
-                self.attention(&mut batch, l, c, m, pc, c0, yarn, &mut cand_active, keys_only)?;
-                if keys_only {
-                    continue;
-                }
-                batch.run(
-                    "hc_post",
-                    &[a.h.all(), a.y.all(), a.dummy.all(), a.mix_a.all()],
-                    &[d as u32, m as u32, 0, 0, c0 as u32],
-                    grid1d(m * d),
-                );
+            };
+            if self.upload_piece == 0 {
+                // DSV4_UPLOAD_PIECE_MB=0: promotions copied ahead of this layer's commands, as before
+                let mut b = gpu.begin();
+                let s = self.experts.send_uploads(&mut b, None);
+                b.submit();
+                self.experts.uploads_done(s);
             }
-            if last < out_from {
-                // nothing here is needed past this layer
-                batch.submit();
-                Stats::add(&self.stats.prompt_rows_skipped, (t_all * (cfg.n_layers - l)) as u64);
-                return Ok(Vec::new());
-            }
-            let row_from = out_from.saturating_sub(p0);
-            Stats::add(&self.stats.prompt_rows_skipped, row_from as u64);
-            // ---------------- MoE over the whole segment ----------------
-            self.hc_mix(&mut batch, &ly.hc_ffn_fn, &ly.hc_ffn_sb, &a.mix_f, 0, t_all);
-            batch.run(
-                "hc_pre_norm",
-                &[a.h.all(), a.mix_a.all(), ly.ffn_norm.all(), a.xnf.all()],
-                &[d as u32, 0, f(cfg.norm_eps), 0, 0, 0],
-                (t_all as u32, 1, 1),
-            );
-            ly.gate_inp.run(&mut batch, &a.xnf, 0, d, &a.rlog, 0, cfg.n_experts, t_all);
-            // guess the next layer's experts by applying its router to this layer's FFN input (the
-            // residual stream changes slowly)
-            let guess = self.prefetch && self.cpu_experts && l + 1 < cfg.n_layers && t_all <= PREFETCH_MAX_TOKENS && self.allowed.is_none();
-            if guess {
-                self.layers[l + 1].gate_inp.run(&mut batch, &a.xnf, 0, d, &a.rnext, 0, cfg.n_experts, t_all);
-            }
-            // shared expert (overlaps with the routing readback)
-            ly.sh_gate.run(&mut batch, &a.xnf, 0, d, &a.sg, 0, cfg.moe_inter, t_all, 0, false);
-            ly.sh_up.run(&mut batch, &a.xnf, 0, d, &a.su, 0, cfg.moe_inter, t_all, 0, false);
-            batch.run("swiglu", &[a.sg.all(), a.su.all(), a.sa.all()], &[(t_all * cfg.moe_inter) as u32, f(cfg.swiglu_limit)], grid1d(t_all * cfg.moe_inter));
-            ly.sh_down.run(&mut batch, &a.sa, 0, cfg.moe_inter, &a.sh_out, 0, d, t_all, 0, false);
-            let tw = Instant::now();
-            let mut ranges = vec![(&a.rlog, 0u64, (t_all * cfg.n_experts * 4) as u64)];
-            let want_x = self.cpu_experts || self.capture.as_ref().is_some_and(|c| c.layer == l);
-            if want_x {
-                ranges.push((&a.xnf, 0, (t_all * d * 4) as u64));
-            }
-            if guess {
-                ranges.push((&a.rnext, 0, (t_all * cfg.n_experts * 4) as u64));
-            }
-            let mut back = gpu.read_multi(batch, &ranges);
+            let mut back = gpu.finish_read(p);
             Stats::add(&self.stats.t_gpu_wait_ns, tw.elapsed().as_nanos() as u64);
-            let next: Option<Vec<f32>> = guess.then(|| bytemuck::cast_slice(&back.pop().unwrap()).to_vec());
-            let xnf_host: Option<Vec<f32>> = if want_x { Some(bytemuck::cast_slice(&back.pop().unwrap()).to_vec()) } else { None };
+            let next: Option<Vec<f32>> = fr.guess.then(|| bytemuck::cast_slice(&back.pop().unwrap()).to_vec());
+            let xnf_host: Option<Vec<f32>> = if fr.want_x { Some(bytemuck::cast_slice(&back.pop().unwrap()).to_vec()) } else { None };
             let rl: Vec<f32> = bytemuck::cast_slice(&back.pop().unwrap()).to_vec();
             let pref = (t_all == 1 && (self.route_prior > 0.0 || self.route_tail_skip > 0))
                 .then(|| RoutePref { prior: self.route_prior, tail_skip: self.route_tail_skip, held: self.experts.held(l, cfg.n_experts) });
-            let routing = route(&cfg, &rl, &ly.exp_bias, t_all, row_from, self.allowed.as_ref().map(|a| a[l].as_slice()), pref.as_ref());
+            let routing = route(&cfg, &rl, &ly.exp_bias, t_all, fr.row_from, self.allowed.as_ref().map(|a| a[l].as_slice()), pref.as_ref());
             Stats::add(&self.stats.route_moved, routing.moved);
             Stats::add(&self.stats.route_dropped, routing.dropped);
             if let Some(cap) = self.capture.as_mut().filter(|c| c.layer == l) {
@@ -864,15 +825,32 @@ impl Model {
             if let Some(next) = next {
                 self.prefetch_next(l + 1, &next, t_all);
             }
-            self.run_experts(l, &routing, xnf_host.as_deref())?;
-            batch = gpu.begin();
-            batch.run(
-                "hc_post",
-                &[a.h.all(), a.sh_out.all(), a.o6.all(), a.mix_f.all()],
-                &[d as u32, t_all as u32, cfg.n_active as u32, 0, 0],
-                grid1d(t_all * d),
-            );
+            // the next layer's engram rows need a submit of their own; DSV4_PROFILE waits on every submit
+            let ahead = self.prepare_ahead
+                && resume.is_none()
+                && l + 1 < cfg.n_layers
+                && !(self.layers[l + 1].engram.is_some() && self.engram.is_some())
+                && gpu.prof.is_none();
+            let (cand, eng) = (&mut cand_active, &mut eng_rows);
+            let me = &*self;
+            let prep = ahead.then(|| {
+                let gpu = &gpu;
+                move || -> Result<Prepared> {
+                    let mut b = gpu.begin();
+                    me.hc_post_ffn(&mut b, t_all);
+                    let fr = me.record_front(&mut b, l + 1, p0, t_all, None, cand, eng)?.expect("whole layer needed");
+                    let p = gpu.prepare_read(b, &me.read_ranges(l + 1, t_all, &fr));
+                    Ok((p, fr))
+                }
+            });
+            prepared = self.run_experts(l, &routing, xnf_host.as_deref(), prep)?;
+            if prepared.is_none() {
+                let mut b = gpu.begin();
+                self.hc_post_ffn(&mut b, t_all);
+                batch = Some(b);
+            }
         }
+        let mut batch = batch.unwrap_or_else(|| gpu.begin());
         // final collapse + head on the last token
         let a = &self.acts;
         batch.run(
@@ -887,6 +865,108 @@ impl Model {
         Ok(logits)
     }
 
+    /// Layer `l`'s commands up to its routing readback: attention, the FFN input, the routers and
+    /// the shared expert. None if, skipping prompt work, nothing past this layer is needed.
+    #[allow(clippy::too_many_arguments)]
+    fn record_front<'g>(
+        &'g self,
+        batch: &mut Batch<'g>,
+        l: usize,
+        p0: usize,
+        t_all: usize,
+        resume: Option<usize>,
+        cand_active: &mut [bool],
+        eng_rows: &mut [crate::engram::Rows],
+    ) -> Result<Option<Front>> {
+        let cfg = &self.cfg;
+        let (a, gpu, d) = (&self.acts, &self.gpu, cfg.dim);
+        let ly = &self.layers[l];
+        let yarn = cfg.ratio(l) > 0;
+        let (keys_from, out_from) = self.needed_from(l, resume);
+        let last = p0 + t_all - 1;
+        // ---------------- attention, chunk by chunk ----------------
+        for c in 0..t_all.div_ceil(self.chunk) {
+            let c0 = c * self.chunk;
+            let m = (t_all - c0).min(self.chunk);
+            let pc = p0 + c0;
+            let keys_only = pc + m - 1 < out_from;
+            if pc + m - 1 < keys_from && self.cfg.skip_layer() != Some(l) {
+                continue;
+            }
+            if let (Some(e), true) = (&ly.engram, self.engram.is_some()) {
+                let li = cfg.engram_layers.iter().position(|&x| x == l).unwrap();
+                let width = self.engram.as_ref().unwrap().cols() * self.engram.as_ref().unwrap().head_dim;
+                // the emb buffer is reused per chunk, so each chunk needs its own submit
+                std::mem::replace(batch, gpu.begin()).submit();
+                gpu.write(&a.emb, 0, bytemuck::cast_slice(&eng_rows[li].get()[c0 * width..(c0 + m) * width]));
+                *batch = gpu.begin();
+                e.kv.run(batch, &a.emb, 0, width, &a.ekv, 0, (cfg.hc_mult + 1) * d, m, 0, false);
+                batch.run("engram", &[a.h.all(), a.ekv.all(), e.gate.all()], &[d as u32, f(cfg.norm_eps), c0 as u32], (m as u32, cfg.hc_mult as u32, 1));
+            }
+            // hyper-connection mixes for attention, then collapse with the previous FFN's pre mix
+            self.hc_mix(batch, &ly.hc_attn_fn, &ly.hc_attn_sb, &a.mix_a, c0, m);
+            batch.run(
+                "hc_pre_norm",
+                &[a.h.all(), a.mix_f.all(), ly.attn_norm.all(), a.xn.all()],
+                &[d as u32, (l == 0) as u32, f(cfg.norm_eps), c0 as u32, 0, 0],
+                (m as u32, 1, 1),
+            );
+            self.attention(batch, l, c, m, pc, c0, yarn, cand_active, keys_only)?;
+            if keys_only {
+                continue;
+            }
+            batch.run("hc_post", &[a.h.all(), a.y.all(), a.dummy.all(), a.mix_a.all()], &[d as u32, m as u32, 0, 0, c0 as u32], grid1d(m * d));
+        }
+        if last < out_from {
+            // nothing here is needed past this layer
+            Stats::add(&self.stats.prompt_rows_skipped, (t_all * (cfg.n_layers - l)) as u64);
+            return Ok(None);
+        }
+        let row_from = out_from.saturating_sub(p0);
+        Stats::add(&self.stats.prompt_rows_skipped, row_from as u64);
+        // ---------------- MoE over the whole segment ----------------
+        self.hc_mix(batch, &ly.hc_ffn_fn, &ly.hc_ffn_sb, &a.mix_f, 0, t_all);
+        batch.run(
+            "hc_pre_norm",
+            &[a.h.all(), a.mix_a.all(), ly.ffn_norm.all(), a.xnf.all()],
+            &[d as u32, 0, f(cfg.norm_eps), 0, 0, 0],
+            (t_all as u32, 1, 1),
+        );
+        ly.gate_inp.run(batch, &a.xnf, 0, d, &a.rlog, 0, cfg.n_experts, t_all);
+        // guess the next layer's experts by applying its router to this layer's FFN input (the
+        // residual stream changes slowly)
+        let guess = self.prefetch && self.cpu_experts && l + 1 < cfg.n_layers && t_all <= PREFETCH_MAX_TOKENS && self.allowed.is_none();
+        if guess {
+            self.layers[l + 1].gate_inp.run(batch, &a.xnf, 0, d, &a.rnext, 0, cfg.n_experts, t_all);
+        }
+        // shared expert (overlaps with the routing readback)
+        ly.sh_gate.run(batch, &a.xnf, 0, d, &a.sg, 0, cfg.moe_inter, t_all, 0, false);
+        ly.sh_up.run(batch, &a.xnf, 0, d, &a.su, 0, cfg.moe_inter, t_all, 0, false);
+        batch.run("swiglu", &[a.sg.all(), a.su.all(), a.sa.all()], &[(t_all * cfg.moe_inter) as u32, f(cfg.swiglu_limit)], grid1d(t_all * cfg.moe_inter));
+        ly.sh_down.run(batch, &a.sa, 0, cfg.moe_inter, &a.sh_out, 0, d, t_all, 0, false);
+        let want_x = self.cpu_experts || self.capture.as_ref().is_some_and(|c| c.layer == l);
+        Ok(Some(Front { row_from, guess, want_x }))
+    }
+
+    /// What layer `l`'s readback copies: router logits, then the FFN input and the next layer's
+    /// guessed logits if wanted.
+    fn read_ranges(&self, _l: usize, t_all: usize, fr: &Front) -> Vec<(&Buf, u64, u64)> {
+        let (a, cfg) = (&self.acts, &self.cfg);
+        let mut ranges = vec![(&a.rlog, 0u64, (t_all * cfg.n_experts * 4) as u64)];
+        if fr.want_x {
+            ranges.push((&a.xnf, 0, (t_all * cfg.dim * 4) as u64));
+        }
+        if fr.guess {
+            ranges.push((&a.rnext, 0, (t_all * cfg.n_experts * 4) as u64));
+        }
+        ranges
+    }
+
+    /// Add the FFN's output (shared and routed experts) to the residual stream.
+    fn hc_post_ffn(&self, b: &mut Batch, t_all: usize) {
+        let (a, cfg) = (&self.acts, &self.cfg);
+        b.run("hc_post", &[a.h.all(), a.sh_out.all(), a.o6.all(), a.mix_f.all()], &[cfg.dim as u32, t_all as u32, cfg.n_active as u32, 0, 0], grid1d(t_all * cfg.dim));
+    }
     #[allow(clippy::too_many_arguments)]
     fn attention(&self, b: &mut Batch, l: usize, c: usize, m: usize, pc: usize, c0: usize, yarn: bool, cand_active: &mut [bool], keys_only: bool) -> Result<()> {
         let cfg = &self.cfg;
@@ -1038,7 +1118,10 @@ impl Model {
     /// run on the CPU straight from the RAM tier, concurrently with the GPU work, and their
     /// outputs are uploaded into the same per-(token, k) rows. Those that keep getting picked are
     /// then copied to VRAM in the background for later steps.
-    fn run_experts(&self, l: usize, routing: &Routing, xnf: Option<&[f32]>) -> Result<()> {
+    fn run_experts<P>(&self, l: usize, routing: &Routing, xnf: Option<&[f32]>, then: Option<P>) -> Result<Option<Prepared>>
+    where
+        P: FnOnce() -> Result<Prepared> + Send,
+    {
         const CPU_MAX_TOKENS: usize = 4;
         let cfg = &self.cfg;
         let gpu = &self.gpu;
@@ -1090,7 +1173,10 @@ impl Model {
             || {
                 let r = self.run_experts_gpu(l, routing, &gpu_list, busy);
                 *gpu_done.lock() = Some((t_join.elapsed().as_nanos() as u64, std::thread::current().id()));
-                r
+                r?;
+                // while the CPU computes, get the next layer's commands ready (without CPU experts there
+                // is nothing to hide it behind)
+                if busy { then.map(|f| f()).transpose() } else { Ok(None) }
             },
             || -> Result<CpuOut> {
                 let Some(x) = xnf else { return Ok(Default::default()) };
@@ -1144,7 +1230,7 @@ impl Model {
         if let (true, Some(g), Some(c)) = (crate::cpu_moe::trace::on() && !cpu_list.is_empty(), *gpu_done.lock(), *cpu_start.lock()) {
             crate::cpu_moe::trace::branch(c.0 as f64 / 1e3, g.0 as f64 / 1e3, g.1 == c.1);
         }
-        gpu_res?;
+        let prepared = gpu_res?;
         let out = cpu_res?;
         Stats::add(&self.stats.expert_cpu_runs, cpu_list.len() as u64);
         for (row, y) in out.rows {
@@ -1155,7 +1241,7 @@ impl Model {
                 self.experts.promote(gpu, l, e, blob);
             }
         }
-        Ok(())
+        Ok(prepared)
     }
 
     /// Start reading the experts that `logits`, a guess of the next layer's router output, picks.
@@ -1202,6 +1288,9 @@ impl Model {
             [crate::quants::has_min(ty) as u32, lut[0], lut[1], lut[2], lut[3]]
         };
         let lut = types.map(|t| t != crate::gguf::GGML_MXFP4);
+        // promotions are copied with the last of these commands, while the CPU computes, in pieces
+        // that fit beside it; the copy keeps the GPU's clocks up as well as keep_busy would
+        let budget = busy.then_some(self.upload_piece as u64);
         let mut waves = list.chunks(cap).peekable();
         while let Some(wave) = waves.next() {
             // read the next wave while this one is uploaded and recorded
@@ -1257,16 +1346,23 @@ impl Model {
                     ((geom.dim as u32).div_ceil(8), (cnt as u32).div_ceil(tm), 1),
                 );
             }
-            if waves.peek().is_none() {
+            let sent = waves.peek().is_none().then(|| {
+                let s = self.experts.send_uploads(&mut b, budget);
                 self.keep_busy(&mut b, busy);
-            }
+                s
+            });
             b.submit();
             drop(gate);
+            if let Some(s) = sent {
+                self.experts.uploads_done(s);
+            }
         }
-        if list.is_empty() && busy {
+        if list.is_empty() {
             let mut b = gpu.begin();
-            self.keep_busy(&mut b, true);
+            let s = self.experts.send_uploads(&mut b, budget);
+            self.keep_busy(&mut b, busy);
             b.submit();
+            self.experts.uploads_done(s);
         }
         Ok(())
     }

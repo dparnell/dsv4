@@ -169,6 +169,7 @@ impl Monitor {
             },
             "layers": layers,
             "cpu": crate::cpu::describe(),
+            "gpu_span_ms": s.decode_gpu_span(),
             "decode_breakdown": s.decode_breakdown().map(|b| b.map(|(name, ms)| json!([name, ms]))),
             "requests": s.requests_json(),
             "events": events,

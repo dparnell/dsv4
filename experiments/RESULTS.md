@@ -329,3 +329,12 @@ prompt five times, greedy, 300 tokens each. `DSV4_CPU_TRACE=1` logs where the ti
   648 -> 601 us, about 0.1 ms per token; the rest the same within noise (303 us per expert, gate/up 595, down 285).
 - Left, per call of 3.3 experts (~1000 us): gate/up ~590 and down ~285 at 85-88 GB/s, which more threads do not raise;
   ~100 us on the caller alone, mostly cold-cache work setting up the tasks; ~35 us before all threads have joined.
+- Tasks without a list: a counter per node over pieces worked out from the index (job, rows), writing through
+  pointers into buffers the thread keeps between calls and does not clear; each token's output written by the down
+  tasks straight into its own vector. Unit tests (now also a job of 12 tokens): bit for bit however rows are divided.
+  `bench-cpu` traced, 44 threads awake, us per call: 1 expert 313 -> 278-282 (inputs 26 -> 8-10), 3 experts
+  720 -> 627-682 (inputs 43 -> 10-15), 6 x 4 tokens 2504 -> 1868 (after the phases 219 -> 0); untraced ms per expert:
+  1 expert 0.27-0.34, 3 experts 0.21-0.24, 6 experts 0.20-0.21, 6 x 4 tokens 0.33-0.37.
+- Server, before -> after: 1020 -> 958 us per call, **303 -> 284 us per expert** (317 when this began); inputs 75 -> 26,
+  between 28 -> 6; gate/up 595 -> 610, down 285 -> 310 (fresh output vectors are first touched there now); disk-fresh
+  calls 601 -> 539. CPU experts per token in requests 3 to 5: 42.5, 39.1, 35.5 ms (disk wait 113, 47, 35).

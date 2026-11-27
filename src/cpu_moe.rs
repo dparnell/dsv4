@@ -7,7 +7,6 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use parking_lot::Mutex;
 use rayon::prelude::*;
 
 use crate::experts::LayerGeom;
@@ -62,17 +61,6 @@ struct QPart<'a> {
     sum: &'a mut [f32],
 }
 
-impl<'a> QPart<'a> {
-    /// The first `n` values (a multiple of 32), and the rest.
-    fn split(self, n: usize) -> (QPart<'a>, QPart<'a>) {
-        let (q0, q1) = self.q.split_at_mut(n);
-        let (d0, d1) = self.d.split_at_mut(n / 32);
-        let (c0, c1) = if self.corr.is_empty() { (&mut [][..], self.corr) } else { self.corr.split_at_mut(n / 4) };
-        let (s0, s1) = self.sum.split_at_mut(n / 16);
-        (QPart { q: q0, d: d0, corr: c0, sum: s0 }, QPart { q: q1, d: d1, corr: c1, sum: s1 })
-    }
-}
-
 /// Quantize `x`, whole blocks, into `p`.
 fn quant_part(x: &[f32], isa: Isa, p: QPart) {
     let nb = x.len() / 32;
@@ -101,6 +89,7 @@ fn quant_part(x: &[f32], isa: Isa, p: QPart) {
     }
 }
 
+#[cfg(test)]
 fn quant_x(x: &[f32], isa: Isa) -> Q8x {
     let mut out = Q8x::zeroed(x.len(), isa);
     quant_part(x, isa, out.tail_mut(0));
@@ -831,17 +820,45 @@ pub mod trace {
     }
 }
 
-/// Run `tasks`, given with the NUMA node whose memory each works on, on `team` or else over the
-/// thread pool: threads take those of their own node first, then help with the others'.
-fn run_tasks<T: Send>(team: Option<&Team>, nodes: usize, tasks: Vec<(usize, T)>, phase: usize, f: impl Fn(&mut Row, T) + Sync) {
-    let threads = rayon::current_num_threads().min(tasks.len());
-    // a counter hands out each queue; the locks around tasks are never contended
+/// The tasks of one phase: each job's rows of every node, in pieces of at most `task` rows. Task
+/// `i` of a node is piece `i % per[node]` of job `i / per[node]`, so nothing is set up per task.
+struct Plan {
+    /// rows of each node, starting at multiples of the alignment
+    ranges: Vec<std::ops::Range<usize>>,
+    task: usize,
+    per: Vec<usize>,
+}
+
+impl Plan {
+    /// `align` divides `rows` and `task`.
+    fn new(shares: &[usize], rows: usize, task: usize, align: usize) -> Plan {
+        debug_assert!(rows % align == 0 && task % align == 0 && task > 0);
+        let ranges: Vec<_> = crate::cpu::split(shares, rows / align).into_iter().map(|r| r.start * align..r.end * align).collect();
+        let per = ranges.iter().map(|r| r.len().div_ceil(task)).collect();
+        Plan { ranges, task, per }
+    }
+
+    fn counts(&self, jobs: usize) -> Vec<usize> {
+        self.per.iter().map(|p| p * jobs).collect()
+    }
+
+    /// The job and rows of task `i` of `node`.
+    fn task(&self, node: usize, i: usize) -> (usize, std::ops::Range<usize>) {
+        let (job, piece) = (i / self.per[node], i % self.per[node]);
+        let r = &self.ranges[node];
+        let from = r.start + piece * self.task;
+        (job, from..(from + self.task).min(r.end))
+    }
+}
+
+/// Run `counts[node]` tasks of each NUMA node, `f(row buffer, node, index)`, on `team` or else over
+/// the thread pool: threads take those of their own node first, then help with the others'.
+fn run_tasks(team: Option<&Team>, counts: &[usize], phase: usize, f: impl Fn(&mut Row, usize, usize) + Sync) {
+    let nodes = counts.len();
+    let threads = rayon::current_num_threads().min(counts.iter().sum());
     #[repr(align(128))]
     struct Next(AtomicUsize);
-    let mut queues: Vec<(Next, Vec<Mutex<Option<T>>>)> = (0..nodes).map(|_| (Next(AtomicUsize::new(0)), Vec::new())).collect();
-    for (n, t) in tasks {
-        queues[n].1.push(Mutex::new(Some(t)));
-    }
+    let next: Vec<Next> = (0..nodes).map(|_| Next(AtomicUsize::new(0))).collect();
     let tracing = trace::on();
     let t0 = std::time::Instant::now();
     let caller = std::thread::current().id();
@@ -849,16 +866,19 @@ fn run_tasks<T: Send>(team: Option<&Team>, nodes: usize, tasks: Vec<(usize, T)>,
     let parts: Vec<std::sync::OnceLock<trace::Part>> = if tracing { (0..256).map(|_| std::sync::OnceLock::new()).collect() } else { Vec::new() };
     let n_parts = AtomicUsize::new(0);
     let work = || {
-        let start = t0.elapsed().as_secs_f64() * 1e6;
+        let start = if tracing { t0.elapsed().as_secs_f64() * 1e6 } else { 0.0 };
         let (mut local, mut remote) = (0u32, 0u32);
         let mut buf = Row::default();
         let me = crate::cpu::node();
-        for i in 0..nodes {
-            let (next, q) = &queues[(me + i) % nodes];
-            while let Some(t) = q.get(next.0.fetch_add(1, Ordering::Relaxed)) {
-                let t = t.lock().take().expect("handed out once");
-                f(&mut buf, t);
-                *(if i == 0 { &mut local } else { &mut remote }) += 1;
+        for k in 0..nodes {
+            let node = (me + k) % nodes;
+            loop {
+                let i = next[node].0.fetch_add(1, Ordering::Relaxed);
+                if i >= counts[node] {
+                    break;
+                }
+                f(&mut buf, node, i);
+                *(if k == 0 { &mut local } else { &mut remote }) += 1;
             }
         }
         if tracing && local + remote > 0 {
@@ -877,19 +897,79 @@ fn run_tasks<T: Send>(team: Option<&Team>, nodes: usize, tasks: Vec<(usize, T)>,
     }
 }
 
-/// Cut `out` (`n` values per row) into tasks of at most `task` rows, none of which spans two nodes,
-/// all starting at multiples of `align` (which divides `rows` and `task`).
-/// Returns (node, first row, its part of `out`).
-fn cut<'a>(shares: &[usize], rows: usize, n: usize, task: usize, align: usize, mut out: &'a mut [f32]) -> Vec<(usize, usize, &'a mut [f32])> {
-    debug_assert!(rows % align == 0 && task % align == 0);
-    let mut v = Vec::new();
-    for (node, r) in crate::cpu::split(shares, rows / align).into_iter().enumerate() {
-        let r = r.start * align..r.end * align;
-        let (a, b) = out.split_at_mut(r.len() * n);
-        out = b;
-        v.extend(a.chunks_mut((task * n).max(1)).enumerate().map(|(c, o)| (node, r.start + c * task, o)));
+/// A pointer the tasks of a call write through, each to parts no other task writes.
+#[derive(Clone, Copy)]
+struct Shared<T>(*mut T);
+// SAFETY: see the uses: tasks write disjoint ranges, and nothing reads them until the phase is over
+unsafe impl<T> Send for Shared<T> {}
+unsafe impl<T> Sync for Shared<T> {}
+
+impl<T> Shared<T> {
+    /// SAFETY: `at..at + len` is in bounds and no one else uses it meanwhile.
+    unsafe fn slice<'a>(self, at: usize, len: usize) -> &'a mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.0.add(at), len) }
     }
-    v
+}
+
+/// Where the tasks quantize one hidden vector.
+#[derive(Clone, Copy)]
+struct QShared {
+    q: Shared<i8>,
+    d: Shared<f32>,
+    corr: Option<Shared<i32>>,
+    sum: Shared<f32>,
+}
+
+impl QShared {
+    fn new(x: &mut Q8x) -> QShared {
+        QShared { q: Shared(x.q.as_mut_ptr()), d: Shared(x.d.as_mut_ptr()), corr: (!x.corr.is_empty()).then(|| Shared(x.corr.as_mut_ptr())), sum: Shared(x.sum.as_mut_ptr()) }
+    }
+
+    /// SAFETY: values `from..to` (whole blocks) are within the vector and no one else uses them.
+    unsafe fn part<'a>(self, from: usize, to: usize) -> QPart<'a> {
+        let n = to - from;
+        unsafe {
+            QPart {
+                q: self.q.slice(from, n),
+                d: self.d.slice(from / 32, n / 32),
+                corr: match self.corr {
+                    Some(c) => c.slice(from / 4, n / 4),
+                    None => &mut [],
+                },
+                sum: self.sum.slice(from / 16, n / 16),
+            }
+        }
+    }
+}
+
+/// Buffers a thread keeps for its calls: what is in them is overwritten, never read, so they are
+/// not cleared (clearing memory that other threads wrote last is slow).
+#[derive(Default)]
+struct Scratch {
+    xq: Vec<Q8x>,
+    hq: Vec<Q8x>,
+    hidden: Vec<f32>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = Default::default();
+}
+
+/// At least `count` vectors of `n` values for `isa`, reusing what fits.
+fn q8_vectors(v: &mut Vec<Q8x>, count: usize, n: usize, isa: Isa) {
+    let fits = |x: &Q8x| {
+        let nb = n / 32;
+        x.d.len() == nb && x.q.len() == nb.next_multiple_of(2) * 32 && x.corr.len() == if uses_corr(isa) { x.q.len() / 4 } else { 0 }
+    };
+    v.truncate(count);
+    for x in v.iter_mut() {
+        if !fits(x) {
+            *x = Q8x::zeroed(n, isa);
+        }
+    }
+    while v.len() < count {
+        v.push(Q8x::zeroed(n, isa));
+    }
 }
 
 /// y = W2 (w * silu(min(W1 x, l)) * clamp(W3 x, -l, l)) for several experts at once, each with
@@ -904,106 +984,146 @@ fn forward_isa(jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa, sha
             trace::blob(j.blob, || j.geom.homes(inter, dim, shares));
         }
     }
+    // taken out for the call: a nested call (on the thread pool) gets fresh buffers
+    let mut s = SCRATCH.take();
+    let res = forward_with(&mut s, jobs, inter, dim, limit, isa, shares, team);
+    SCRATCH.set(s);
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_with(s: &mut Scratch, jobs: &[Job], inter: usize, dim: usize, limit: f32, isa: Isa, shares: &[usize], team: Option<&Team>) -> Vec<Vec<Vec<f32>>> {
     let t_call = std::time::Instant::now();
     let us = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e6;
+    // the first token of each job among all of them
+    let mut tok0 = Vec::with_capacity(jobs.len() + 1);
+    tok0.push(0);
+    for j in jobs {
+        tok0.push(tok0.last().unwrap() + j.xs.len());
+    }
+    let tokens = *tok0.last().unwrap();
     // each input once: in decode every expert of a call has the same one
     let mut seen: Vec<(*const f32, usize)> = Vec::new();
-    let idx: Vec<Vec<usize>> = jobs
-        .iter()
-        .map(|j| {
-            j.xs.iter()
-                .map(|x| {
-                    let k = (x.as_ptr(), x.len());
-                    seen.iter().position(|&s| s == k).unwrap_or_else(|| {
-                        seen.push(k);
-                        seen.len() - 1
-                    })
-                })
-                .collect()
-        })
-        .collect();
-    let mut uniq: Vec<Option<Q8x>> = (0..seen.len()).map(|_| None).collect();
-    for (j, ix) in jobs.iter().zip(&idx) {
-        for (x, &i) in j.xs.iter().zip(ix) {
-            uniq[i].get_or_insert_with(|| quant_x(x, isa));
+    let mut which = Vec::with_capacity(tokens);
+    for x in jobs.iter().flat_map(|j| &j.xs) {
+        let k = (x.as_ptr(), x.len());
+        which.push(seen.iter().position(|&s| s == k).unwrap_or_else(|| {
+            seen.push(k);
+            seen.len() - 1
+        }));
+    }
+    q8_vectors(&mut s.xq, seen.len(), dim, isa);
+    let mut done = vec![false; seen.len()];
+    for (x, &i) in jobs.iter().flat_map(|j| &j.xs).zip(&which) {
+        if !std::mem::replace(&mut done[i], true) {
+            quant_part(x, isa, s.xq[i].tail_mut(0));
         }
     }
-    let uniq: Vec<Q8x> = uniq.into_iter().map(Option::unwrap).collect();
-    let xq: Vec<Vec<&Q8x>> = idx.iter().map(|ix| ix.iter().map(|&i| &uniq[i]).collect()).collect();    // row-major: hidden[i][t]
-    let mut hidden: Vec<Vec<f32>> = jobs.iter().map(|j| vec![0f32; j.xs.len() * inter]).collect();
+    let xq: Vec<&Q8x> = which.iter().map(|&i| &s.xq[i]).collect();
+    // row-major per job: hidden[i][t]
+    if s.hidden.len() < tokens * inter {
+        s.hidden.resize(tokens * inter, 0.0);
+    }
+    let hidden = Shared(s.hidden.as_mut_ptr());
     // the hidden vectors quantized for the down matrix, filled block by block by the tasks
-    let mut hq: Vec<Vec<Q8x>> = jobs.iter().map(|j| j.xs.iter().map(|_| Q8x::zeroed(inter, isa)).collect()).collect();
+    q8_vectors(&mut s.hq, tokens, inter, isa);
+    let hq_w: Vec<QShared> = s.hq.iter_mut().map(QShared::new).collect();
     let threads = rayon::current_num_threads();
     // whole blocks of 32, so that every task quantizes its own rows
-    let task = task_rows(jobs.len() * inter, threads).next_multiple_of(32);
-    let mut tasks = Vec::new();
-    for (((j, xq), h), hq) in jobs.iter().zip(&xq).zip(&mut hidden).zip(&mut hq) {
-        let (gate, up) = (j.mat(0, inter, dim), j.mat(1, inter, dim));
-        let mut rest: Vec<Option<QPart>> = hq.iter_mut().map(|q| Some(q.tail_mut(0))).collect();
-        for (n, first, out) in cut(shares, inter, j.xs.len(), task, 32, h) {
-            let rows = out.len() / j.xs.len();
-            let mine: Vec<QPart> = rest
-                .iter_mut()
-                .map(|r| {
-                    let (a, b) = r.take().unwrap().split(rows);
-                    *r = Some(b);
-                    a
-                })
-                .collect();
-            tasks.push((n, (first, out, mine, j, &xq[..], gate, up)));
-        }
-    }
+    let plan = Plan::new(shares, inter, task_rows(jobs.len() * inter, threads).next_multiple_of(32), 32);
+    let mats: Vec<(Mat, Mat, Mat)> = jobs.iter().map(|j| (j.mat(0, inter, dim), j.mat(1, inter, dim), j.mat(2, dim, inter))).collect();
     let prep = us(t_call);
-    run_tasks(team, shares.len(), tasks, 0, |buf, (first, out, mine, j, xq, gate, up)| {
-        let n = j.xs.len();
-        let (mut g, mut u) = (vec![0f32; n], vec![0f32; n]);
+    run_tasks(team, &plan.counts(jobs.len()), 0, |buf, node, i| {
+        let (ji, r) = plan.task(node, i);
+        let (j, n) = (&jobs[ji], jobs[ji].xs.len());
+        let (gate, up, _) = mats[ji];
+        let xq = &xq[tok0[ji]..tok0[ji + 1]];
+        // SAFETY: tasks have disjoint rows of disjoint jobs
+        let out = unsafe { hidden.slice(tok0[ji] * inter + r.start * n, r.len() * n) };
+        let (mut g, mut u) = ([0f32; MAX_TOKENS], [0f32; MAX_TOKENS]);
+        let (g, u) = if n <= MAX_TOKENS { (&mut g[..n], &mut u[..n]) } else { return task_wide(buf, isa, limit, j, gate, up, xq, out, r, &hq_w[tok0[ji]..tok0[ji + 1]]) };
         for (o, row) in out.chunks_mut(n).enumerate() {
-            let i = first + o;
-            gate.row(isa, i, xq, buf, &mut g);
-            up.row(isa, i, xq, buf, &mut u);
+            let i = r.start + o;
+            gate.row(isa, i, xq, buf, g);
+            up.row(isa, i, xq, buf, u);
             for t in 0..n {
                 let gv = g[t].min(limit);
                 row[t] = gv / (1.0 + (-gv).exp()) * u[t].clamp(-limit, limit) * j.ws[t];
             }
         }
-        for (t, p) in mine.into_iter().enumerate() {
-            if n == 1 {
-                quant_part(out, isa, p);
-            } else {
-                let col: Vec<f32> = out.iter().skip(t).step_by(n).copied().collect();
-                quant_part(&col, isa, p);
+        quantize_rows(isa, out, n, r, &hq_w[tok0[ji]..tok0[ji + 1]]);
+    });
+    let t_mid = std::time::Instant::now();
+    let hq: Vec<&Q8x> = s.hq[..tokens].iter().collect();
+    // one vector per token, written in full by the tasks before anything reads them
+    let mut out: Vec<Vec<Vec<f32>>> = jobs.iter().map(|j| j.xs.iter().map(|_| Vec::with_capacity(dim)).collect()).collect();
+    let out_w: Vec<Shared<f32>> = out.iter_mut().flatten().map(|o| Shared(o.as_mut_ptr())).collect();
+    let plan = Plan::new(shares, dim, 2 * task_rows(jobs.len() * dim / 2, threads), 1);
+    let mid = us(t_mid);
+    run_tasks(team, &plan.counts(jobs.len()), 1, |buf, node, i| {
+        let (ji, r) = plan.task(node, i);
+        let n = jobs[ji].xs.len();
+        let hq = &hq[tok0[ji]..tok0[ji + 1]];
+        let cols = &out_w[tok0[ji]..tok0[ji + 1]];
+        let (mut small, mut wide) = ([0f32; MAX_TOKENS], Vec::new());
+        let row = if n <= MAX_TOKENS {
+            &mut small[..n]
+        } else {
+            wide.resize(n, 0.0);
+            &mut wide[..]
+        };
+        for i in r {
+            mats[ji].2.row(isa, i, hq, buf, row);
+            for (c, v) in cols.iter().zip(&*row) {
+                // SAFETY: tasks have disjoint rows of disjoint jobs, within the capacity
+                unsafe { c.0.add(i).write(*v) };
             }
         }
     });
-    let t_mid = std::time::Instant::now();
-    let hq: Vec<Vec<&Q8x>> = hq.iter().map(|h| h.iter().collect()).collect();
-    let mut out: Vec<Vec<f32>> = jobs.iter().map(|j| vec![0f32; j.xs.len() * dim]).collect();
-    let task = 2 * task_rows(jobs.len() * dim / 2, threads);
-    let mut tasks = Vec::new();
-    for ((j, hq), o) in jobs.iter().zip(&hq).zip(&mut out) {
-        let down = j.mat(2, dim, inter);
-        tasks.extend(cut(shares, dim, hq.len(), task, 1, o).into_iter().map(|(n, first, out)| (n, (first, out, &hq[..], down))));
-    }
-    let mid = us(t_mid);
-    run_tasks(team, shares.len(), tasks, 1, |buf, (first, out, hq, down)| {
-        for (o, row) in out.chunks_mut(hq.len()).enumerate() {
-            down.row(isa, first + o, hq, buf, row);
-        }
-    });
     let t_tail = std::time::Instant::now();
-    let column = |m: &[f32], n: usize, t: usize| -> Vec<f32> { m.iter().skip(t).step_by(n).copied().collect() };
-    let res = jobs
-        .iter()
-        .zip(out)
-        .map(|(j, o)| match j.xs.len() {
-            1 => vec![o],
-            n => (0..n).map(|t| column(&o, n, t)).collect(),
-        })
-        .collect();
+    for o in out.iter_mut().flatten() {
+        // SAFETY: every row of every token was written by one task
+        unsafe { o.set_len(dim) };
+    }
+    let res = out;
     if trace::on() {
         trace::call(jobs.len(), us(t_call), prep, mid, us(t_tail));
     }
     res
+}
+
+/// Tokens per expert the gate/up tasks keep on the stack (decode and short prompts).
+const MAX_TOKENS: usize = 8;
+
+/// Quantize rows `r` of the hidden vectors of one job (`out`, row-major with `n` tokens) into `hq`.
+fn quantize_rows(isa: Isa, out: &[f32], n: usize, r: std::ops::Range<usize>, hq: &[QShared]) {
+    for (t, q) in hq.iter().enumerate() {
+        // SAFETY: these blocks belong to this task alone
+        let p = unsafe { q.part(r.start, r.end) };
+        if n == 1 {
+            quant_part(out, isa, p);
+        } else {
+            let col: Vec<f32> = out.iter().skip(t).step_by(n).copied().collect();
+            quant_part(&col, isa, p);
+        }
+    }
+}
+
+/// A gate/up task of a job with more tokens than [`MAX_TOKENS`].
+#[allow(clippy::too_many_arguments)]
+fn task_wide(buf: &mut Row, isa: Isa, limit: f32, j: &Job, gate: Mat, up: Mat, xq: &[&Q8x], out: &mut [f32], r: std::ops::Range<usize>, hq: &[QShared]) {
+    let n = j.xs.len();
+    let (mut g, mut u) = (vec![0f32; n], vec![0f32; n]);
+    for (o, row) in out.chunks_mut(n).enumerate() {
+        let i = r.start + o;
+        gate.row(isa, i, xq, buf, &mut g);
+        up.row(isa, i, xq, buf, &mut u);
+        for t in 0..n {
+            let gv = g[t].min(limit);
+            row[t] = gv / (1.0 + (-gv).exp()) * u[t].clamp(-limit, limit) * j.ws[t];
+        }
+    }
+    quantize_rows(isa, out, n, r, hq);
 }
 
 /// [`experts_forward`] for one MXFP4 expert.
@@ -1242,13 +1362,15 @@ mod tests {
         let mk = |i: usize| -> Vec<u8> { (0..3 * mat).map(|k| if k % mat >= dim * inter / 2 { 116 + (k % 4) as u8 } else { (k * 31 + i * 17) as u8 }).collect() };
         let geom = LayerGeom { types: [GGML_MXFP4; 3], host: [mat; 3] };
         let blobs: Vec<Vec<u8>> = (0..3).map(mk).collect();
-        let xs: Vec<Vec<f32>> = (0..5).map(|t| (0..dim).map(|i| ((i * 37 + t * 101) % 200) as f32 / 100.0 - 1.0).collect()).collect();
+        let xs: Vec<Vec<f32>> = (0..12).map(|t| (0..dim).map(|i| ((i * 37 + t * 101) % 200) as f32 / 100.0 - 1.0).collect()).collect();
         let team = Team::new(0, 4).unwrap();
         for isa in Isa::ALL.into_iter().filter(|i| i.available()) {
             let jobs: Vec<Job> = blobs
                 .iter()
                 .enumerate()
-                .map(|(i, b)| Job { geom, blob: b, xs: xs[..i + 3].iter().map(|x| &x[..]).collect(), ws: (0..i + 3).map(|t| 0.5 + t as f32).collect() })
+                // the last more than MAX_TOKENS
+                .map(|(i, b)| (b, [3, 4, 12][i]))
+                .map(|(b, n)| Job { geom, blob: b, xs: xs[..n].iter().map(|x| &x[..]).collect(), ws: (0..n).map(|t| 0.5 + t as f32).collect() })
                 .collect();
             let all = forward_isa(&jobs, inter, dim, 10.0, isa, &[1], None);
             // however the rows are divided among NUMA nodes, bit for bit

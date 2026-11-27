@@ -424,14 +424,6 @@ fn write_part(kind: PartKind, raw: Option<&[u8]>, out: &mut [u8], from: usize, t
     }
 }
 
-/// 17-byte MXFP4 blocks -> values and scales stored separately
-fn repack_mxfp4(raw: &[u8], qs: &mut [u8], sc: &mut [u8]) {
-    for ((b, q), s) in raw.chunks_exact(BLK).zip(qs.chunks_exact_mut(16)).zip(sc) {
-        *s = b[0];
-        q.copy_from_slice(&b[1..]);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

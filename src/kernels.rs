@@ -703,67 +703,91 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// Quantize-dequantize simulation, in place. One thread per block.
+/// Quantize-dequantize simulation, in place. One thread per element: the lanes of a block (16 or
+/// 32, never more than a subgroup) take its largest magnitude by shuffles; with smaller subgroups the
+/// first thread of each block does the whole block. Dispatch n_blocks * block threads.
 /// p0=n_blocks p1=block p2=mode(0 fp8 pow2 / 1 fp4 e8m0 / 2 fp4 e4m3-scale) p3=x_off
 /// p4=row_len p5=row_stride (blocks never straddle rows)
 const QUANT_SIM: &str = r#"
 @group(0) @binding(0) var<storage, read_write> X: array<f32>;
+
+fn qs_scale(amax: f32, mode: u32) -> f32 {
+  if (mode == 0u) { return pow2_ceil(max(amax, 1e-4) / 448.0); }
+  if (mode == 1u) { return pow2_ceil(max(amax, 6.0 * 1.1754944e-38) / 6.0); }
+  return to_e4m3(max(amax, 6.0 / 512.0) / 6.0);
+}
+
+fn qs_one(v: f32, s: f32, mode: u32) -> f32 {
+  if (mode == 0u) { return to_e4m3(clamp(v / s, -448.0, 448.0)) * s; }
+  return to_e2m1(clamp(v / s, -6.0, 6.0)) * s;
+}
+
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let bi = gid.x + gid.y * 65535u * 256u;
-  if (bi >= P.p0) { return; }
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(subgroup_size) ss: u32) {
+  let t = gid.x + gid.y * 65535u * 256u;
   let bs = P.p1;
+  let bi = t / bs;
+  let live = bi < P.p0;
   let per_row = P.p4 / bs;
-  let base = P.p3 + (bi / per_row) * P.p5 + (bi % per_row) * bs;
+  let base = P.p3 + (min(bi, P.p0 - 1u) / per_row) * P.p5 + (min(bi, P.p0 - 1u) % per_row) * bs;
+  let mode = P.p2;
+  if (ss >= bs) {
+    let at = base + t % bs;
+    var v = 0.0;
+    if (live) { v = X[at]; }
+    var amax = abs(v);
+    for (var o = 1u; o < bs; o <<= 1u) { amax = max(amax, subgroupShuffleXor(amax, o)); }
+    if (live) { X[at] = qs_one(v, qs_scale(amax, mode), mode); }
+    return;
+  }
+  if (!live || t % bs != 0u) { return; }
   var amax = 0.0;
   for (var i = 0u; i < bs; i++) { amax = max(amax, abs(X[base + i])); }
-  let mode = P.p2;
-  if (mode == 0u) {
-    let s = pow2_ceil(max(amax, 1e-4) / 448.0);
-    for (var i = 0u; i < bs; i++) { X[base + i] = to_e4m3(clamp(X[base + i] / s, -448.0, 448.0)) * s; }
-  } else {
-    var s: f32;
-    if (mode == 1u) { s = pow2_ceil(max(amax, 6.0 * 1.1754944e-38) / 6.0); }
-    else { s = to_e4m3(max(amax, 6.0 / 512.0) / 6.0); }
-    for (var i = 0u; i < bs; i++) { X[base + i] = to_e2m1(clamp(X[base + i] / s, -6.0, 6.0)) * s; }
-  }
+  let s = qs_scale(amax, mode);
+  for (var i = 0u; i < bs; i++) { X[base + i] = qs_one(X[base + i], s, mode); }
 }
 "#;
 
 /// vec4s of H that one workgroup of `hc_dot` reduces.
 pub const HC_PART: u32 = 128;
 
+/// Workgroups of `hc_dot` along z, each taking 24 / HC_DOT_SPLIT rows of Wf.
+pub const HC_DOT_SPLIT: u32 = 4;
+
 /// First half of the hyper-connection mixes: the products of H with each row of Wf (and H with
 /// itself), in parts so that many workgroups share the work.
 /// H [M][hc*D] ; Wf [24][hc*D] ; out PART [M][parts][25], parts = hc*D/4/HC_PART rounded up
-/// p0=hc*D p1=token offset into H; dispatch (parts, M, 1)
+/// p0=hc*D p1=token offset into H; dispatch (parts, M, HC_DOT_SPLIT): z = which 6 rows of Wf
+/// (z = 0 also H with itself)
 const HC_DOT: &str = r#"
 @group(0) @binding(0) var<storage, read> H: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> Wf: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> PART: array<f32>;
-var<workgroup> red: array<array<f32, 32>, 25>;
+var<workgroup> red: array<array<f32, 32>, 7>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>,
         @builtin(subgroup_invocation_id) sl: u32, @builtin(subgroup_size) ss: u32) {
   let L = P.p0 / 4u;
   let i = wid.x * 128u + li;
-  var acc: array<f32, 25>;
-  for (var o = 0u; o < 25u; o++) { acc[o] = 0.0; }
+  let o0 = wid.z * 6u;
+  var acc: array<f32, 7>;
+  for (var o = 0u; o < 7u; o++) { acc[o] = 0.0; }
   if (i < L) {
     let x = H[(P.p1 + wid.y) * L + i];
-    acc[24] = dot(x, x);
-    for (var o = 0u; o < 24u; o++) { acc[o] = dot(x, Wf[o * L + i]); }
+    acc[6] = dot(x, x);
+    for (var o = 0u; o < 6u; o++) { acc[o] = dot(x, Wf[(o0 + o) * L + i]); }
   }
-  for (var o = 0u; o < 25u; o++) {
+  for (var o = 0u; o < 7u; o++) {
     let v = subgroupAdd(acc[o]);
     if (sl == 0u) { red[o][li / ss] = v; }
   }
   workgroupBarrier();
-  if (li < 25u) {
+  let row = (wid.y * nw.x + wid.x) * 25u;
+  if (li < 6u || (li == 6u && wid.z == 0u)) {
     var t = 0.0;
     for (var s = 0u; s < 128u / ss; s++) { t += red[li][s]; }
-    PART[(wid.y * nw.x + wid.x) * 25u + li] = t;
+    PART[row + select(o0 + li, 24u, li == 6u)] = t;
   }
 }
 "#;
@@ -777,52 +801,87 @@ const HC_MIX: &str = r#"
 @group(0) @binding(1) var<storage, read> SB: array<f32>;
 @group(0) @binding(2) var<storage, read_write> MIX: array<f32>;
 var<workgroup> tot: array<f32, 25>;
+var<workgroup> cm: array<f32, 16>;
 
-@compute @workgroup_size(25)
-fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>) {
-  var t = 0.0;
-  for (var i = 0u; i < P.p7; i++) { t += PART[(wid.x * P.p7 + i) * 25u + li]; }
-  tot[li] = t;
-  workgroupBarrier();
-  if (li == 0u) {
-    let hc = P.p1;
-    let eps = fbits(P.p4);
-    let r = inverseSqrt(tot[24] / f32(P.p0) + fbits(P.p3));
-    let so = P.p5;
-    let mo = P.p6 + wid.x * 24u;
-    var m: array<f32, 24>;
-    for (var o = 0u; o < 24u; o++) { m[o] = tot[o] * r; }
-    for (var j = 0u; j < 4u; j++) {
-      MIX[mo + j] = 1.0 / (1.0 + exp(-(m[j] * SB[so] + SB[so + 3u + j]))) + eps;
-      MIX[mo + 4u + j] = 2.0 / (1.0 + exp(-(m[4u + j] * SB[so + 1u] + SB[so + 3u + 4u + j])));
+// Thread li < 16 holds comb entry (j, k) = (li / 4, li % 4); 16..23 the pre and post mixes. Every
+// sum is taken in the same order as one thread doing it all would.
+@compute @workgroup_size(32)
+fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_size) ss: u32) {
+  if (li < 25u) {
+    // loads issued eight at a time, added in order
+    var t = 0.0;
+    let pb = wid.x * P.p7 * 25u + li;
+    var i = 0u;
+    for (; i + 8u <= P.p7; i += 8u) {
+      var v: array<f32, 8>;
+      for (var q = 0u; q < 8u; q++) { v[q] = PART[pb + (i + q) * 25u]; }
+      for (var q = 0u; q < 8u; q++) { t += v[q]; }
     }
-    var c: array<f32, 16>;
-    for (var j = 0u; j < 4u; j++) {
-      var mx = NEG_INF;
-      for (var k = 0u; k < 4u; k++) {
-        c[j * 4u + k] = m[8u + j * 4u + k] * SB[so + 2u] + SB[so + 3u + 8u + j * 4u + k];
-        mx = max(mx, c[j * 4u + k]);
-      }
-      var sum = 0.0;
-      for (var k = 0u; k < 4u; k++) { c[j * 4u + k] = exp(c[j * 4u + k] - mx); sum += c[j * 4u + k]; }
-      for (var k = 0u; k < 4u; k++) { c[j * 4u + k] = c[j * 4u + k] / sum + eps; }
-    }
-    for (var k = 0u; k < 4u; k++) {
-      let cs = c[k] + c[4u + k] + c[8u + k] + c[12u + k] + eps;
-      for (var j = 0u; j < 4u; j++) { c[j * 4u + k] /= cs; }
-    }
-    for (var it = 1u; it < P.p2; it++) {
-      for (var j = 0u; j < 4u; j++) {
-        let rs = c[j * 4u] + c[j * 4u + 1u] + c[j * 4u + 2u] + c[j * 4u + 3u] + eps;
-        for (var k = 0u; k < 4u; k++) { c[j * 4u + k] /= rs; }
-      }
-      for (var k = 0u; k < 4u; k++) {
-        let cs = c[k] + c[4u + k] + c[8u + k] + c[12u + k] + eps;
-        for (var j = 0u; j < 4u; j++) { c[j * 4u + k] /= cs; }
-      }
-    }
-    for (var o = 0u; o < 16u; o++) { MIX[mo + 8u + o] = c[o]; }
+    for (; i < P.p7; i++) { t += PART[pb + i * 25u]; }
+    tot[li] = t;
   }
+  workgroupBarrier();
+  let eps = fbits(P.p4);
+  let r = inverseSqrt(tot[24] / f32(P.p0) + fbits(P.p3));
+  let so = P.p5;
+  let mo = P.p6 + wid.x * 24u;
+  let j = li / 4u;
+  let k = li % 4u;
+  if (li >= 16u && li < 20u) {
+    let q = li - 16u;
+    MIX[mo + q] = 1.0 / (1.0 + exp(-(tot[q] * r * SB[so] + SB[so + 3u + q]))) + eps;
+  } else if (li >= 20u && li < 24u) {
+    let q = li - 20u;
+    MIX[mo + 4u + q] = 2.0 / (1.0 + exp(-(tot[4u + q] * r * SB[so + 1u] + SB[so + 3u + 4u + q])));
+  }
+  // Lanes of one subgroup trade comb entries by shuffles (this path needs subgroups of 16 or more;
+  // the workgroup is one subgroup then, and every lane runs the same steps).
+  if (ss >= 16u) {
+    let e = min(li, 15u);
+    var c = tot[8u + e] * r * SB[so + 2u] + SB[so + 3u + 8u + e];
+    let rb = j % 4u * 4u;
+    let mx = max(max(max(max(NEG_INF, subgroupShuffle(c, rb)), subgroupShuffle(c, rb + 1u)), subgroupShuffle(c, rb + 2u)), subgroupShuffle(c, rb + 3u));
+    c = exp(c - mx);
+    c = c / (0.0 + subgroupShuffle(c, rb) + subgroupShuffle(c, rb + 1u) + subgroupShuffle(c, rb + 2u) + subgroupShuffle(c, rb + 3u)) + eps;
+    c /= subgroupShuffle(c, k) + subgroupShuffle(c, 4u + k) + subgroupShuffle(c, 8u + k) + subgroupShuffle(c, 12u + k) + eps;
+    for (var it = 1u; it < P.p2; it++) {
+      c /= subgroupShuffle(c, rb) + subgroupShuffle(c, rb + 1u) + subgroupShuffle(c, rb + 2u) + subgroupShuffle(c, rb + 3u) + eps;
+      c /= subgroupShuffle(c, k) + subgroupShuffle(c, 4u + k) + subgroupShuffle(c, 8u + k) + subgroupShuffle(c, 12u + k) + eps;
+    }
+    if (li < 16u) { MIX[mo + 8u + li] = c; }
+    return;
+  }
+  var c = 0.0;
+  if (li < 16u) { c = tot[8u + li] * r * SB[so + 2u] + SB[so + 3u + 8u + li]; cm[li] = c; }
+  workgroupBarrier();
+  if (li < 16u) {
+    let rb = j * 4u;
+    let mx = max(max(max(max(NEG_INF, cm[rb]), cm[rb + 1u]), cm[rb + 2u]), cm[rb + 3u]);
+    c = exp(c - mx);
+  }
+  workgroupBarrier();
+  if (li < 16u) { cm[li] = c; }
+  workgroupBarrier();
+  if (li < 16u) {
+    let rb = j * 4u;
+    let sum = 0.0 + cm[rb] + cm[rb + 1u] + cm[rb + 2u] + cm[rb + 3u];
+    c = c / sum + eps;
+  }
+  workgroupBarrier();
+  if (li < 16u) { cm[li] = c; }
+  workgroupBarrier();
+  if (li < 16u) { c /= cm[k] + cm[4u + k] + cm[8u + k] + cm[12u + k] + eps; }
+  for (var it = 1u; it < P.p2; it++) {
+    workgroupBarrier();
+    if (li < 16u) { cm[li] = c; }
+    workgroupBarrier();
+    if (li < 16u) { let rb = j * 4u; c /= cm[rb] + cm[rb + 1u] + cm[rb + 2u] + cm[rb + 3u] + eps; }
+    workgroupBarrier();
+    if (li < 16u) { cm[li] = c; }
+    workgroupBarrier();
+    if (li < 16u) { c /= cm[k] + cm[4u + k] + cm[8u + k] + cm[12u + k] + eps; }
+  }
+  if (li < 16u) { MIX[mo + 8u + li] = c; }
 }
 "#;
 
@@ -833,9 +892,9 @@ const HC_PRE_NORM: &str = r#"
 @group(0) @binding(1) var<storage, read> MIX: array<f32>;
 @group(0) @binding(2) var<storage, read> Wt: array<f32>;
 @group(0) @binding(3) var<storage, read_write> Y: array<f32>;
-var<workgroup> red: array<f32, 32>;
+var<workgroup> red: array<f32, 128>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(1024)
 fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>,
         @builtin(subgroup_invocation_id) sl: u32, @builtin(subgroup_size) ss: u32) {
   let D = P.p0;
@@ -848,7 +907,7 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
   let hb = t * 4u * D;
   let yb = P.p4 + wid.x * D;
   var s = 0.0;
-  for (var i = li; i < D; i += 256u) {
+  for (var i = li; i < D; i += 1024u) {
     let v = pre.x * H[hb + i] + pre.y * H[hb + D + i] + pre.z * H[hb + 2u * D + i] + pre.w * H[hb + 3u * D + i];
     Y[yb + i] = v;
     s += v * v;
@@ -857,9 +916,9 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
   if (sl == 0u) { red[li / ss] = s; }
   workgroupBarrier();
   var tot = 0.0;
-  for (var i = 0u; i < 256u / ss; i++) { tot += red[i]; }
+  for (var i = 0u; i < 1024u / ss; i++) { tot += red[i]; }
   let r = inverseSqrt(tot / f32(D) + fbits(P.p2));
-  for (var i = li; i < D; i += 256u) { Y[yb + i] = Y[yb + i] * r * Wt[i]; }
+  for (var i = li; i < D; i += 1024u) { Y[yb + i] = Y[yb + i] * r * Wt[i]; }
 }
 "#;
 
@@ -1017,6 +1076,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// Indexer scores: S[m][t] = sum_h relu(q[m,h] . k[t]) * w[m,h] * scale, t < n_vis(m) else -inf.
 /// Q [M][heads*hd], WP [M][heads], K [n][hd]. p0=n_cols(row stride of S) p1=heads p2=hd
 /// p3=pos0 p4=ratio p5=scale p6=use_cand p7=cand_block p8=cand_stride(u32 words per row)
+/// One thread per (t, head), IDX_T_PER_WG values of t per workgroup (heads * IDX_T_PER_WG = 256);
+/// dispatch (n_cols / IDX_T_PER_WG rounded up, M, 1). The heads are added in order by one thread.
 const IDX_SCORES: &str = r#"
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
 @group(0) @binding(1) var<storage, read> WP: array<f32>;
@@ -1025,38 +1086,52 @@ const IDX_SCORES: &str = r#"
 @group(0) @binding(4) var<storage, read_write> S: array<f32>;
 var<workgroup> qs: array<vec4<f32>, 1024>;
 var<workgroup> ws: array<f32, 64>;
+var<workgroup> part: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>) {
   let heads = P.p1; let hd = P.p2; let hv = hd / 4u;
   let m = wid.y;
-  for (var i = li; i < heads * hv; i += 256u) {
-    let b = m * heads * hd + i * 4u;
-    qs[i] = vec4<f32>(Q[b], Q[b + 1u], Q[b + 2u], Q[b + 3u]);
+  // q transposed, [i][h], so the lanes of one t read consecutive vec4s
+  for (var e = li; e < heads * hv; e += 256u) {
+    let h = e / hv; let i = e % hv;
+    let b = m * heads * hd + e * 4u;
+    qs[i * heads + h] = vec4<f32>(Q[b], Q[b + 1u], Q[b + 2u], Q[b + 3u]);
   }
   if (li < heads) { ws[li] = WP[m * heads + li] * fbits(P.p5); }
   workgroupBarrier();
-  let t = wid.x * 256u + li;
-  if (t >= P.p0) { return; }
+  let per = 256u / heads;
+  let h = li % heads;
+  let t = wid.x * per + li / heads;
   let nvis = (P.p3 + m + 1u) / P.p4;
-  var out = NEG_INF;
-  var ok = t < nvis;
+  var ok = t < nvis && t < P.p0;
   if (ok && P.p6 != 0u) {
     let blk = t / P.p7;
     ok = ((CAND[m * P.p8 + (blk >> 5u)] >> (blk & 31u)) & 1u) != 0u;
   }
+  var d = 0.0;
   if (ok) {
-    var acc = 0.0;
-    for (var h = 0u; h < heads; h++) {
-      var d = 0.0;
-      for (var i = 0u; i < hv; i++) { d += dot(qs[h * hv + i], Kc[t * hv + i]); }
-      acc += max(d, 0.0) * ws[h];
-    }
-    out = acc;
+    for (var i = 0u; i < hv; i++) { d += dot(qs[i * heads + h], Kc[t * hv + i]); }
   }
-  S[m * P.p0 + t] = out;
+  part[li] = d;
+  workgroupBarrier();
+  if (h == 0u && t < P.p0) {
+    var out = NEG_INF;
+    if (ok) {
+      var acc = 0.0;
+      for (var g = 0u; g < heads; g++) { acc += max(part[li + g], 0.0) * ws[g]; }
+      out = acc;
+    }
+    S[m * P.p0 + t] = out;
+  }
 }
 "#;
+
+/// Values of t per workgroup of `idx_scores` for `heads` indexer heads.
+pub fn idx_t_per_wg(heads: usize) -> u32 {
+    assert!(heads > 0 && 256 % heads == 0 && heads <= 64, "idx_scores needs heads dividing 256, at most 64");
+    (256 / heads) as u32
+}
 
 /// Block maxima for candidate selection; the block with the newest visible position is pinned
 /// to +big. p0=n_cols p1=block p2=n_blocks(row stride of B) p3=pos0 p4=ratio
@@ -1218,20 +1293,23 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
 /// window slots (WIDX [M][W] into the ring) then compressed slots (CIDX [M][T] into the cache).
 /// p0=n_slots p1=W p2=T(cidx stride) p3=heads p4=hd p5=scale p6=cidx_off
 const ATTN_SCORES: &str = r#"
-@group(0) @binding(0) var<storage, read> Q: array<f32>;
-@group(0) @binding(1) var<storage, read> KW: array<f32>;
-@group(0) @binding(2) var<storage, read> KC: array<f32>;
+@group(0) @binding(0) var<storage, read> Q: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> KW: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> KC: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read> WIDX: array<i32>;
 @group(0) @binding(4) var<storage, read> CIDX: array<i32>;
 @group(0) @binding(5) var<storage, read_write> S: array<f32>;
-var<workgroup> qt: array<array<f32, 17>, 16>;
-var<workgroup> kt: array<array<f32, 17>, 16>;
+var<workgroup> qt: array<array<vec4<f32>, 33>, 16>;
+var<workgroup> kt: array<array<vec4<f32>, 33>, 16>;
 var<workgroup> kidx: array<i32, 16>;
 var<workgroup> ksrc: array<u32, 16>;
 
+// 16 heads x 16 slots per workgroup, hd in steps of 128 (hd a multiple of 16), as vec4s. Four sums
+// per thread (one per vec4 lane), so the adds do not wait on each other.
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>) {
   let ns = P.p0; let W = P.p1; let heads = P.p3; let hd = P.p4;
+  let hv = hd / 4u;
   let m = wid.z;
   let j0 = wid.x * 16u; let h0 = wid.y * 16u;
   let ty = li / 16u; let tx = li % 16u;
@@ -1244,22 +1322,41 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
     kidx[li] = ix; ksrc[li] = src;
   }
   workgroupBarrier();
-  var acc = 0.0;
-  for (var d0 = 0u; d0 < hd; d0 += 16u) {
-    qt[ty][tx] = Q[(m * heads + h0 + ty) * hd + d0 + tx];
-    let ix = kidx[ty];
-    var kv = 0.0;
-    if (ix >= 0) {
-      if (ksrc[ty] == 0u) { kv = KW[u32(ix) * hd + d0 + tx]; } else { kv = KC[u32(ix) * hd + d0 + tx]; }
+  var acc = vec4<f32>(0.0);
+  var acc2 = vec4<f32>(0.0);
+  for (var c0 = 0u; c0 < hv; c0 += 32u) {
+    let cn = min(32u, hv - c0);
+    var qv: array<vec4<f32>, 2>;
+    var kv: array<vec4<f32>, 2>;
+    for (var q = 0u; q < 2u; q++) {
+      let e = q * 256u + li;
+      let r = e / 32u; let c = e % 32u;
+      qv[q] = vec4<f32>(0.0); kv[q] = vec4<f32>(0.0);
+      if (c < cn) {
+        qv[q] = Q[(m * heads + h0 + r) * hv + c0 + c];
+        let ix = kidx[r];
+        if (ix >= 0) {
+          if (ksrc[r] == 0u) { kv[q] = KW[u32(ix) * hv + c0 + c]; } else { kv[q] = KC[u32(ix) * hv + c0 + c]; }
+        }
+      }
     }
-    kt[ty][tx] = kv;
+    for (var q = 0u; q < 2u; q++) {
+      let e = q * 256u + li;
+      qt[e / 32u][e % 32u] = qv[q];
+      kt[e / 32u][e % 32u] = kv[q];
+    }
     workgroupBarrier();
-    for (var d = 0u; d < 16u; d++) { acc += qt[ty][d] * kt[tx][d]; }
+    // cn is even (hd a multiple of 16)
+    for (var c = 0u; c < cn; c += 2u) {
+      acc = fma(qt[ty][c], kt[tx][c], acc);
+      acc2 = fma(qt[ty][c + 1u], kt[tx][c + 1u], acc2);
+    }
     workgroupBarrier();
   }
   let j = j0 + tx;
   if (j < ns) {
-    var v = acc * fbits(P.p5);
+    let a = acc + acc2;
+    var v = ((a.x + a.y) + (a.z + a.w)) * fbits(P.p5);
     if (kidx[tx] < 0) { v = NEG_INF; }
     S[(m * heads + h0 + ty) * ns + j] = v;
   }
@@ -1312,9 +1409,11 @@ const ATTN_PV: &str = r#"
 @group(0) @binding(3) var<storage, read> WIDX: array<i32>;
 @group(0) @binding(4) var<storage, read> CIDX: array<i32>;
 @group(0) @binding(5) var<storage, read_write> O: array<f32>;
-var<workgroup> pt: array<array<f32, 17>, 16>;
-var<workgroup> vt: array<array<f32, 17>, 16>;
+var<workgroup> pt: array<array<f32, 65>, 16>;
+var<workgroup> vt: array<array<f32, 17>, 64>;
 
+// 16 heads x 16 dims per workgroup, slots in steps of 64; each step's loads issued before any is
+// stored, two sums per thread.
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: vec3<u32>) {
   let ns = P.p0; let W = P.p1; let heads = P.p3; let hd = P.p4;
@@ -1322,26 +1421,38 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
   let d0 = wid.x * 16u; let h0 = wid.y * 16u;
   let ty = li / 16u; let tx = li % 16u;
   var acc = 0.0;
-  for (var j0 = 0u; j0 < ns; j0 += 16u) {
-    let jp = j0 + tx;
-    var p = 0.0;
-    if (jp < ns) { p = PR[(m * heads + h0 + ty) * ns + jp]; }
-    pt[ty][tx] = p;
-    let j = j0 + ty;
-    var v = 0.0;
-    if (j < ns) {
-      var ix = -1; var src = 0u;
-      if (j < W) { ix = WIDX[m * W + j]; } else { ix = CIDX[P.p6 + m * P.p2 + (j - W)]; src = 1u; }
-      if (ix >= 0) {
-        if (src == 0u) { v = KW[u32(ix) * hd + d0 + tx]; } else { v = KC[u32(ix) * hd + d0 + tx]; }
+  var acc2 = 0.0;
+  for (var j0 = 0u; j0 < ns; j0 += 64u) {
+    var pv: array<f32, 4>;
+    var vv: array<f32, 4>;
+    for (var q = 0u; q < 4u; q++) {
+      let e = q * 256u + li;
+      let ph = e / 64u; let pj = j0 + e % 64u;
+      pv[q] = 0.0;
+      if (pj < ns) { pv[q] = PR[(m * heads + h0 + ph) * ns + pj]; }
+      let j = j0 + e / 16u;
+      vv[q] = 0.0;
+      if (j < ns) {
+        var ix = -1; var src = 0u;
+        if (j < W) { ix = WIDX[m * W + j]; } else { ix = CIDX[P.p6 + m * P.p2 + (j - W)]; src = 1u; }
+        if (ix >= 0) {
+          if (src == 0u) { vv[q] = KW[u32(ix) * hd + d0 + e % 16u]; } else { vv[q] = KC[u32(ix) * hd + d0 + e % 16u]; }
+        }
       }
     }
-    vt[ty][tx] = v;
+    for (var q = 0u; q < 4u; q++) {
+      let e = q * 256u + li;
+      pt[e / 64u][e % 64u] = pv[q];
+      vt[e / 16u][e % 16u] = vv[q];
+    }
     workgroupBarrier();
-    for (var jj = 0u; jj < 16u; jj++) { acc += pt[ty][jj] * vt[jj][tx]; }
+    for (var jj = 0u; jj < 64u; jj += 2u) {
+      acc += pt[ty][jj] * vt[jj][tx];
+      acc2 += pt[ty][jj + 1u] * vt[jj + 1u][tx];
+    }
     workgroupBarrier();
   }
-  O[(m * heads + h0 + ty) * hd + d0 + tx] = acc;
+  O[(m * heads + h0 + ty) * hd + d0 + tx] = acc + acc2;
 }
 "#;
 

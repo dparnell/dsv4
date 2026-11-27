@@ -379,7 +379,7 @@ pub fn run() -> Result<()> {
         let x = r.vec(n, 3.0);
         let xb = fb(&x);
         let mut b = gpu.begin();
-        b.run("quant_sim", &[xb.all()], &[(n / block) as u32, block as u32, mode, 0, 512, 512], (((n / block) as u32).div_ceil(256), 1, 1));
+        b.run("quant_sim", &[xb.all()], &[(n / block) as u32, block as u32, mode, 0, 512, 512], ((n as u32).div_ceil(256), 1, 1));
         let got = gpu.read_f32(b, &xb, 0, n);
         let mut want = x.clone();
         for blk in want.chunks_mut(block) {
@@ -404,7 +404,8 @@ pub fn run() -> Result<()> {
 
     // ---- hyper-connection mix (Sinkhorn) + pre + post ----
     {
-        let (d, t) = (256usize, 2usize);
+        // 18 parts: both the grouped loads and the rest in hc_mix
+        let (d, t) = (2304usize, 2usize);
         let hdim = 4 * d;
         let h = r.vec(t * hdim, 1.0);
         let wf = r.vec(24 * hdim, 0.05);
@@ -414,7 +415,7 @@ pub fn run() -> Result<()> {
         let mut b = gpu.begin();
         let parts = (hdim as u32 / 4).div_ceil(crate::kernels::HC_PART);
         let pb = gpu.buffer("part", t as u64 * parts as u64 * 100);
-        b.run("hc_dot", &[hb.all(), wb.all(), pb.all()], &[hdim as u32, 0], (parts, t as u32, 1));
+        b.run("hc_dot", &[hb.all(), wb.all(), pb.all()], &[hdim as u32, 0], (parts, t as u32, crate::kernels::HC_DOT_SPLIT));
         b.run("hc_mix", &[pb.all(), sbb.all(), mb.all()], &[hdim as u32, 4, 20, bits(1e-20), bits(1e-6), 0, 0, parts], (t as u32, 1, 1));
         let got = gpu.read_f32(b, &mb, 0, t * 24);
         let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
@@ -514,7 +515,8 @@ pub fn run() -> Result<()> {
 
     // ---- sparse attention with sink ----
     {
-        let (m, heads, hd, w, tk) = (2usize, 16usize, 64usize, 8usize, 4usize);
+        // hd 144: a full step of 128 and a partial one in attn_scores
+        let (m, heads, hd, w, tk) = (2usize, 16usize, 144usize, 8usize, 4usize);
         let ring = 16;
         let q = r.vec(m * heads * hd, 1.0);
         let kw = r.vec(ring * hd, 1.0);
@@ -661,7 +663,7 @@ pub fn run() -> Result<()> {
             "idx_scores",
             &[qb.all(), wb.all(), kb.all(), cb.all(), sb.all()],
             &[n as u32, heads as u32, hd as u32, pos0 as u32, ratio as u32, bits(scale), 1, 8, words as u32],
-            ((n as u32).div_ceil(256), m as u32, 1),
+            ((n as u32).div_ceil(crate::kernels::idx_t_per_wg(heads)), m as u32, 1),
         );
         let got = gpu.read_f32(b, &sb, 0, m * n);
         let mut want = vec![0f32; m * n];
@@ -770,6 +772,7 @@ pub fn bench_gpu(dim: usize, inter: usize, types: [u32; 3]) -> Result<()> {
     best(5);
     println!("{}: expert {:.1} MB, VRAM slot {:.1} MB, {:.3} ms", gpu.info.name, host.len() as f64 / 1e6, sl.iter().sum::<usize>() as f64 / 1e6, best(60));
     bench_dense(&gpu);
+    bench_hc(&gpu);
     let busy = gpu.buffer("busy", 256);
     for iters in [10_000u32, 100_000, 400_000] {
         let t = (0..20)
@@ -806,6 +809,88 @@ pub fn bench_gpu(dim: usize, inter: usize, types: [u32; 3]) -> Result<()> {
 
 /// Time one-token Q8 matmuls of the dense layers' shapes, with each lane reading 16 bytes of a row
 /// (`mm_q8_1`, used) and a 32-byte block (`mm_q8_1_blocks`, DSV4_MM_Q8_BLOCKS=1).
+/// Hyper-connection kernels at one decode token (dim 5120, hc 4), each repeated in one batch.
+fn bench_hc(gpu: &Gpu) {
+    let (d, hc) = (5120usize, 4usize);
+    let width = hc * d;
+    let fill = |n: usize, s: f32| -> Vec<f32> { (0..n).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 * s - s / 2.0).collect() };
+    let fb = |v: &[f32]| gpu.buffer_init("b", bytemuck::cast_slice(v));
+    let (hb, wb) = (fb(&fill(width, 2.0)), fb(&fill(24 * width, 0.05)));
+    let mut sb = vec![0.7f32, 0.9, 1.1];
+    sb.extend(fill(24, 1.0));
+    let sbb = fb(&sb);
+    let parts = (width as u32 / 4).div_ceil(crate::kernels::HC_PART);
+    let pb = gpu.buffer("part", parts as u64 * 100);
+    let mb = fb(&fill(24, 1.0));
+    let (nw, yb, ob, dmy) = (fb(&fill(d, 1.0)), gpu.buffer("y", (d * 4) as u64), fb(&fill(d, 1.0)), gpu.buffer("d", 16));
+    let reps = 200usize;
+    let time = |what: &dyn Fn(&mut crate::gpu::Batch)| {
+        let pass = || {
+            let mut b = gpu.begin();
+            for _ in 0..reps {
+                what(&mut b);
+            }
+            let t0 = std::time::Instant::now();
+            gpu.read_f32(b, &dmy, 0, 1);
+            t0.elapsed().as_secs_f64() * 1e6 / reps as f64
+        };
+        pass();
+        (0..10).map(|_| pass()).fold(f64::MAX, f64::min)
+    };
+    let dot = time(&|b| b.run("hc_dot", &[hb.all(), wb.all(), pb.all()], &[width as u32, 0], (parts, 1, crate::kernels::HC_DOT_SPLIT)));
+    let mix = time(&|b| b.run("hc_mix", &[pb.all(), sbb.all(), mb.all()], &[width as u32, 4, 20, bits(1e-20), bits(1e-6), 0, 0, parts], (1, 1, 1)));
+    let pre = time(&|b| b.run("hc_pre_norm", &[hb.all(), mb.all(), nw.all(), yb.all()], &[d as u32, 0, bits(1e-20), 0, 0, 0], (1, 1, 1)));
+    let post = time(&|b| b.run("hc_post", &[hb.all(), ob.all(), dmy.all(), mb.all()], &[d as u32, 1, 0, 0, 0], ((d as u32).div_ceil(256), 1, 1)));
+    let copy = time(&|b| b.run("copy", &[ob.all(), yb.all()], &[16, 0, 0], (1, 1, 1)));
+    println!("hyper-connection kernels, one token (us per dispatch): hc_dot {dot:.1}  hc_mix {mix:.1}  hc_pre_norm {pre:.1}  hc_post {post:.1}  (16-float copy {copy:.1})");
+    let qb = fb(&fill(64 * 512, 4.0));
+    let q = |n: usize, bs: usize, mode: u32| time(&|b| b.run("quant_sim", &[qb.all()], &[(n / bs) as u32, bs as u32, mode, 0, 512, 512], ((n as u32).div_ceil(256), 1, 1)));
+    println!("quant_sim (us per dispatch): fp8 512 values {:.1}  fp8 64 x 512 {:.1}  fp4 4096 / 16 {:.1}", q(512, 32, 0), q(64 * 512, 32, 0), q(4096, 16, 2));
+    // indexer scores (32 heads of 128) and sparse attention scores (64 heads of 512, 128 + 512 slots)
+    let (ih, ihd) = (32usize, 128usize);
+    let iq = fb(&fill(ih * ihd, 1.0));
+    let iw = fb(&fill(ih, 1.0));
+    let ik = fb(&fill(4096 * ihd, 1.0));
+    let cand = gpu.buffer("cand", 1024);
+    let isc = gpu.buffer("isc", 4096 * 4);
+    let idx = |n: usize| {
+        time(&|b| {
+            let p = [n as u32, ih as u32, ihd as u32, (4 * n) as u32, 4, bits(0.01), 0, 8, 1];
+            b.run("idx_scores", &[iq.all(), iw.all(), ik.all(), cand.all(), isc.all()], &p, ((n as u32).div_ceil(crate::kernels::idx_t_per_wg(ih)), 1, 1))
+        })
+    };
+    let (nh, hd, w, topk) = (64usize, 512usize, 128usize, 512usize);
+    let aq = fb(&fill(nh * hd, 1.0));
+    let kw = fb(&fill(w * hd, 1.0));
+    let kc = fb(&fill(topk * hd, 1.0));
+    let widx = gpu.buffer_init("widx", bytemuck::cast_slice(&(0..w as i32).collect::<Vec<_>>()));
+    let cidx = gpu.buffer_init("cidx", bytemuck::cast_slice(&(0..topk as i32).collect::<Vec<_>>()));
+    let att = gpu.buffer("att", (nh * (w + topk) * 4) as u64);
+    let attn = |ns: usize, hd: usize, nh: usize| {
+        time(&|b| {
+            let p = [ns as u32, w.min(ns) as u32, topk as u32, nh as u32, hd as u32, bits(0.04), 0];
+            b.run("attn_scores", &[aq.all(), kw.all(), kc.all(), widx.all(), cidx.all(), att.all()], &p, ((ns as u32).div_ceil(16), (nh / 16) as u32, 1))
+        })
+    };
+    println!("idx_scores (us per dispatch): 128 positions {:.1}  1024 {:.1}  4096 {:.1}", idx(128), idx(1024), idx(4096));
+    println!(
+        "attn_scores (us per dispatch): 640 slots x 64 heads x 512 {:.1}  16 x 64 x 512 {:.1}  640 x 16 x 512 {:.1}  640 x 64 x 64 {:.1}",
+        attn(w + topk, hd, nh),
+        attn(16, hd, nh),
+        attn(w + topk, hd, 16),
+        attn(w + topk, 64, nh)
+    );
+    let ob = gpu.buffer("o", (nh * hd * 4) as u64);
+    let ns = w + topk;
+    let pv = |kn: &'static str, ns: usize| {
+        time(&|b| {
+            let p = [ns as u32, w.min(ns) as u32, topk as u32, nh as u32, hd as u32, bits(0.04), 0];
+            b.run(kn, &[att.all(), kw.all(), kc.all(), widx.all(), cidx.all(), ob.all()], &p, ((hd / 16) as u32, (nh / 16) as u32, 1))
+        })
+    };
+    println!("attn_pv (us per dispatch): 640 slots {:.1}  160 slots {:.1}", pv("attn_pv", ns), pv("attn_pv", 160));
+}
+
 fn bench_dense(gpu: &Gpu) {
     let mut z = 0x9E37_79B9u64;
     for (n, k) in [(5120usize, 5120usize), (2304, 5120), (5120, 2304), (1280, 5120), (32768, 1280)] {

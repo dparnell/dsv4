@@ -394,3 +394,30 @@ Same machine and server as above (UD-Q4_K_XL, `--ram-cache-gb 206`, 5 greedy req
   10.4, 11.3 ms: ~4 ms a token, more than the round trips alone. Rest of GPU 38.8, 41.5, 33.6, 37.4; other 11.4-12.2 ->
   10.3-11.9; tok/s 7.02, 7.11, 9.13, 7.97 (disk wait 39-111 ms; at a similar disk wait, 38.6 vs 40.0 ms, 9.13 vs 8.61).
   Now the default (`DSV4_GPU_POLL=0`: sleep).
+
+### Small kernels that left the GPU idle
+
+Per token the dense weights are ~7.4 GB in the layers and 0.7 GB in the output head, ~14 ms at the 430-557 GB/s the Q8
+kernel reaches in `bench-gpu`; the batches were busy 21-26 ms. The rest was kernels that use a few workgroups or wait
+on themselves. `bench-gpu` now times them at one decode token (us per dispatch; a 16-float copy, the floor, is 3.2):
+
+| kernel | before | after | what was slow |
+|---|---|---|---|
+| hc_dot | 10.9 | 4.9 | 40 workgroups for 25 sums; now 160 (6 rows of Wf each) |
+| hc_mix | 26.4 | 6.7 | one thread ran the Sinkhorn iterations; now 16 lanes trading by shuffles, and the 40 partial sums loaded 8 at a time |
+| hc_pre_norm | 9.9 | 6.8 | 256 threads for 5120 values; now 1024 |
+| quant_sim | 13 (profile) | 3.5-4.3 | one thread per block of 32; now one per value, the block's maximum by shuffles |
+| idx_scores, 128 positions | 127 (profile) | 8.2 | one workgroup, each thread 32 heads x 128 in a row; now a thread per (position, head) |
+| attn_scores, 640 slots | 35.8 | 13.5 | each thread one running sum over 512; now vec4s, two sums, steps of 128 |
+| attn_pv, 640 slots | 41.9 | 27.2 | 16-slot steps, one sum; now 64-slot steps, loads issued together, two sums |
+
+Every sum in hc_dot, hc_mix and idx_scores is taken in the same order as before, quant_sim gives the same values; the
+norm in hc_pre_norm and the attention sums are added in a different order (selftest: within 1.3e-6).
+
+- GPU-only (`--expert-subset 6 --gpu-only-experts`, 120 tokens, two runs each): GPU busy 27.3-28.1 -> 22.6-22.9 ms a
+  token, gpu-wait 52.4-53.2 -> 48.3-49.0, 16.35, 16.45 -> 17.86 tok/s (a second run 15.52, its expert time 2.4 s
+  against 1.6).
+- Live, requests 3 to 5 (hc kernels only / then quant_sim / then idx and attn scores): GPU busy 23.2-26.1 (before) ->
+  20.8-23.3 -> 20.4-22.4 -> 18.6; rest of GPU 41.5, 33.6, 37.4 -> 35.3, 32.5, 32.3 -> 34.9, 33.8, 36.3 -> 33.8, 34.2,
+  34.5. The time not covered by GPU work grew over the three runs (11.5-12.0 -> 13.4-13.9 -> 15.2-15.9), so live only
+  part of the GPU time saved shows; not explained yet.

@@ -682,7 +682,7 @@ impl Model {
 
     fn quant(&self, b: &mut Batch, x: &Buf, rows: usize, row_len: usize, block: usize, mode: u32) {
         let nb = rows * row_len / block;
-        b.run("quant_sim", &[x.all()], &[nb as u32, block as u32, mode, 0, row_len as u32, row_len as u32], grid1d(nb));
+        b.run("quant_sim", &[x.all()], &[nb as u32, block as u32, mode, 0, row_len as u32, row_len as u32], grid1d(nb * block));
     }
 
     /// Hyper-connection mixes of tokens `c0..c0+m` of the residual stream.
@@ -690,7 +690,7 @@ impl Model {
         let (cfg, a) = (&self.cfg, &self.acts);
         let width = (cfg.hc_mult * cfg.dim) as u32;
         let parts = (width / 4).div_ceil(crate::kernels::HC_PART);
-        b.run("hc_dot", &[a.h.all(), wf.all(), a.hc_part.all()], &[width, c0 as u32], (parts, m as u32, 1));
+        b.run("hc_dot", &[a.h.all(), wf.all(), a.hc_part.all()], &[width, c0 as u32], (parts, m as u32, crate::kernels::HC_DOT_SPLIT));
         b.run(
             "hc_mix",
             &[a.hc_part.all(), sb.all(), mix.all()],
@@ -1061,7 +1061,7 @@ impl Model {
                         cfg.candidate_block as u32,
                         self.cand_words as u32,
                     ],
-                    ((n_comp as u32).div_ceil(256), m as u32, 1),
+                    ((n_comp as u32).div_ceil(crate::kernels::idx_t_per_wg(ih)), m as u32, 1),
                 );
                 let blk = cfg.candidate_block.max(1);
                 let n_blocks = n_comp.div_ceil(blk);

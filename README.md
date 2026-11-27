@@ -144,10 +144,10 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "content-type: application/jso
 
 Common model options: `--ctx` (context, default 32768), `--segment`, `--chunk`, `--expert-vram-gb`,
 `--ram-cache-gb`, `--backend vulkan|dx12|metal`, `--gpu-only-experts`, `--no-prefetch`, `--no-warm-up`, `--tokenizer`.
-`DSV4_PROFILE=1` with `run` or `eval` prints the GPU time of each kernel per decoded token (slower while it is on).
+`DSV4_PROFILE=1` with `run` or `eval` prints the GPU time of each kernel per decoded token (slower while it is on). `DSV4_CPU_TRACE=1` logs where the time of CPU expert calls goes (phases, thread joins, page placement).
 
 CPU threads: one per logical processor, except on machines with several NUMA nodes (Windows, Linux; typically dual-socket
-servers) or Windows processor groups (more than 64 logical processors), where there is one per core over all of them.
+servers) or Windows processor groups (more than 64 logical processors), where there is one per core over all of them. The threads that compute experts while generating each get a core of their own (`DSV4_PIN_CORES=0`: any core of their node).
 `--threads N` or `DSV4_THREADS` changes the number. With several NUMA nodes threads are bound to their node, and each
 expert's rows are divided among the nodes' memories so that threads mostly read their own; `DSV4_NUMA=off` turns that
 off, and `bench-cpu` compares both. macOS has no NUMA nodes. `--cpu-spin on|off`

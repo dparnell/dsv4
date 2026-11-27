@@ -381,25 +381,47 @@ fn run_piece(sh: &Shared, files: &[File], p: &Piece, scratch: &mut Vec<Page>, th
     // `remaining` reaches zero; `start` checked its length.
     assert!(m.dst + m.len <= p.job.len);
     let out = unsafe { std::slice::from_raw_parts_mut(p.job.dst.add(m.dst), m.len) };
-    if let Some(h) = sh.homes.get((p.job.key >> 16) as usize) {
-        // the threads end on different nodes
-        crate::cpu::place(out, m.dst, h, thread);
-    }
     let e = (p.job.key & 0xffff) as u64;
-    if m.kind != PartKind::Zero {
-        let raw = read_at(&files[m.file], m.offset + e * m.stride, m.len, scratch)?;
-        if m.kind == PartKind::Raw {
-            out.copy_from_slice(raw);
-        } else {
-            let (qs, sc) = out.split_at_mut(m.len / BLK * 16);
-            repack_mxfp4(raw, qs, sc);
+    let raw = if m.kind != PartKind::Zero { Some(read_at(&files[m.file], m.offset + e * m.stride, m.len, scratch)?) } else { None };
+    let write = |out: &mut [u8], from: usize, to: usize| write_part(m.kind, raw, out, from, to);
+    if let Some(h) = sh.homes.get((p.job.key >> 16) as usize) {
+        // each node's rows written from there; the threads end on different nodes
+        if crate::cpu::place_write(out, m.dst, h, thread, write) {
+            return Ok(());
         }
-        return Ok(());
     }
-    let (qs, sc) = out.split_at_mut(m.len / BLK * 16);
-    qs.fill(0);
-    sc.fill(127);
+    write(out, 0, m.len);
     Ok(())
+}
+
+/// Bytes `from..to` of a part as the RAM tier holds it: MXFP4 values (16 bytes a block) before all
+/// scales; `raw` is the part as read, or none for zeros. `from` and `to` fall on whole blocks.
+fn write_part(kind: PartKind, raw: Option<&[u8]>, out: &mut [u8], from: usize, to: usize) {
+    if kind == PartKind::Raw {
+        out[from..to].copy_from_slice(&raw.expect("read")[from..to]);
+        return;
+    }
+    let qs_len = out.len() / BLK * 16;
+    let (qs, sc) = out.split_at_mut(qs_len);
+    let (q0, q1) = (from.min(qs_len), to.min(qs_len));
+    let (s0, s1) = (from.max(qs_len) - qs_len, to.max(qs_len) - qs_len);
+    debug_assert!(q0 % 16 == 0 && q1 % 16 == 0);
+    match raw {
+        Some(raw) => {
+            if q0 < q1 {
+                for (b, q) in (q0 / 16..q1 / 16).zip(qs[q0..q1].chunks_exact_mut(16)) {
+                    q.copy_from_slice(&raw[b * BLK + 1..b * BLK + BLK]);
+                }
+            }
+            for (b, s) in (s0..s1).zip(&mut sc[s0..s1]) {
+                *s = raw[b * BLK];
+            }
+        }
+        None => {
+            qs[q0..q1].fill(0);
+            sc[s0..s1].fill(127);
+        }
+    }
 }
 
 /// 17-byte MXFP4 blocks -> values and scales stored separately
@@ -455,6 +477,25 @@ mod tests {
         // prefetches may finish before being demanded, in which case they load twice (no cache here)
         assert!(done.load(Ordering::Relaxed) >= 4);
         drop(l);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Written node by node where there are several nodes, the same bytes.
+    #[test]
+    fn loads_with_homes() {
+        let (inter, dim) = (64, 128);
+        let blocks = inter * dim / 32;
+        let (path, data, locs) = fixture(blocks, 3);
+        let g = crate::experts::LayerGeom { types: [crate::gguf::GGML_MXFP4; 3], host: [blocks * BLK; 3] };
+        for shares in [&[1, 1][..], &[3, 1]] {
+            let homes = g.homes(inter, dim, shares);
+            assert!(!homes.is_empty());
+            let l = Loader::new(|| Ok(vec![File::open(&path)?]), locs.clone(), vec![homes], 2, Box::new(|_| {})).unwrap();
+            for e in 0..3 {
+                let v = l.demand(0, e, || None, || Ok(vec![0; 3 * blocks * BLK])).unwrap().wait().unwrap();
+                assert!(*v == expect(&data, &locs, e, blocks), "expert {e}, shares {shares:?}");
+            }
+        }
         let _ = std::fs::remove_file(path);
     }
 

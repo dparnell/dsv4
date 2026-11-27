@@ -370,6 +370,45 @@ pub fn place(buf: &mut [u8], at: usize, homes: &[(usize, Range<usize>)], home: u
     }
 }
 
+/// [`place`], then `write(buf, from, to)` for each part of `buf` (indices into it) from a thread of
+/// the node it belongs to, so that what is written is in that node's caches as well as its memory.
+/// Every part of `buf` is written exactly once. Returns false, writing nothing, with fewer than two
+/// nodes.
+pub fn place_write(buf: &mut [u8], at: usize, homes: &[(usize, Range<usize>)], home: usize, mut write: impl FnMut(&mut [u8], usize, usize)) -> bool {
+    let t = topology();
+    let n = t.shares.len();
+    if n < 2 || homes.is_empty() {
+        return false;
+    }
+    place(buf, at, homes, home);
+    let (start, end) = (at, at + buf.len());
+    let mut done = 0;
+    for node in (1..=n).map(|i| (home + i) % n) {
+        let group = t.node_of.iter().position(|&g| g == node).unwrap();
+        enter(group);
+        for (_, r) in homes.iter().filter(|h| h.0 == node) {
+            let (from, to) = (r.start.max(start), r.end.min(end));
+            if from < to {
+                write(buf, from - at, to - at);
+                done += to - from;
+            }
+        }
+    }
+    // not covered by `homes` (they cover whole experts, so this is for safety only)
+    if done < buf.len() {
+        let mut covered: Vec<(usize, usize)> = homes.iter().map(|(_, r)| (r.start.max(start), r.end.min(end))).filter(|r| r.0 < r.1).collect();
+        covered.sort_unstable();
+        let mut pos = start;
+        for (a, b) in covered.into_iter().chain([(end, end)]) {
+            if a > pos {
+                write(buf, pos - at, a - at);
+            }
+            pos = pos.max(b);
+        }
+    }
+    true
+}
+
 /// Of the pages of `buf`, how many are on the node `homes` wants, and how many are elsewhere.
 pub fn placed(buf: &[u8], homes: &[(usize, Range<usize>)]) -> (usize, usize) {
     let t = topology();

@@ -716,9 +716,20 @@ pub mod trace {
         branch_wait: f64,
         branch_gpu: f64,
         branch_after_gpu: u64,
+        /// calls of experts just read from disk: count, experts, us
+        fresh: (u64, u64, f64),
     }
 
     static AGG: Mutex<Option<Agg>> = Mutex::new(None);
+
+    thread_local! {
+        static FRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The calls this thread makes from now on are of experts just read from disk (or not).
+    pub fn fresh(b: bool) {
+        FRESH.set(b);
+    }
 
     /// A layer's CPU branch started `us` after the layer's experts did; the GPU branch took `gpu`.
     pub fn branch(us: f64, gpu: f64, same_thread: bool) {
@@ -756,6 +767,11 @@ pub mod trace {
         let a = g.get_or_insert_default();
         a.calls += 1;
         a.experts += experts as u64;
+        if FRESH.get() {
+            a.fresh.0 += 1;
+            a.fresh.1 += experts as u64;
+            a.fresh.2 += total;
+        }
         let b = &mut a.by_size[match experts {
             1..=3 => experts - 1,
             4..=6 => 3,
@@ -785,7 +801,7 @@ pub mod trace {
             .map(|(s, b)| format!("{s}: {} calls {:.0} us", b.0, b.1 / b.0 as f64))
             .collect();
         format!(
-            "CPU experts: {} calls, {:.2} experts each, {:.0} us per call = {:.0} us per expert (inputs {:.0}, between {:.0}, after {:.0}); by experts {}; caller on node {:?}, a team thread {}; pages on their node {:.1}% of {}\n  layers: CPU branch began {:.0} us after the GPU branch (which took {:.0} us), on the same thread in {:.0}%\n  {}\n  {}",
+            "CPU experts: {} calls, {:.2} experts each, {:.0} us per call = {:.0} us per expert (inputs {:.0}, between {:.0}, after {:.0}); by experts {}; of them just read from disk {} calls, {:.2} experts each, {:.0} us; caller on node {:?}, a team thread {}; pages on their node {:.1}% of {}\n  layers: CPU branch began {:.0} us after the GPU branch (which took {:.0} us), on the same thread in {:.0}%\n  {}\n  {}",
             a.calls,
             a.experts as f64 / n,
             a.total / n,
@@ -794,6 +810,9 @@ pub mod trace {
             a.mid / n,
             a.tail / n,
             sizes.join(", "),
+            a.fresh.0,
+            a.fresh.1 as f64 / a.fresh.0.max(1) as f64,
+            a.fresh.2 / a.fresh.0.max(1) as f64,
             a.caller_node,
             a.caller_team,
             100.0 * a.pages_right as f64 / (a.pages_right + a.pages_wrong).max(1) as f64,

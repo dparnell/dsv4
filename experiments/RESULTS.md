@@ -318,3 +318,14 @@ prompt five times, greedy, 300 tokens each. `DSV4_CPU_TRACE=1` logs where the ti
 - What is left on the caller is slow because everything it touches is cold after a phase has streamed 20-100 MB
   through the caches: quantizing one 5120-vector takes 3.3 us on an idle thread, 7-8 us there; setting up the tasks
   ~20 us.
+- Smaller tasks against the threads that finish last: `bench-cpu` 44 threads with 3, 6 and 12 tasks per thread, ms per
+  expert: 0.31 / 0.32 / 0.30, 0.24 / 0.24 / 0.26, 0.22 / 0.22 / 0.22, 0.33 / 0.39 / 0.38. No difference; kept at 3.
+- Server with `--threads 40` (cores left over for the GPU, I/O and caller threads): 304 us per expert against 299 with
+  44; gate/up 602, down 292. The phases are limited by memory, not by threads sharing cores.
+- Experts that a call waited for from disk: 5% of calls (about 2.2 per token), all of one expert, 648 us against
+  ~421 us for the other one-expert calls. One I/O thread wrote all of an expert, so the rows of the other node were
+  in the wrong socket's cache.
+- I/O threads now write each node's rows while bound to that node (bytes identical, unit test): disk-fresh calls
+  648 -> 601 us, about 0.1 ms per token; the rest the same within noise (303 us per expert, gate/up 595, down 285).
+- Left, per call of 3.3 experts (~1000 us): gate/up ~590 and down ~285 at 85-88 GB/s, which more threads do not raise;
+  ~100 us on the caller alone, mostly cold-cache work setting up the tasks; ~35 us before all threads have joined.

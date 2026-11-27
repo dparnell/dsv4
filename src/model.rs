@@ -1119,7 +1119,10 @@ impl Model {
                     run(group, &mut all);
                 }
                 for (e, l) in pending {
-                    run(vec![(e, l.wait()?)], &mut all);
+                    let blob = l.wait()?;
+                    crate::cpu_moe::trace::fresh(true);
+                    run(vec![(e, blob)], &mut all);
+                    crate::cpu_moe::trace::fresh(false);
                 }
                 Ok(all)
             },

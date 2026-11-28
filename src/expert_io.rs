@@ -63,8 +63,13 @@ pub type Homes = Vec<(usize, std::ops::Range<usize>)>;
 #[derive(Clone, Copy)]
 struct Page([u8; 4096]);
 
-/// Reads `len` bytes at `off` using only page-aligned I/O (required by unbuffered handles).
-fn read_at<'a>(f: &File, off: u64, len: usize, scratch: &'a mut Vec<Page>) -> std::io::Result<&'a [u8]> {
+/// Background reads go to the drive in pieces of this size, so a demand that arrives meanwhile
+/// waits for at most one of them (a SATA drive serves queued reads side by side).
+const BACKGROUND_CHUNK: usize = 1 << 20;
+
+/// Reads `len` bytes at `off` using only page-aligned I/O (required by unbuffered handles), in
+/// requests of at most `chunk` bytes with `between` called before each one after the first.
+fn read_at<'a>(f: &File, off: u64, len: usize, scratch: &'a mut Vec<Page>, chunk: usize, between: &dyn Fn()) -> std::io::Result<&'a [u8]> {
     let a0 = off & !4095;
     let a1 = (off + len as u64 + 4095) & !4095;
     let n = (a1 - a0) as usize;
@@ -74,10 +79,14 @@ fn read_at<'a>(f: &File, off: u64, len: usize, scratch: &'a mut Vec<Page>) -> st
     let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, n) };
     let mut done = 0usize;
     while done < n {
+        if done > 0 {
+            between();
+        }
+        let end = n.min(done + chunk);
         #[cfg(windows)]
-        let r = std::os::windows::fs::FileExt::seek_read(f, &mut buf[done..], a0 + done as u64)?;
+        let r = std::os::windows::fs::FileExt::seek_read(f, &mut buf[done..end], a0 + done as u64)?;
         #[cfg(unix)]
-        let r = std::os::unix::fs::FileExt::read_at(f, &mut buf[done..], a0 + done as u64)?;
+        let r = std::os::unix::fs::FileExt::read_at(f, &mut buf[done..end], a0 + done as u64)?;
         done += r;
         // unbuffered reads only stop short at end of file; a retry would start unaligned
         if r == 0 || done % 4096 != 0 {
@@ -111,8 +120,10 @@ pub struct Job {
     /// some piece has been handed to a thread (guarded by the queue lock)
     started: AtomicBool,
     kind: Kind,
-    /// a demand has joined this background load
+    /// a demand has joined this background load (counted as a prefetch hit)
     claimed: AtomicBool,
+    /// a demand waits for this background load: its reads no longer give way to demands
+    urgent: AtomicBool,
     error: Mutex<Option<String>>,
     result: Mutex<Option<Result<Arc<Vec<u8>>, String>>>,
     cv: Condvar,
@@ -196,6 +207,7 @@ impl Loader {
         let mut q = self.sh.q.lock();
         if let Some(j) = q.inflight.get(&k).cloned() {
             if j.kind != Kind::Demand {
+                j.urgent.store(true, Ordering::Relaxed);
                 let is_mine = |p: &Piece| p.job.key == k;
                 let (a, rest): (VecDeque<Piece>, VecDeque<Piece>) = std::mem::take(&mut q.prefetch).into_iter().partition(is_mine);
                 q.prefetch = rest;
@@ -254,6 +266,7 @@ impl Loader {
             started: AtomicBool::new(false),
             kind,
             claimed: AtomicBool::new(false),
+            urgent: AtomicBool::new(kind == Kind::Demand),
             error: Mutex::new(None),
             result: Mutex::new(None),
             cv: Condvar::new(),
@@ -342,7 +355,15 @@ fn worker(sh: &Shared, files: &[File], thread: usize) {
                 sh.cv.wait(&mut q);
             }
         };
-        if let Err(e) = run_piece(sh, files, &piece, &mut scratch, thread) {
+        // background reads wait between their pieces while a demand is read, unless one waits for them
+        let give_way = || {
+            let mut q = sh.q.lock();
+            while (q.demand_active > 0 || !q.demand.is_empty()) && !q.stop && !piece.job.urgent.load(Ordering::Relaxed) {
+                sh.cv.wait(&mut q);
+            }
+        };
+        let (chunk, between): (usize, &dyn Fn()) = if background { (BACKGROUND_CHUNK, &give_way) } else { (usize::MAX, &|| {}) };
+        if let Err(e) = run_piece(sh, files, &piece, &mut scratch, thread, chunk, between) {
             *piece.job.error.lock() = Some(e.to_string());
         }
         {
@@ -351,9 +372,14 @@ fn worker(sh: &Shared, files: &[File], thread: usize) {
                 q.background_active -= 1;
             } else {
                 q.demand_active -= 1;
+                if q.demand_active == 0 && q.demand.is_empty() && q.background_active > 0 {
+                    // background reads waiting for the demands to finish
+                    sh.cv.notify_all();
+                }
             }
             if q.background_active < sh.max_background && !(q.prefetch.is_empty() && q.warm.is_empty()) {
-                sh.cv.notify_one();
+                // all: a background read waiting to give way may be the one woken
+                sh.cv.notify_all();
             }
         }
         let job = piece.job;
@@ -375,14 +401,14 @@ fn worker(sh: &Shared, files: &[File], thread: usize) {
     }
 }
 
-fn run_piece(sh: &Shared, files: &[File], p: &Piece, scratch: &mut Vec<Page>, thread: usize) -> std::io::Result<()> {
+fn run_piece(sh: &Shared, files: &[File], p: &Piece, scratch: &mut Vec<Page>, thread: usize, chunk: usize, between: &dyn Fn()) -> std::io::Result<()> {
     let m = &p.part;
     // SAFETY: the parts of a job are disjoint ranges of its buffer, which stays alive until
     // `remaining` reaches zero; `start` checked its length.
     assert!(m.dst + m.len <= p.job.len);
     let out = unsafe { std::slice::from_raw_parts_mut(p.job.dst.add(m.dst), m.len) };
     let e = (p.job.key & 0xffff) as u64;
-    let raw = if m.kind != PartKind::Zero { Some(read_at(&files[m.file], m.offset + e * m.stride, m.len, scratch)?) } else { None };
+    let raw = if m.kind != PartKind::Zero { Some(read_at(&files[m.file], m.offset + e * m.stride, m.len, scratch, chunk, between)?) } else { None };
     let write = |out: &mut [u8], from: usize, to: usize| write_part(m.kind, raw, out, from, to);
     if let Some(h) = sh.homes.get((p.job.key >> 16) as usize) {
         // each node's rows written from there; the threads end on different nodes

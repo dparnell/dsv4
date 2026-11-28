@@ -471,3 +471,30 @@ bit for bit, unit tests pass, greedy text reads the same):
 Clean build, requests 2 to 5: other 8.3, 8.2, 8.1, 8.2 ms (before: 10.3-11.8); tok/s 6.64, 7.90, 9.80, 10.72 (the disk
 wait varies more than the gain).
 
+
+# Waiting for disk
+
+Same server setup (two Xeons + RTX 4070 Ti SUPER, 206 GB RAM tier, the prompt five times, greedy, 300 tokens). Temporary
+counters over whole requests (the breakdown covers only the last 100 tokens, which is why "waiting for disk" seemed larger
+than the reads it waited for).
+
+- The drive: the GGUF is on H:, a Samsung 840 on SATA. `bench-io` there: 0.49 GB/s with one loader, 0.55 with 4-32, i.e.
+  34-38 ms an 18.8 MB expert however many are queued. C: and E: are separate Samsung 860s; copying experts there to read
+  from three drives at once was not wanted.
+- Not the tier's policy: a routing trace (`DSV4_ROUTE_TRACE`) of the five requests uses 10,389 distinct experts, fewer than
+  the tier's ~10,960, and replaying it through LRU, decayed counts (half-life 16 to 256), LFU and Belady gives the same misses.
+  New experts per token by request: 28.2, 3.1, 1.8, 0.8, 0.65. The misses later on are first uses.
+- "Waiting for disk" minus the time spent in `Load::wait` for reads is under 1 ms a token: it is the reads.
+- Prefetch was a wash: requests 3 to 5 with / without it, CPU branch minus compute 43.6, 29.2, 27.8 / 34.9, 37.5, 29.5 ms a
+  token; reads waited for 0.97, 0.66, 0.62 / 0.92, 0.99, 0.77 a token, but 43-44 ms each against 37.5 (the bare read): a
+  demand queued behind up to 4 background reads of 6.3 MB already at the drive. Many "wrong" guesses are used by a
+  later token (in request 5, 105 of 168 used prefetches had finished before they were needed).
+- One background read at a time (temporary switch): 40-41 ms a read, but fewer prefetches done in time.
+- Now background reads (prefetch, warm-up) go to the drive 1 MB at a time and wait between pieces while a demand is
+  being read, unless a demand has joined them. Requests 4 and 5: 38.9 and 39.5 ms a read, 0.52 and 0.55 reads a token,
+  CPU branch minus compute 20.9 and 22.2 ms a token (before: 29.2 and 27.8); tok/s 9.93, 9.75 (before 9.36, 9.52). With
+  this and only one background read at a time: 37.2 ms a read, but 0.92-0.94 reads a token (prefetches queued too long
+  and cancelled), 34.8 and 35.7 ms: not kept.
+- How many new experts a request meets varies between runs by up to 2x, so tok/s moves more than this; ms per read is
+  the steady measure.
+- Clean build, requests 1 to 5: 1.49, 6.88, 6.86, 9.03, 9.99 tok/s; waiting for disk (last 100 tokens) 210, 70, 127, 36, 43 ms.

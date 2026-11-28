@@ -577,8 +577,31 @@ pub fn run() -> Result<()> {
         let yb = fb(&y);
         let dmy = gpu.buffer("d", 16);
         let mut b = gpu.begin();
-        b.run("hc_post", &[hb.all(), yb.all(), dmy.all(), mb.all()], &[d as u32, t as u32, 0, 0, 0], (((t * d) as u32).div_ceil(256), 1, 1));
+        b.run("hc_post", &[hb.all(), yb.all(), dmy.all(), mb.all(), dmy.all()], &[d as u32, t as u32, 0, 0, 0], (((t * d) as u32).div_ceil(256), 1, 1));
         let got = gpu.read_f32(b, &hb, 0, t * hdim);
+
+        // one token, routed outputs of some slots taken from O6C: the same as all from O6
+        {
+            let ns = 6usize;
+            let o6 = r.vec(ns * d, 1.0);
+            let mask = 0b010110u32;
+            let mut o6c = vec![0f32; ns * d];
+            let mut o6g = o6.clone();
+            for s in (0..ns).filter(|s| mask >> s & 1 != 0) {
+                o6c[s * d..(s + 1) * d].copy_from_slice(&o6[s * d..(s + 1) * d]);
+                // what O6 holds for those slots must not matter
+                o6g[s * d..(s + 1) * d].iter_mut().for_each(|v| *v = f32::NAN);
+            }
+            let run = |o: &[f32], oc: &[f32], m: u32| {
+                let (hb1, yb1, ob, ocb) = (fb(&h[..hdim]), fb(&y[..d]), fb(o), fb(oc));
+                let mut b = gpu.begin();
+                b.run("hc_post", &[hb1.all(), yb1.all(), ob.all(), mb.all(), ocb.all()], &[d as u32, 1, ns as u32, 0, 0, m], ((d as u32).div_ceil(256), 1, 1));
+                gpu.read_f32(b, &hb1, 0, hdim)
+            };
+            let want1 = run(&o6, &o6c, 0);
+            let got1 = run(&o6g, &o6c, mask);
+            all &= check("hc_post (CPU slots)", &got1, &want1, 0.0);
+        }
         let mut wantp = vec![0f32; t * hdim];
         for tk in 0..t {
             let mix = &want[tk * 24..tk * 24 + 24];
@@ -977,7 +1000,7 @@ fn bench_hc(gpu: &Gpu) {
     let dot = time(&|b| b.run("hc_dot", &[hb.all(), wb.all(), pb.all()], &[width as u32, 0], (parts, 1, crate::kernels::HC_DOT_SPLIT)));
     let mix = time(&|b| b.run("hc_mix", &[pb.all(), sbb.all(), mb.all()], &[width as u32, 4, 20, bits(1e-20), bits(1e-6), 0, 0, parts], (1, 1, 1)));
     let pre = time(&|b| b.run("hc_pre_norm", &[hb.all(), mb.all(), nw.all(), yb.all()], &[d as u32, 0, bits(1e-20), 0, 0, 0], (1, 1, 1)));
-    let post = time(&|b| b.run("hc_post", &[hb.all(), ob.all(), dmy.all(), mb.all()], &[d as u32, 1, 0, 0, 0], ((d as u32).div_ceil(256), 1, 1)));
+    let post = time(&|b| b.run("hc_post", &[hb.all(), ob.all(), dmy.all(), mb.all(), dmy.all()],&[d as u32, 1, 0, 0, 0], ((d as u32).div_ceil(256), 1, 1)));
     let copy = time(&|b| b.run("copy", &[ob.all(), yb.all()], &[16, 0, 0], (1, 1, 1)));
     // the floor: tiny copies each reading what the one before wrote, and copies into separate buffers
     let bufs: Vec<_> = (0..8).map(|_| gpu.buffer("c", 256)).collect();

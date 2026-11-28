@@ -1116,11 +1116,13 @@ fn main(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid: ve
 
 /// H[m][k] = post[k] * y + sum_j comb[j][k] H[m][j]; y = Y[m] (+ SH[m] + sum_s O6[m*ns+s])
 /// p0=D p1=M p2=n_slots(0 = attention output only) p3=mix_off p4=token offset into H / MIX
+/// p5=slots (M = 1 only) read from O6C[s] instead of O6
 const HC_POST: &str = r#"
 @group(0) @binding(0) var<storage, read_write> H: array<f32>;
 @group(0) @binding(1) var<storage, read> Y: array<f32>;
 @group(0) @binding(2) var<storage, read> O6: array<f32>;
 @group(0) @binding(3) var<storage, read> MIX: array<f32>;
+@group(0) @binding(4) var<storage, read> O6C: array<f32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let D = P.p0;
@@ -1128,7 +1130,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (i >= P.p1 * D) { return; }
   let m = i / D; let d = i % D;
   var y = Y[i];
-  for (var s = 0u; s < P.p2; s++) { y += O6[(m * P.p2 + s) * D + d]; }
+  // p5 bit s: slot s (one token only) was computed on the CPU and is in O6C
+  for (var s = 0u; s < P.p2; s++) {
+    var o: f32;
+    if (((P.p5 >> s) & 1u) != 0u) { o = O6C[s * D + d]; } else { o = O6[(m * P.p2 + s) * D + d]; }
+    y += o;
+  }
   let tk = P.p4 + m;
   let mo = P.p3 + tk * 24u;
   let hb = tk * 4u * D + d;

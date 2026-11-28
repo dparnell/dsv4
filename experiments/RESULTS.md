@@ -443,3 +443,31 @@ within noise. Live, requests 3 to 5, back to back with the build before: rest of
 115 ms), 29.1, 30.8; GPU experts 6.2 -> 5.9. Under 1 ms a token either way, below what these runs resolve; the
 dispatches left are mostly the matrix products, attention and the hyper-connection steps, each with work of its own.
 
+# "Other" in the decode breakdown
+
+Same server setup (two Xeons + RTX 4070 Ti SUPER, 206 GB RAM tier, the prompt five times, greedy, 300 tokens). "Other" is
+the time of a decode step outside the expert call and the per-layer GPU waits, all of it on the decoding thread.
+Temporary timers, ms per token, requests 3 to 5 (they add up to "other", 10.5-11.8):
+
+- writing the CPU experts' outputs to the GPU 2.6 (about 3.3 `write_buffer` calls a layer)
+- guessing the next layer's experts for prefetch 1.85 (queueing the reads 0.1)
+- the head and logits after the last layer 1.8 (GPU work)
+- `route` 1.4
+- recording the 3.4 layers a token whose commands cannot be prepared ahead (next layer has engram rows) 1.2
+- deciding promotions 1.0, readback copies and the rest ~0.45
+
+Changes (output unchanged; selftest compares `hc_post` reading CPU slots from the new buffer against all from `o6`
+bit for bit, unit tests pass, greedy text reads the same):
+
+- `route` for up to 4 rows without the thread pool: 1.37 -> 1.17 ms.
+- Prefetch guesses by partial selection of the best few instead of sorting all 256: 1.95 -> 1.0 ms.
+- CPU outputs of one token: one write instead of one per row left it at 2.0 ms, and the time grew with bytes (~0.4 us
+  per KB): `write_buffer` takes new staging memory each call, which the OS faults in and zeroes. Now written into one
+  of two host buffers kept mapped; the batch holding the next layer's `hc_post` (recorded while the CPU computes)
+  copies it to `o6c`, and `hc_post` reads the CPU's slots from there by a mask, adding in the same order: 0.65 ms.
+- `--threads 40` (cores free for the decoding thread) changed none of these, so they are not slowed by sharing a core
+  with spinning expert threads; more likely the data is cold after each CPU phase streams 20-100 MB.
+
+Clean build, requests 2 to 5: other 8.3, 8.2, 8.1, 8.2 ms (before: 10.3-11.8); tok/s 6.64, 7.90, 9.80, 10.72 (the disk
+wait varies more than the gain).
+

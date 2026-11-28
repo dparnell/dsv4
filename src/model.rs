@@ -71,6 +71,8 @@ struct Acts {
     sa: Buf,
     sh_out: Buf,
     o6: Buf,
+    /// one token's routed outputs computed on the CPU, by pick slot (`cpu_slots` says which)
+    o6c: Buf,
     hmid: Buf,
     route: Buf,
     comp_idx: Buf,
@@ -142,6 +144,11 @@ pub struct Model {
     /// rows were skipped
     gaps: Vec<(usize, usize)>,
     step: std::sync::atomic::AtomicU64,
+    /// bit k: pick slot k of this layer's one token is in `o6c`, not `o6`
+    cpu_slots: std::sync::atomic::AtomicU32,
+    /// host buffers those outputs are written into, and the one this layer took
+    o6_stage: crate::gpu::HostStage,
+    o6_stage_cur: std::sync::atomic::AtomicUsize,
     snapshot: Option<Snapshot>,
     /// [layer][expert] -> may be routed to (None: all)
     allowed: Option<Vec<Vec<bool>>>,
@@ -309,39 +316,38 @@ pub fn route(cfg: &Config, logits: &[f32], bias: &[f32], t: usize, from: usize, 
     let ne = cfg.n_experts;
     let k = cfg.n_active;
     let mut per_expert: Vec<Vec<(u32, u32, f32)>> = vec![Vec::new(); ne];
-    let picks: Vec<(Vec<(usize, f32)>, u64, u64)> = (0..t)
-        .into_par_iter()
-        .map(|ti| {
-            if ti < from {
-                return (Vec::new(), 0, 0);
-            }
-            let row = &logits[ti * ne..(ti + 1) * ne];
-            let scores: Vec<f32> = row.iter().map(|&x| route_score(x)).collect();
-            let mut idx: Vec<usize> = match allowed {
-                Some(m) => (0..ne).filter(|&e| m[e]).collect(),
-                None => (0..ne).collect(),
-            };
-            let k = k.min(idx.len());
-            let plain = |e: usize| scores[e] + bias[e];
-            idx.select_nth_unstable_by(k - 1, |&a, &b| plain(b).total_cmp(&plain(a)));
-            let (mut moved, mut dropped) = (0, 0);
-            let mut sel = idx[..k].to_vec();
-            if let Some(p) = pref.filter(|p| p.prior > 0.0) {
-                let s = |e: usize| plain(e) + if p.held[e] { p.prior } else { 0.0 };
-                idx.select_nth_unstable_by(k - 1, |&a, &b| s(b).total_cmp(&s(a)));
-                moved = idx[..k].iter().filter(|e| !sel.contains(e)).count() as u64;
-                sel = idx[..k].to_vec();
-            }
-            let sum: f32 = sel.iter().map(|&e| scores[e]).sum::<f32>() + 1e-20;
-            if let Some(p) = pref.filter(|p| p.tail_skip > 0) {
-                sel.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
-                let kept: Vec<usize> = sel.iter().enumerate().filter(|&(r, &e)| r < p.tail_skip || p.held[e]).map(|x| *x.1).collect();
-                dropped = (sel.len() - kept.len()) as u64;
-                sel = kept;
-            }
-            (sel.iter().map(|&e| (e, scores[e] / sum * cfg.route_scale)).collect(), moved, dropped)
-        })
-        .collect();
+    let pick = |ti: usize| {
+        if ti < from {
+            return (Vec::new(), 0, 0);
+        }
+        let row = &logits[ti * ne..(ti + 1) * ne];
+        let scores: Vec<f32> = row.iter().map(|&x| route_score(x)).collect();
+        let mut idx: Vec<usize> = match allowed {
+            Some(m) => (0..ne).filter(|&e| m[e]).collect(),
+            None => (0..ne).collect(),
+        };
+        let k = k.min(idx.len());
+        let plain = |e: usize| scores[e] + bias[e];
+        idx.select_nth_unstable_by(k - 1, |&a, &b| plain(b).total_cmp(&plain(a)));
+        let (mut moved, mut dropped) = (0, 0);
+        let mut sel = idx[..k].to_vec();
+        if let Some(p) = pref.filter(|p| p.prior > 0.0) {
+            let s = |e: usize| plain(e) + if p.held[e] { p.prior } else { 0.0 };
+            idx.select_nth_unstable_by(k - 1, |&a, &b| s(b).total_cmp(&s(a)));
+            moved = idx[..k].iter().filter(|e| !sel.contains(e)).count() as u64;
+            sel = idx[..k].to_vec();
+        }
+        let sum: f32 = sel.iter().map(|&e| scores[e]).sum::<f32>() + 1e-20;
+        if let Some(p) = pref.filter(|p| p.tail_skip > 0) {
+            sel.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+            let kept: Vec<usize> = sel.iter().enumerate().filter(|&(r, &e)| r < p.tail_skip || p.held[e]).map(|x| *x.1).collect();
+            dropped = (sel.len() - kept.len()) as u64;
+            sel = kept;
+        }
+        (sel.iter().map(|&e| (e, scores[e] / sum * cfg.route_scale)).collect::<Vec<_>>(), moved, dropped)
+    };
+    // handing a few rows to the pool costs more than computing them
+    let picks: Vec<(Vec<(usize, f32)>, u64, u64)> = if t <= 4 { (0..t).map(pick).collect() } else { (0..t).into_par_iter().map(pick).collect() };
     let (mut moved, mut dropped) = (0, 0);
     for (ti, (p, m, d)) in picks.iter().enumerate() {
         moved += m;
@@ -447,6 +453,7 @@ impl Model {
             sa: gpu.buffer("sa", fb(seg * inter)),
             sh_out: gpu.buffer("sh_out", fb(seg * d)),
             o6: gpu.buffer("o6", fb(seg * na * d)),
+            o6c: gpu.buffer("o6c", fb(na * d)),
             hmid: gpu.buffer("hmid", fb(seg * na * inter)),
             route: gpu.buffer("route", fb(seg * na * 3)),
             comp_idx: gpu.buffer("comp_idx", fb(seg * topk)),
@@ -538,6 +545,7 @@ impl Model {
             stats.event(format!("GPU kept busy while the CPU computes experts: {busy_iters} iterations per layer (DSV4_GPU_BUSY_US=0 turns it off)"));
         }
         stats.set_phase("ready");
+        let o6_stage = crate::gpu::HostStage::new(&gpu, 2, (cfg.n_active * cfg.dim * 4) as u64);
         Ok(Self {
             cfg,
             g,
@@ -569,6 +577,9 @@ impl Model {
             gaps: Vec::new(),
             cpu_experts,
             step: std::sync::atomic::AtomicU64::new(0),
+            cpu_slots: std::sync::atomic::AtomicU32::new(0),
+            o6_stage,
+            o6_stage_cur: std::sync::atomic::AtomicUsize::new(0),
             snapshot: None,
             allowed,
             profile_out: None,
@@ -946,7 +957,7 @@ impl Model {
             if keys_only {
                 continue;
             }
-            batch.run("hc_post", &[a.h.all(), a.y.all(), a.dummy.all(), a.mix_a.all()], &[d as u32, m as u32, 0, 0, c0 as u32], grid1d(m * d));
+            batch.run("hc_post", &[a.h.all(), a.y.all(), a.dummy.all(), a.mix_a.all(), a.dummy.all()],&[d as u32, m as u32, 0, 0, c0 as u32], grid1d(m * d));
         }
         if last < out_from {
             // nothing here is needed past this layer
@@ -1002,7 +1013,20 @@ impl Model {
     /// Add the FFN's output (shared and routed experts) to the residual stream.
     fn hc_post_ffn(&self, b: &mut Batch, t_all: usize) {
         let (a, cfg) = (&self.acts, &self.cfg);
-        b.run("hc_post", &[a.h.all(), a.sh_out.all(), a.o6.all(), a.mix_f.all()], &[cfg.dim as u32, t_all as u32, cfg.n_active as u32, 0, 0], grid1d(t_all * cfg.dim));
+        let mask = if t_all == 1 { self.cpu_slots.load(std::sync::atomic::Ordering::Relaxed) } else { 0 };
+        if mask != 0 {
+            // the CPU writes these rows into the host buffer before this batch is submitted
+            let (lo, hi) = slot_span(mask);
+            let row = (cfg.dim * 4) as u64;
+            let src = self.o6_stage.buffer(self.o6_stage_cur.load(std::sync::atomic::Ordering::Relaxed));
+            b.copy_raw(src, lo * row, &a.o6c.buf, lo * row, (hi - lo) * row);
+        }
+        b.run(
+            "hc_post",
+            &[a.h.all(), a.sh_out.all(), a.o6.all(), a.mix_f.all(), a.o6c.all()],
+            &[cfg.dim as u32, t_all as u32, cfg.n_active as u32, 0, 0, mask],
+            grid1d(t_all * cfg.dim),
+        );
     }
     #[allow(clippy::too_many_arguments)]
     fn attention(&self, b: &mut Batch, l: usize, c: usize, m: usize, pc: usize, c0: usize, yarn: bool, cand_active: &mut [bool], keys_only: bool) -> Result<()> {
@@ -1200,6 +1224,17 @@ impl Model {
         }
         // resident experts first: they need no transfer
         gpu_list.sort_by_key(|&e| !self.experts.is_resident(l, e));
+        // One token: its CPU outputs are written into a mapped host buffer that the batch with
+        // hc_post (recorded meanwhile for the next layer) copies to `o6c`, and hc_post reads those
+        // slots from there. write_buffer per row cost ~20 us each, faulting in fresh staging memory.
+        let one_token = xnf.is_some_and(|x| x.len() == cfg.dim);
+        let mask = if one_token { cpu_list.iter().flat_map(|&e| routing.per_expert[e].iter()).fold(0u32, |m, &(_, k, _)| m | 1 << k) } else { 0 };
+        if mask != 0 {
+            // the last layer's batch, which copied from a host buffer, is submitted by now
+            self.o6_stage.recycle();
+            self.o6_stage_cur.store(self.o6_stage.take(gpu), std::sync::atomic::Ordering::Relaxed);
+        }
+        self.cpu_slots.store(mask, std::sync::atomic::Ordering::Relaxed);
 
         let t_moe = std::time::Instant::now();
         // queue every disk read before waiting on any
@@ -1279,8 +1314,16 @@ impl Model {
         let prepared = gpu_res?;
         let out = cpu_res?;
         Stats::add(&self.stats.expert_cpu_runs, cpu_list.len() as u64);
-        for (row, y) in out.rows {
-            gpu.write(&self.acts.o6, (row * cfg.dim * 4) as u64, bytemuck::cast_slice(&y));
+        if mask != 0 {
+            // into the host buffer the next batch copies to o6c from; unmapped before it is submitted
+            let row = (cfg.dim * 4) as u64;
+            let cur = self.o6_stage_cur.load(std::sync::atomic::Ordering::Relaxed);
+            let parts: Vec<(u64, &[u8])> = out.rows.iter().map(|(r, y)| (*r as u64 * row, bytemuck::cast_slice(y))).collect();
+            self.o6_stage.fill(cur, &parts);
+        } else {
+            for (row, y) in out.rows {
+                gpu.write(&self.acts.o6, (row * cfg.dim * 4) as u64, bytemuck::cast_slice(&y));
+            }
         }
         for (e, blob) in out.blobs {
             if self.experts.worth_promoting(l, e, uses[e]) {
@@ -1308,7 +1351,11 @@ impl Model {
                 .collect();
             let mut idx: Vec<usize> = (0..cfg.n_experts).collect();
             // best guesses first: the rest is dropped if the disk has not got to it in time
-            idx.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+            let by = |&a: &usize, &b: &usize| scores[b].total_cmp(&scores[a]);
+            if keep < idx.len() {
+                idx.select_nth_unstable_by(keep, by);
+            }
+            idx[..keep].sort_unstable_by(by);
             for (r, &e) in idx[..keep].iter().enumerate() {
                 want.push((r, e));
             }
@@ -1445,6 +1492,11 @@ fn calibrate_busy(gpu: &Gpu, buf: &Buf) -> u32 {
     let (a, b) = (time(20_000), time(120_000));
     let per = ((b - a) / 100_000.0).max(1e-3);
     (want_us / per).clamp(0.0, 1e7) as u32
+}
+
+/// First and one past the last pick slot set in `mask`.
+fn slot_span(mask: u32) -> (u64, u64) {
+    (mask.trailing_zeros() as u64, 32 - mask.leading_zeros() as u64)
 }
 
 /// Results of one layer's CPU experts: (output row, values), and the weights they ran from.

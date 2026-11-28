@@ -434,6 +434,76 @@ impl Gpu {
     }
 }
 
+/// Host-visible buffers kept mapped, for small uploads every layer that would otherwise go through
+/// `write_buffer` (whose staging memory is new each call: ~0.4 us per KB here, faulted in and zeroed).
+/// Take one (`take`), record copies from it, fill it (`fill`), submit the commands, then `recycle`
+/// before the next `take` maps those submitted again.
+pub struct HostStage {
+    bufs: Vec<(wgpu::Buffer, Arc<std::sync::atomic::AtomicU8>)>,
+}
+
+const STAGE_MAPPED: u8 = 0;
+const STAGE_TAKEN: u8 = 1;
+const STAGE_PENDING: u8 = 2;
+
+impl HostStage {
+    pub fn new(gpu: &Gpu, n: usize, size: u64) -> Self {
+        let bufs = (0..n)
+            .map(|_| {
+                let b = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("host stage"),
+                    size,
+                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: true,
+                });
+                (b, Arc::new(std::sync::atomic::AtomicU8::new(STAGE_MAPPED)))
+            })
+            .collect();
+        HostStage { bufs }
+    }
+
+    /// Map again the buffers taken since the last call; every command copying from them must
+    /// have been submitted.
+    pub fn recycle(&self) {
+        for (b, st) in &self.bufs {
+            if st.compare_exchange(STAGE_TAKEN, STAGE_PENDING, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                let st = st.clone();
+                b.slice(..).map_async(wgpu::MapMode::Write, move |r| {
+                    r.expect("map host stage");
+                    st.store(STAGE_MAPPED, Ordering::Release);
+                });
+            }
+        }
+    }
+
+    /// A mapped buffer, waiting for one if they are all still being mapped.
+    pub fn take(&self, gpu: &Gpu) -> usize {
+        loop {
+            for (i, (_, st)) in self.bufs.iter().enumerate() {
+                if st.compare_exchange(STAGE_MAPPED, STAGE_TAKEN, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    return i;
+                }
+            }
+            assert!(self.bufs.iter().any(|(_, s)| s.load(Ordering::Relaxed) == STAGE_PENDING), "no host stage buffer to wait for");
+            let _ = gpu.device.poll(wgpu::PollType::Poll);
+            std::hint::spin_loop();
+        }
+    }
+
+    pub fn buffer(&self, i: usize) -> &wgpu::Buffer {
+        &self.bufs[i].0
+    }
+
+    /// Write each (offset, bytes) into taken buffer `i`, then unmap it, ready for submitting.
+    pub fn fill(&self, i: usize, parts: &[(u64, &[u8])]) {
+        let b = &self.bufs[i].0;
+        for &(o, data) in parts.iter().filter(|p| !p.1.is_empty()) {
+            b.slice(o..o + data.len() as u64).get_mapped_range_mut().expect("mapped").slice(..).copy_from_slice(data);
+        }
+        b.unmap();
+    }
+}
+
 /// A read whose commands are recorded and encoded, waiting to be submitted (Gpu::prepare_read).
 pub struct PreparedRead {
     cb: wgpu::CommandBuffer,

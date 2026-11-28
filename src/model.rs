@@ -82,12 +82,10 @@ struct Acts {
     qr: Buf,
     q: Buf,
     kv_raw: Buf,
-    kvt: Buf,
     ckv: Buf,
     csc: Buf,
     lat: Buf,
     ik_raw: Buf,
-    ik: Buf,
     iq: Buf,
     iw: Buf,
     isc: Buf,
@@ -246,6 +244,35 @@ struct Front {
 
 /// A layer's commands up to its routing readback, encoded ahead of time.
 type Prepared = (crate::gpu::PreparedRead, Front);
+
+/// What `Model::row_post` does to each row.
+#[derive(Clone, Copy, Default)]
+struct RowPost<'a> {
+    norm: Option<&'a Buf>,
+    rope: Option<RopeAt>,
+    /// (block, mode) as for `quant`
+    quant: Option<(usize, u32)>,
+    /// None: in place
+    dst: Option<Dst<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct RopeAt {
+    heads: usize,
+    pos_base: usize,
+    pos_step: usize,
+    yarn: bool,
+    inverse: bool,
+}
+
+/// Rows written at `off` floats into `buf`, row r at (ring_base + r) % ring when ring > 0.
+#[derive(Clone, Copy)]
+struct Dst<'a> {
+    buf: &'a Buf,
+    off: usize,
+    ring_base: usize,
+    ring: usize,
+}
 
 pub struct Routing {
     /// per expert: list of (token, k-slot, weight)
@@ -430,12 +457,10 @@ impl Model {
             qr: gpu.buffer("qr", fb(chunk * cfg.q_lora_rank)),
             q: gpu.buffer("q", fb(chunk * cfg.n_heads * hd)),
             kv_raw: gpu.buffer("kv_raw", fb(chunk * hd)),
-            kvt: gpu.buffer("kvt", fb(chunk * hd)),
             ckv: gpu.buffer("ckv", fb(chunk * hd)),
             csc: gpu.buffer("csc", fb(chunk * hd)),
             lat: gpu.buffer("lat", fb((chunk + 1) * hd)),
             ik_raw: gpu.buffer("ik_raw", fb((chunk + 1) * ihd)),
-            ik: gpu.buffer("ik", fb((chunk + 1) * ihd)),
             iq: gpu.buffer("iq", fb(chunk * cfg.index_heads * ihd)),
             iw: gpu.buffer("iw", fb(chunk * cfg.index_heads)),
             isc: gpu.buffer("isc", fb(chunk * (max_ctx + 1))),
@@ -658,31 +683,40 @@ impl Model {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn rope(&self, b: &mut Batch, x: &Buf, rows: usize, heads: usize, stride: usize, pos_base: usize, pos_step: usize, yarn: bool, inverse: bool) {
-        let half = self.cfg.rope_dim / 2;
+    /// RMSNorm (with weight), RoPE, quantize and write, each optional, in one dispatch over `rows`
+    /// rows of `len` (see ROW_POST).
+    fn row_post(&self, b: &mut Batch, x: &Buf, rows: usize, len: usize, p: RowPost) {
+        assert!(len <= 1024 && len % 32 == 0, "row_post: rows of {len}");
+        let rope = p.rope.unwrap_or(RopeAt { heads: 1, pos_base: 0, pos_step: 0, yarn: false, inverse: false });
+        let (dst, dst_off, ring_base, ring) = match p.dst {
+            Some(d) => (d.buf, d.off, d.ring_base, d.ring),
+            None => (&self.acts.dummy, 0, 0, 0),
+        };
+        let flags = p.norm.is_some() as u32 | (p.rope.is_some() as u32) << 1 | (rope.inverse as u32) << 2 | (p.dst.is_some() as u32) << 3;
+        let (qb, qm) = p.quant.unwrap_or((0, 0));
         b.run(
-            "rope",
-            &[x.all(), self.rope.all()],
+            "row_post",
+            // with no norm, the (unread) weight slot gets the rope table: dummy may be bound as D
+            &[x.all(), p.norm.unwrap_or(&self.rope).all(), self.rope.all(), dst.all()],
             &[
-                rows as u32,
-                heads as u32,
-                stride as u32,
-                (stride - self.cfg.rope_dim) as u32,
-                pos_base as u32,
-                pos_step as u32,
-                inverse as u32,
-                if yarn { self.rope_yarn_off } else { 0 },
+                len as u32,
+                rope.heads as u32,
                 0,
-                half as u32,
+                flags,
+                f(self.cfg.norm_eps),
+                rope.pos_base as u32,
+                rope.pos_step as u32,
+                if rope.yarn { self.rope_yarn_off } else { 0 },
+                (self.cfg.rope_dim / 2) as u32,
+                qb as u32,
+                qm,
+                dst_off as u32,
+                ring_base as u32,
+                ring as u32,
+                rows as u32,
             ],
-            grid1d(rows * half),
+            ((rows as u32).min(65535), (rows as u32).div_ceil(65535), 1),
         );
-    }
-
-    fn quant(&self, b: &mut Batch, x: &Buf, rows: usize, row_len: usize, block: usize, mode: u32) {
-        let nb = rows * row_len / block;
-        b.run("quant_sim", &[x.all()], &[nb as u32, block as u32, mode, 0, row_len as u32, row_len as u32], grid1d(nb * block));
     }
 
     /// Hyper-connection mixes of tokens `c0..c0+m` of the residual stream.
@@ -699,9 +733,6 @@ impl Model {
         );
     }
 
-    fn copy(&self, b: &mut Batch, src: &Buf, so: usize, dst: &Buf, d_o: usize, n: usize) {
-        b.run("copy", &[src.all(), dst.all()], &[n as u32, so as u32, d_o as u32], grid1d(n));
-    }
 
     /// Run the model over `toks` (appended at the current position). Returns logits of the last
     /// token.
@@ -932,17 +963,23 @@ impl Model {
             &[d as u32, 0, f(cfg.norm_eps), 0, 0, 0],
             (t_all as u32, 1, 1),
         );
-        ly.gate_inp.run(batch, &a.xnf, 0, d, &a.rlog, 0, cfg.n_experts, t_all);
         // guess the next layer's experts by applying its router to this layer's FFN input (the
         // residual stream changes slowly)
         let guess = self.prefetch && self.cpu_experts && l + 1 < cfg.n_layers && t_all <= PREFETCH_MAX_TOKENS && self.allowed.is_none();
-        if guess {
-            self.layers[l + 1].gate_inp.run(batch, &a.xnf, 0, d, &a.rnext, 0, cfg.n_experts, t_all);
+        if guess && t_all == 1 {
+            ly.gate_inp.run_pair(&self.layers[l + 1].gate_inp, batch, &a.xnf, 0, &a.rlog, &a.rnext);
+        } else {
+            ly.gate_inp.run(batch, &a.xnf, 0, d, &a.rlog, 0, cfg.n_experts, t_all);
+            if guess {
+                self.layers[l + 1].gate_inp.run(batch, &a.xnf, 0, d, &a.rnext, 0, cfg.n_experts, t_all);
+            }
         }
         // shared expert (overlaps with the routing readback)
-        ly.sh_gate.run(batch, &a.xnf, 0, d, &a.sg, 0, cfg.moe_inter, t_all, 0, false);
-        ly.sh_up.run(batch, &a.xnf, 0, d, &a.su, 0, cfg.moe_inter, t_all, 0, false);
-        batch.run("swiglu", &[a.sg.all(), a.su.all(), a.sa.all()], &[(t_all * cfg.moe_inter) as u32, f(cfg.swiglu_limit)], grid1d(t_all * cfg.moe_inter));
+        if t_all != 1 || !crate::weights::run_glu(&ly.sh_gate, &ly.sh_up, batch, &a.xnf, 0, &a.sa, cfg.swiglu_limit) {
+            ly.sh_gate.run(batch, &a.xnf, 0, d, &a.sg, 0, cfg.moe_inter, t_all, 0, false);
+            ly.sh_up.run(batch, &a.xnf, 0, d, &a.su, 0, cfg.moe_inter, t_all, 0, false);
+            batch.run("swiglu", &[a.sg.all(), a.su.all(), a.sa.all()], &[(t_all * cfg.moe_inter) as u32, f(cfg.swiglu_limit)], grid1d(t_all * cfg.moe_inter));
+        }
         ly.sh_down.run(batch, &a.sa, 0, cfg.moe_inter, &a.sh_out, 0, d, t_all, 0, false);
         let want_x = self.cpu_experts || self.capture.as_ref().is_some_and(|c| c.layer == l);
         Ok(Some(Front { row_from, guess, want_x }))
@@ -985,14 +1022,23 @@ impl Model {
         // q
         ly.q_a.run(b, &a.xn, 0, d, &a.qa_raw, 0, cfg.q_lora_rank, m, 0, false);
         self.rmsnorm(b, &a.qa_raw, 0, Some(&ly.q_a_norm), &a.qr, 0, cfg.q_lora_rank, m);
+        // q gets its RoPE in attn_scores
         ly.q_b.run(b, &a.qr, 0, cfg.q_lora_rank, &a.q, 0, nh * hd, m, 0, false);
-        self.rope(b, &a.q, m * nh, nh, hd, pc, 1, yarn, false);
         // sliding-window kv
         ly.kv.run(b, &a.xn, 0, d, &a.kv_raw, 0, hd, m, 0, false);
-        self.rmsnorm(b, &a.kv_raw, 0, Some(&ly.kv_norm), &a.kvt, 0, hd, m);
-        self.rope(b, &a.kvt, m, 1, hd, pc, 1, yarn, false);
-        self.quant(b, &a.kvt, m, hd, 32, 0);
-        b.run("copy_ring", &[a.kvt.all(), st.wring.all()], &[m as u32, hd as u32, pc as u32, self.ring as u32, 0, 0], grid1d(m * hd));
+        // norm, rope, fp8 and into the window ring
+        self.row_post(
+            b,
+            &a.kv_raw,
+            m,
+            hd,
+            RowPost {
+                norm: Some(&ly.kv_norm),
+                rope: Some(RopeAt { heads: 1, pos_base: pc, pos_step: 1, yarn, inverse: false }),
+                quant: Some((32, 0)),
+                dst: Some(Dst { buf: &st.wring, off: 0, ring_base: pc, ring: self.ring }),
+            },
+        );
 
         let mut n_slots = w;
         let mut kc: &Buf = &a.dummy;
@@ -1021,15 +1067,14 @@ impl Model {
                     if let Some(ind) = &ly.indexer {
                         if let (Some(wk), Some(kn)) = (&ind.attn_k, &ind.k_norm) {
                             wk.run(b, &a.lat, 0, hd, &a.ik_raw, 0, ihd, g, 0, false);
-                            self.rmsnorm(b, &a.ik_raw, 0, Some(kn), &a.ik, 0, ihd, g);
-                            self.rope(b, &a.ik, g, 1, ihd, j_lo * ratio, ratio, yarn, false);
-                            self.quant(b, &a.ik, g, ihd, 32, 1);
-                            self.copy(b, &a.ik, 0, st.idxk.as_ref().unwrap(), j_lo * ihd, g * ihd);
+                            let rope = RopeAt { heads: 1, pos_base: j_lo * ratio, pos_step: ratio, yarn, inverse: false };
+                            let dst = Dst { buf: st.idxk.as_ref().unwrap(), off: j_lo * ihd, ring_base: 0, ring: 0 };
+                            self.row_post(b, &a.ik_raw, g, ihd, RowPost { norm: Some(kn), rope: Some(rope), quant: Some((32, 1)), dst: Some(dst) });
                         }
                     }
-                    self.rope(b, &a.lat, g, 1, hd, j_lo * ratio, ratio, yarn, false);
-                    self.quant(b, &a.lat, g, hd, 16, 2);
-                    self.copy(b, &a.lat, 0, st.ccache.as_ref().unwrap(), j_lo * hd, g * hd);
+                    let rope = RopeAt { heads: 1, pos_base: j_lo * ratio, pos_step: ratio, yarn, inverse: false };
+                    let dst = Dst { buf: st.ccache.as_ref().unwrap(), off: j_lo * hd, ring_base: 0, ring: 0 };
+                    self.row_post(b, &a.lat, g, hd, RowPost { norm: None, rope: Some(rope), quant: Some((16, 2)), dst: Some(dst) });
                 }
             }
             if keys_only {
@@ -1040,8 +1085,8 @@ impl Model {
             if cfg.is_index_source(l) && k_eff > 0 {
                 let ind = ly.indexer.as_ref().unwrap();
                 ind.q_b.run(b, &a.qr, 0, cfg.q_lora_rank, &a.iq, 0, ih * ihd, m, 0, false);
-                self.rope(b, &a.iq, m * ih, ih, ihd, pc, 1, yarn, false);
-                self.quant(b, &a.iq, m * ih, ihd, 32, 1);
+                let rope = RopeAt { heads: ih, pos_base: pc, pos_step: 1, yarn, inverse: false };
+                self.row_post(b, &a.iq, m * ih, ihd, RowPost { rope: Some(rope), quant: Some((32, 1)), ..Default::default() });
                 ind.proj.run(b, &a.xn, 0, d, &a.iw, 0, ih, m, 0, false);
                 let cand_src = cfg.candidate_source.unwrap_or(usize::MAX);
                 let use_cand = l > cand_src && cand_active[c];
@@ -1089,11 +1134,12 @@ impl Model {
 
         let widx_b = a.widx.range((c0 * w * 4) as u64, (m * w * 4) as u64);
         let scale = (hd as f32).powf(-0.5);
-        let ab: [B; 6] = [a.q.all(), st.wring.all(), kc.all(), widx_b, a.comp_idx.all(), a.att.all()];
+        let ab: [B; 7] = [a.q.all(), st.wring.all(), kc.all(), widx_b, a.comp_idx.all(), a.att.all(), self.rope.all()];
+        let table = if yarn { self.rope_yarn_off } else { 0 };
         b.run(
             "attn_scores",
             &ab,
-            &[n_slots as u32, w as u32, topk as u32, nh as u32, hd as u32, f(scale), (c0 * topk) as u32],
+            &[n_slots as u32, w as u32, topk as u32, nh as u32, hd as u32, f(scale), (c0 * topk) as u32, table, (cfg.rope_dim / 2) as u32, pc as u32, 1],
             ((n_slots as u32).div_ceil(16), (nh / 16) as u32, m as u32),
         );
         b.run("attn_softmax", &[a.att.all(), ly.sinks.all()], &[n_slots as u32, nh as u32], (nh as u32, m as u32, 1));
@@ -1104,8 +1150,8 @@ impl Model {
             &[n_slots as u32, w as u32, topk as u32, nh as u32, hd as u32, 0, (c0 * topk) as u32],
             ((hd / 16) as u32, (nh / 16) as u32, m as u32),
         );
-        self.rope(b, &a.o, m * nh, nh, hd, pc, 1, yarn, true);
-        self.quant(b, &a.o, m * nh, hd, 32, 0);
+        let rope = RopeAt { heads: nh, pos_base: pc, pos_step: 1, yarn, inverse: true };
+        self.row_post(b, &a.o, m * nh, hd, RowPost { rope: Some(rope), quant: Some((32, 0)), ..Default::default() });
         ly.out_a.run(b, &a.o, 0, nh * hd, &a.oa, 0, cfg.o_groups * cfg.o_lora_rank, m, cfg.o_lora_rank, false);
         ly.out_b.run(b, &a.oa, 0, cfg.o_groups * cfg.o_lora_rank, &a.y, 0, d, m, 0, false);
         Ok(())

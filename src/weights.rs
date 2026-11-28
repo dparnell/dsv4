@@ -112,6 +112,23 @@ impl Q8W {
     }
 }
 
+/// For one token, A = swiglu(gate . x, up . x) in one dispatch (`mm_q8_1_glu`), when both are one
+/// part of the same shape and the 16-byte kernel is in use; false (nothing recorded) otherwise.
+pub fn run_glu(gate: &Q8W, up: &Q8W, b: &mut Batch, x: &Buf, x_off: usize, a: &Buf, limit: f32) -> bool {
+    if gate.parts.len() != 1 || up.parts.len() != 1 || gate.n != up.n || gate.k != up.k || q8_1_kernel() != "mm_q8_1" {
+        return false;
+    }
+    let (g, u) = (&gate.parts[0], &up.parts[0]);
+    let mut params = [0u32; 12];
+    params[0] = g.rows as u32;
+    params[1] = gate.k as u32;
+    params[5] = x_off as u32;
+    params[7] = g.scale_off_words;
+    params[11] = limit.to_bits();
+    b.run("mm_q8_1_glu", &[g.buf.all(), u.buf.all(), x.all(), a.all()], &params, ((g.rows as u32).div_ceil(8), 1, 1));
+    true
+}
+
 /// Read any float tensor as f32 on the host.
 pub fn read_f32(g: &Gguf, t: &TensorInfo) -> Result<Vec<f32>> {
     if !crate::quants::can_dequantize(t.ty) {
@@ -139,6 +156,13 @@ impl F32W {
         let k = t.dims[0] as usize;
         let n = (t.n_elements() / t.dims[0]) as usize;
         Ok(Self { buf: f32_buf(g, gpu, name)?, n, k })
+    }
+
+    /// For one token, Y0 = self . x and Y1 = other . x in one dispatch (the same shape).
+    pub fn run_pair(&self, other: &F32W, b: &mut Batch, x: &Buf, x_off: usize, y0: &Buf, y1: &Buf) {
+        assert!(self.n == other.n && self.k == other.k);
+        let params = [self.n as u32, self.k as u32, 1, 0, 0, x_off as u32, 0];
+        b.run("mm_f32_1_pair", &[self.buf.all(), other.buf.all(), x.all(), y0.all(), y1.all()], &params, ((self.n as u32).div_ceil(8), 1, 2));
     }
 
     pub fn run(&self, b: &mut Batch, x: &Buf, x_off: usize, x_stride: usize, y: &Buf, y_off: usize, y_stride: usize, m: usize) {

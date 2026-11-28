@@ -420,4 +420,26 @@ norm in hc_pre_norm and the attention sums are added in a different order (selft
 - Live, requests 3 to 5 (hc kernels only / then quant_sim / then idx and attn scores): GPU busy 23.2-26.1 (before) ->
   20.8-23.3 -> 20.4-22.4 -> 18.6; rest of GPU 41.5, 33.6, 37.4 -> 35.3, 32.5, 32.3 -> 34.9, 33.8, 36.3 -> 33.8, 34.2,
   34.5. The time not covered by GPU work grew over the three runs (11.5-12.0 -> 13.4-13.9 -> 15.2-15.9), so live only
-  part of the GPU time saved shows; not explained yet.
+  part of the GPU time saved shows; not explained yet. (A later run of the same build: rest of GPU 29.4, 28.9, 29.1,
+  GPU busy 17.7-18.2, the time not covered 11.2-11.4: the growth was between runs, not the kernels.)
+
+### Fewer dispatches
+
+`bench-gpu` with the commands encoded before the clock starts: a dispatch costs the GPU 0.95-1.25 us (tiny copies into
+separate buffers, or each reading the one before); encoding one costs the CPU ~1.7 us more on an idle core (the earlier
+"floor" of 3.2 us was both). A plain layer at one token was ~29 dispatches. Merged, each computing exactly what the
+kernels it replaces did (selftest compares them bit for bit; greedy text GPU-only identical):
+
+- `row_post`: RMSNorm, RoPE, quantize-dequantize and copy of a row in one dispatch: the window kv (4 -> 1), the output
+  before `out_a` (2 -> 1), and on the compressor layers the indexer keys (5 -> 1), the compressed kv (3 -> 1) and the
+  indexer q (2 -> 1).
+- `mm_q8_1_glu`: the shared expert's gate and up rows and SwiGLU, one token (3 -> 1).
+- `mm_f32_1_pair`: this layer's router and the next layer's guess, one token (2 -> 1).
+- RoPE of q done by `attn_scores` as it reads q (2 -> 1).
+
+That is 6-7 fewer a plain layer (29 -> 22-23), more on the compressor layers. GPU-only, three runs each, against the
+build before: gpu-wait 5.68, 5.73, 5.87 -> 5.67, 5.66, 5.66 s for 120 tokens, GPU busy the same (2.64-2.72 s), tok/s
+within noise. Live, requests 3 to 5, back to back with the build before: rest of GPU 29.4, 28.9, 29.1 -> 38.6 (disk wait
+115 ms), 29.1, 30.8; GPU experts 6.2 -> 5.9. Under 1 ms a token either way, below what these runs resolve; the
+dispatches left are mostly the matrix products, attention and the hyper-connection steps, each with work of its own.
+

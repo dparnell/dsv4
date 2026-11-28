@@ -373,6 +373,116 @@ pub fn run() -> Result<()> {
         all &= check("rope inverse", &back, &x, 1e-5);
     }
 
+    // ---- mm_q8_1_glu: the same values as two mm_q8_1 and swiglu ----
+    {
+        let (n, k) = (40usize, 512usize);
+        let q8 = |seed: u64| {
+            let mut z = seed;
+            let raw: Vec<u8> = (0..n * k / 32)
+                .flat_map(|_| {
+                    z ^= z << 13;
+                    z ^= z >> 7;
+                    z ^= z << 17;
+                    let mut b = f16::from_f32(0.002 + (z % 100) as f32 * 1e-4).to_le_bytes().to_vec();
+                    b.extend((0..32).map(|i| (z >> (i % 56)) as u8));
+                    b
+                })
+                .collect();
+            gpu.buffer_init("w", &crate::weights::repack_q8(&raw, n, k))
+        };
+        let (wg, wu) = (q8(0x1234_5678_9abc), q8(0x0fed_cba9_8765));
+        let x = r.vec(k + 16, 1.0);
+        let xb = fb(&x);
+        let (g, u, a1, a2) = (gpu.buffer("g", (n * 4) as u64), gpu.buffer("u", (n * 4) as u64), gpu.buffer("a1", (n * 4) as u64), gpu.buffer("a2", (n * 4) as u64));
+        let so = (n * k / 4) as u32;
+        let limit = 7.0f32;
+        let mut b = gpu.begin();
+        for (w, y) in [(&wg, &g), (&wu, &u)] {
+            b.run("mm_q8_1", &[w.all(), xb.all(), y.all()], &[n as u32, k as u32, 1, k as u32, n as u32, 16, 0, so, 0, 0, 0], ((n as u32).div_ceil(8), 1, 1));
+        }
+        b.run("swiglu", &[g.all(), u.all(), a1.all()], &[n as u32, bits(limit)], ((n as u32).div_ceil(256), 1, 1));
+        let mut p = [0u32; 12];
+        p[0] = n as u32;
+        p[1] = k as u32;
+        p[5] = 16;
+        p[7] = so;
+        p[11] = bits(limit);
+        b.run("mm_q8_1_glu", &[wg.all(), wu.all(), xb.all(), a2.all()], &p, ((n as u32).div_ceil(8), 1, 1));
+        let want = gpu.read_f32(b, &a1, 0, n);
+        let got = gpu.read_f32(gpu.begin(), &a2, 0, n);
+        all &= want.iter().any(|v| *v != 0.0);
+        all &= check("mm_q8_1_glu", &got, &want, 0.0);
+    }
+
+    // ---- mm_f32_1_pair: the same values as mm_f32_1 twice ----
+    {
+        let (n, k) = (40usize, 256usize);
+        let (w0, w1, x) = (r.vec(n * k, 0.1), r.vec(n * k, 0.1), r.vec(k, 1.0));
+        let (w0b, w1b, xb) = (fb(&w0), fb(&w1), fb(&x));
+        let ys: Vec<_> = (0..4).map(|_| gpu.buffer("y", (n * 4) as u64)).collect();
+        let mut b = gpu.begin();
+        for (w, y) in [(&w0b, &ys[0]), (&w1b, &ys[1])] {
+            b.run("mm_f32_1", &[w.all(), xb.all(), y.all()], &[n as u32, k as u32, 1, k as u32, n as u32, 0, 0], ((n as u32).div_ceil(8), 1, 1));
+        }
+        b.run("mm_f32_1_pair", &[w0b.all(), w1b.all(), xb.all(), ys[2].all(), ys[3].all()], &[n as u32, k as u32, 1, 0, 0, 0, 0], ((n as u32).div_ceil(8), 1, 2));
+        let want: Vec<f32> = [gpu.read_f32(b, &ys[0], 0, n), gpu.read_f32(gpu.begin(), &ys[1], 0, n)].concat();
+        let got: Vec<f32> = [gpu.read_f32(gpu.begin(), &ys[2], 0, n), gpu.read_f32(gpu.begin(), &ys[3], 0, n)].concat();
+        all &= want.iter().any(|v| *v != 0.0);
+        all &= check("mm_f32_1_pair", &got, &want, 0.0);
+    }
+
+    // ---- row_post: the same values as rmsnorm, rope, quant_sim and copy_ring one after another ----
+    for (len, heads, norm, rope_on, inv, quant, ring) in [
+        (512usize, 1usize, true, true, false, (32usize, 0u32), 6usize),
+        (128, 1, true, true, false, (32, 1), 0),
+        (512, 1, false, true, false, (16, 2), 0),
+        (128, 4, false, true, false, (32, 1), 0),
+        (512, 4, false, true, true, (32, 0), 0),
+    ] {
+        let rows = 2 * heads + 1;
+        let half = 32usize;
+        let x = r.vec(rows * len, 2.0);
+        let w = r.vec(len, 1.0);
+        let positions = 40usize;
+        let table: Vec<f32> = (0..positions * half).flat_map(|i| {
+            let a = (i % half) as f32 * 0.37 + (i / half) as f32 * 0.11;
+            [a.cos(), a.sin()]
+        }).collect();
+        let (pos_base, pos_step) = (5usize, 3usize);
+        let (xb, wb, tb) = (fb(&x), fb(&w), fb(&table));
+        let dst_off = 64usize;
+        let dst_rows = if ring > 0 { ring } else { rows };
+        let d1 = gpu.buffer("d1", ((dst_off + dst_rows * len) * 4) as u64);
+        let d2 = gpu.buffer("d2", ((dst_off + dst_rows * len) * 4) as u64);
+        let tmp = gpu.buffer("t", (rows * len * 4) as u64);
+        let flags = norm as u32 | (rope_on as u32) << 1 | (inv as u32) << 2 | 8;
+        // separate kernels
+        let mut b = gpu.begin();
+        if norm {
+            b.run("rmsnorm", &[xb.all(), wb.all(), tmp.all()], &[len as u32, 0, 0, len as u32, len as u32, bits(1e-6), 1], (rows as u32, 1, 1));
+        } else {
+            b.run("copy", &[xb.all(), tmp.all()], &[(rows * len) as u32, 0, 0], (((rows * len) as u32).div_ceil(256), 1, 1));
+        }
+        let rp = [rows as u32, heads as u32, len as u32, (len - 2 * half) as u32, pos_base as u32, pos_step as u32, inv as u32, 0, 0, half as u32];
+        b.run("rope", &[tmp.all(), tb.all()], &rp, (((rows * half) as u32).div_ceil(256), 1, 1));
+        let n = rows * len;
+        b.run("quant_sim", &[tmp.all()], &[(n / quant.0) as u32, quant.0 as u32, quant.1, 0, len as u32, len as u32], ((n as u32).div_ceil(256), 1, 1));
+        let ring_p = if ring > 0 { ring } else { 1 << 30 };
+        let base = if ring > 0 { 3u32 } else { 0 };
+        b.run("copy_ring", &[tmp.all(), d1.all()], &[rows as u32, len as u32, base, ring_p as u32, 0, dst_off as u32], ((n as u32).div_ceil(256), 1, 1));
+        // fused
+        let pp = [len as u32, heads as u32, 0, flags, bits(1e-6), pos_base as u32, pos_step as u32, 0, half as u32, quant.0 as u32, quant.1, dst_off as u32, 3, ring as u32, rows as u32];
+        b.run("row_post", &[xb.all(), wb.all(), tb.all(), d2.all()], &pp, (rows as u32, 1, 1));
+        let want = gpu.read_f32(b, &d1, 0, dst_off + dst_rows * len);
+        let got = gpu.read_f32(gpu.begin(), &d2, 0, dst_off + dst_rows * len);
+        let written = want[dst_off..].iter().filter(|v| **v != 0.0).count();
+        if written < rows * len / 2 {
+            println!("FAIL row_post: only {written} values written");
+            all = false;
+        }
+        all &= check(&format!("row_post {len} x{heads} norm {norm} quant {quant:?} ring {ring}"), &got, &want, 0.0);
+    }
+
     // ---- quant simulation ----
     for (mode, block, name) in [(0u32, 32usize, "quant fp8"), (1, 32, "quant fp4/e8m0"), (2, 16, "quant fp4/e4m3")] {
         let n = 512 * 4;
@@ -534,7 +644,8 @@ pub fn run() -> Result<()> {
         let ob = gpu.buffer("o", (m * heads * hd * 4) as u64);
         let mut b = gpu.begin();
         let pp = [ns as u32, w as u32, tk as u32, heads as u32, hd as u32, bits(scale), 0];
-        b.run("attn_scores", &[qb.all(), kwb.all(), kcb.all(), wib.all(), cib.all(), att.all()], &pp, ((ns as u32).div_ceil(16), (heads / 16) as u32, m as u32));
+        let rtab = fb(&[0f32; 16]);
+        b.run("attn_scores", &[qb.all(), kwb.all(), kcb.all(), wib.all(), cib.all(), att.all(), rtab.all()], &pp, ((ns as u32).div_ceil(16), (heads / 16) as u32, m as u32));
         b.run("attn_softmax", &[att.all(), skb.all()], &[ns as u32, heads as u32], (heads as u32, m as u32, 1));
         b.run("attn_pv", &[att.all(), kwb.all(), kcb.all(), wib.all(), cib.all(), ob.all()], &pp, ((hd / 16) as u32, (heads / 16) as u32, m as u32));
         let got = gpu.read_f32(b, &ob, 0, m * heads * hd);
@@ -563,6 +674,30 @@ pub fn run() -> Result<()> {
             }
         }
         all &= check("sparse attention", &got, &want, 1e-4);
+
+        // RoPE of q inside attn_scores: the same scores as the rope kernel and then attn_scores
+        let half = 8usize;
+        let table: Vec<f32> = (0..20 * half).flat_map(|i| {
+            let a = (i % half) as f32 * 0.31 + (i / half) as f32 * 0.17;
+            [a.cos(), a.sin()]
+        }).collect();
+        let tb = fb(&table);
+        let q2 = fb(&q);
+        let (s1, s2) = (gpu.buffer("s1", (m * heads * ns * 4) as u64), gpu.buffer("s2", (m * heads * ns * 4) as u64));
+        let pos = 7usize;
+        let mut b = gpu.begin();
+        let rp = [(m * heads) as u32, heads as u32, hd as u32, (hd - 2 * half) as u32, pos as u32, 1, 0, 0, 0, half as u32];
+        b.run("rope", &[q2.all(), tb.all()], &rp, (((m * heads * half) as u32).div_ceil(256), 1, 1));
+        b.run("attn_scores", &[q2.all(), kwb.all(), kcb.all(), wib.all(), cib.all(), s1.all(), tb.all()], &pp, ((ns as u32).div_ceil(16), (heads / 16) as u32, m as u32));
+        let mut pr = [0u32; 11];
+        pr[..7].copy_from_slice(&pp);
+        pr[8] = half as u32;
+        pr[9] = pos as u32;
+        pr[10] = 1;
+        b.run("attn_scores", &[qb.all(), kwb.all(), kcb.all(), wib.all(), cib.all(), s2.all(), tb.all()], &pr, ((ns as u32).div_ceil(16), (heads / 16) as u32, m as u32));
+        let want = gpu.read_f32(b, &s1, 0, m * heads * ns);
+        let got = gpu.read_f32(gpu.begin(), &s2, 0, m * heads * ns);
+        all &= check("attn_scores with q rope", &got, &want, 0.0);
     }
 
     // ---- hc_pre_norm ----
@@ -830,8 +965,10 @@ fn bench_hc(gpu: &Gpu) {
             for _ in 0..reps {
                 what(&mut b);
             }
+            // encoded before the clock starts: GPU time and one round trip only
+            let p = gpu.prepare_read(b, &[(&dmy, 0, 4)]);
             let t0 = std::time::Instant::now();
-            gpu.read_f32(b, &dmy, 0, 1);
+            gpu.finish_read(p);
             t0.elapsed().as_secs_f64() * 1e6 / reps as f64
         };
         pass();
@@ -842,6 +979,18 @@ fn bench_hc(gpu: &Gpu) {
     let pre = time(&|b| b.run("hc_pre_norm", &[hb.all(), mb.all(), nw.all(), yb.all()], &[d as u32, 0, bits(1e-20), 0, 0, 0], (1, 1, 1)));
     let post = time(&|b| b.run("hc_post", &[hb.all(), ob.all(), dmy.all(), mb.all()], &[d as u32, 1, 0, 0, 0], ((d as u32).div_ceil(256), 1, 1)));
     let copy = time(&|b| b.run("copy", &[ob.all(), yb.all()], &[16, 0, 0], (1, 1, 1)));
+    // the floor: tiny copies each reading what the one before wrote, and copies into separate buffers
+    let bufs: Vec<_> = (0..8).map(|_| gpu.buffer("c", 256)).collect();
+    let chain = time(&|b| {
+        b.run("copy", &[bufs[0].all(), bufs[1].all()], &[16, 0, 0], (1, 1, 1));
+        b.run("copy", &[bufs[1].all(), bufs[0].all()], &[16, 0, 0], (1, 1, 1));
+    }) / 2.0;
+    let apart = time(&|b| {
+        for i in 1..8 {
+            b.run("copy", &[ob.all(), bufs[i].all()], &[16, 0, 0], (1, 1, 1));
+        }
+    }) / 7.0;
+    println!("dispatch floor (us): dependent copies {chain:.2}  copies into separate buffers {apart:.2}");
     println!("hyper-connection kernels, one token (us per dispatch): hc_dot {dot:.1}  hc_mix {mix:.1}  hc_pre_norm {pre:.1}  hc_post {post:.1}  (16-float copy {copy:.1})");
     let qb = fb(&fill(64 * 512, 4.0));
     let q = |n: usize, bs: usize, mode: u32| time(&|b| b.run("quant_sim", &[qb.all()], &[(n / bs) as u32, bs as u32, mode, 0, 512, 512], ((n as u32).div_ceil(256), 1, 1)));
@@ -869,7 +1018,7 @@ fn bench_hc(gpu: &Gpu) {
     let attn = |ns: usize, hd: usize, nh: usize| {
         time(&|b| {
             let p = [ns as u32, w.min(ns) as u32, topk as u32, nh as u32, hd as u32, bits(0.04), 0];
-            b.run("attn_scores", &[aq.all(), kw.all(), kc.all(), widx.all(), cidx.all(), att.all()], &p, ((ns as u32).div_ceil(16), (nh / 16) as u32, 1))
+            b.run("attn_scores", &[aq.all(), kw.all(), kc.all(), widx.all(), cidx.all(), att.all(), dmy.all()], &p, ((ns as u32).div_ceil(16), (nh / 16) as u32, 1))
         })
     };
     println!("idx_scores (us per dispatch): 128 positions {:.1}  1024 {:.1}  4096 {:.1}", idx(128), idx(1024), idx(4096));
